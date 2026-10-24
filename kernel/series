@@ -21,3 +21,4 @@
 0021-asoc-tas571x-vendor-compatible-tas5751m-controls.patch
 0022-selinux-read-android-6-ioctl-rule-layout.patch
 0023-wifi-brcmfmac-sdio-take-the-mac-address-from-the-cis.patch
+0024-reset-gpio-support-gpio-controllers-with-more-than-two-cells.patch
