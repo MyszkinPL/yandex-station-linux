@@ -21,10 +21,12 @@ while read -r p; do
 	echo "applied $p"
 done < "$TOP/gpu/mali/patches/series"
 
-# USING_DT: the GPU node comes from the device tree (allwinner,sun50i-a64-mali);
-# no UMP, no profiling; DVFS stays with the vendor SCP firmware
+# MALI_PLATFORM=sunxi (Bootlin) finds the GPU node in the device tree itself
+# (allwinner,sun50i-a64-mali: bus/core clocks, reset, named IRQs) and registers
+# the platform device, which is the USING_DT=0 path of ARM's driver.
+# No UMP, no profiling; DVFS stays with the vendor SCP firmware.
 make -k -C mali/src/devicedrv/mali -j"$J" KDIR="$O" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-	USING_UMP=0 BUILD=release USING_PROFILING=0 USING_DT=1 MALI_PLATFORM=sunxi \
+	USING_UMP=0 BUILD=release USING_PROFILING=0 USING_DT=0 MALI_PLATFORM=sunxi \
 	USING_DVFS=0 USING_DEVFREQ=0
 aarch64-linux-gnu-strip --strip-debug -o "$OUT/mali.ko" mali/src/devicedrv/mali/mali.ko
 modinfo "$OUT/mali.ko" | grep -E '^(version|vermagic|depends):'
