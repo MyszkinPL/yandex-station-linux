@@ -156,6 +156,22 @@
 			reg = <0x4e400000 0x1000>;
 			no-map;
 		};
+
+		/*
+		 * pstore: the kernel log survives a watchdog reset here. The
+		 * vendor kernel (cma=232M) keeps the top of RAM as CMA and fills
+		 * it from the bottom, and U-Boot relocates into the last few MiB,
+		 * so this block stays untouched across a vendor boot too and the
+		 * next mainline boot finds the log in /sys/fs/pstore.
+		 */
+		ramoops@7e000000 {
+			compatible = "ramoops";
+			reg = <0x7e000000 0x100000>;
+			no-map;
+			record-size = <0x20000>;
+			console-size = <0x80000>;
+			pmsg-size = <0x40000>;
+		};
 	};
 
 	hdmi-connector {
