@@ -13,6 +13,8 @@ cd "$B"
 [ -f "$T" ] || curl -fL --retry 3 -o "$T" "https://developer.arm.com/-/media/Files/downloads/mali-drivers/kernel/mali-utgard-gpu/$T"
 sha256sum -c --quiet "$TOP/gpu/mali/source.sha256"
 rm -rf mali && mkdir mali && tar -C mali --strip-components=2 -xzf "$T"   # DX910-SW-99002-$R/driver/
+# ten files of the release mix CRLF and LF lines; the patches are LF
+find mali -type f \( -name '*.[ch]' -o -name Makefile -o -name Kbuild \) -exec sed -i 's/$//' {} +
 while read -r p; do
 	case "$p" in ''|'#'*) continue ;; esac
 	patch -d mali -p1 -s --no-backup-if-mismatch < "$TOP/gpu/mali/patches/$p" || { echo "FAILED: $p"; exit 1; }
