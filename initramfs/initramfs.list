@@ -7,6 +7,8 @@
 #                                        fw_bcm4356a2_ag.bin, nvram.txt)
 #              tas5751m-2a.txt/-2b.txt   amplifier register scripts, extracted from the
 #                                        vendor snd-soc-tas5751m.ko (docs/audio.md)
+#              BCM4356A2.hcd             the Bluetooth patch RAM of the same module
+#                                        (/system/vendor/modules/BCM4354A2.hcd)
 dir /dev 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 nod /dev/null 0666 0 0 c 1 3
@@ -29,5 +31,6 @@ file /etc/station/station-mics-init.sh station-mics-init.sh 0755 0 0
 file /etc/station/authorized_keys ${PRIVATE}/authorized_keys 0644 0 0
 file /lib/firmware/brcm/brcmfmac4356-sdio.bin ${PRIVATE}/brcmfmac4356-sdio.bin 0644 0 0
 file /lib/firmware/brcm/brcmfmac4356-sdio.txt ${PRIVATE}/brcmfmac4356-sdio.txt 0644 0 0
+file /lib/firmware/brcm/BCM4356A2.hcd ${PRIVATE}/BCM4356A2.hcd 0644 0 0
 file /lib/firmware/tas5751m-2a.txt ${PRIVATE}/tas5751m-2a.txt 0644 0 0
 file /lib/firmware/tas5751m-2b.txt ${PRIVATE}/tas5751m-2b.txt 0644 0 0
