@@ -27,6 +27,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bootimg  # noqa: E402
+import cpio  # noqa: E402
 import fdt  # noqa: E402
 
 LOAD = 0x40080000           # where boota runs the payload
@@ -42,14 +43,6 @@ def align(n, a):
     return (n + a - 1) // a * a
 
 
-def cpio_entry(name, mode, data=b"", ino=0, rdev=(0, 0), nlink=1):
-    nb = name.encode() + b"\0"
-    fields = (ino, mode, 0, 0, nlink, 0, len(data), 0, 0, rdev[0], rdev[1], len(nb), 0)
-    b = b"070701" + b"".join(b"%08X" % v for v in fields) + nb
-    b += b"\0" * ((-len(b)) % 4) + data
-    return b + b"\0" * ((-len(b)) % 4)
-
-
 def cpio_from_list(path, defs):
     """gen_init_cpio list format (dir/file/nod/slink), ${NAME} from -D, paths relative to the list"""
     base = os.path.dirname(os.path.abspath(path))
@@ -63,19 +56,18 @@ def cpio_from_list(path, defs):
         kind, name = w[0], w[1].lstrip("/")
         ino += 1
         if kind == "dir":
-            out += cpio_entry(name, 0o040000 | int(w[2], 8), ino=ino, nlink=2)
+            out += cpio.entry(name, 0o040000 | int(w[2], 8), ino=ino, nlink=2)
         elif kind == "file":
             src = w[2] if os.path.isabs(w[2]) else os.path.join(base, w[2])
-            out += cpio_entry(name, 0o100000 | int(w[3], 8), open(src, "rb").read(), ino=ino)
+            out += cpio.entry(name, 0o100000 | int(w[3], 8), open(src, "rb").read(), ino=ino)
         elif kind == "nod":
             t = {"c": 0o020000, "b": 0o060000}[w[5]]
-            out += cpio_entry(name, t | int(w[2], 8), ino=ino, rdev=(int(w[6]), int(w[7])))
+            out += cpio.entry(name, t | int(w[2], 8), ino=ino, rdev=(int(w[6]), int(w[7])))
         elif kind == "slink":
-            out += cpio_entry(name, 0o120000 | int(w[3], 8), w[2].encode(), ino=ino)
+            out += cpio.entry(name, 0o120000 | int(w[3], 8), w[2].encode(), ino=ino)
         else:
             sys.exit(f"{path}:{ln}: unknown entry {kind}")
-    out += cpio_entry("TRAILER!!!", 0)
-    return bytes(out) + b"\0" * ((-len(out)) % 512)
+    return cpio.finish(out)
 
 
 def main():
@@ -139,8 +131,7 @@ def main():
         assert fdt.get_prop(dtb, "/chosen", "linux,initrd-start") == struct.pack(">Q", LOAD + initrd_off)
     assert pay[DTB_OFF:DTB_OFF + len(dtb)] == dtb and pay[IMAGE_OFF:IMAGE_OFF + len(img)] == img
 
-    empty = cpio_entry("TRAILER!!!", 0)
-    empty += b"\0" * ((-len(empty)) % 512)
+    empty = cpio.finish(b"")
     h = dict(kernel=bytes(pay), ramdisk=gzip.compress(empty, 9, mtime=0), second=b"",
              kernel_addr=LOAD, ramdisk_addr=SHIMLOG_RAMDISK, second_addr=0x40f00000, tags_addr=0x40000100,
              page_size=2048, hdr_version=0, os_version=0, name=b"", cmdline=b"", extra=b"")

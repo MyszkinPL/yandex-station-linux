@@ -3,8 +3,8 @@
 # (rdinit=/station-init): start a mirror of the kernel log into the unused
 # tail of misc (14 MiB), so a failure before Android's own services run can
 # still be read after the Station is back on the vendor kernel; then hand
-# PID 1 to Android's init. The mirror lives in the ramdisk root, which stays
-# the root file system under Android, and stops after 15 minutes.
+# PID 1 to Android's init. The mirror works in a tmpfs of its own (/.slog):
+# Android's init remounts the ramdisk root read-only. It stops after 15 minutes.
 B=/sbin/station/busybox
 $B mount -t sysfs sysfs /sys
 i=0
@@ -13,6 +13,7 @@ dev=$($B cat /sys/class/block/mmcblk0p9/dev 2>/dev/null)
 $B umount /sys
 if [ -n "$dev" ]; then
 	$B mkdir -p /.slog
+	$B mount -t tmpfs -o size=4m,mode=0700 tmpfs /.slog
 	$B mknod /.slog/misc b "${dev%%:*}" "${dev##*:}"
 	(
 		n=0

@@ -5,6 +5,8 @@
 #   - sets the mic ADCs up like the vendor's i2c_ma once /system is there
 #     (the ADCs belong to the kernel driver now, i2c_ma cannot reach them);
 #   - saves dmesg + logcat to the unused tail of misc (13 MiB) every 30 s;
+#   - with station.debug, copies logcat into the kernel log as it comes, so
+#     the kernel log mirror of station-init keeps it across a fast reboot;
 #   - if Android has not finished booting after DEADLINE seconds, saves the
 #     logs once more and stops feeding: the watchdog resets the Station
 #     within 16 s and the next boot is the vendor kernel again.
@@ -18,6 +20,15 @@ i=0
 while [ ! -e /dev/watchdog ] && [ $i -lt 600 ]; do $B sleep 0.1; i=$((i+1)); done
 $B watchdog -F -t 4 -T 16 /dev/watchdog &
 WD=$!
+
+if $B grep -q station.debug /proc/cmdline; then
+	(
+		while [ ! -S /dev/socket/logdr ] || [ ! -x /system/bin/logcat ]; do $B sleep 0.2; done
+		# one write() per entry: nothing waits in a pipe buffer when the
+		# Station resets right after a crash
+		/system/bin/logcat -v brief -b main -b system -b crash -f /dev/kmsg '*:I' 2>/dev/null
+	) &
+fi
 
 savelog() {
 	{
