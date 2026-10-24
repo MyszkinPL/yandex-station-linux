@@ -46,6 +46,8 @@ for a in $(cat /proc/cmdline); do
 done
 
 say "init started, $(uname -r)"
+# our services log into the kernel log (os/klog): no rate limit for them
+echo on > /proc/sys/kernel/printk_devkmsg
 
 # --- misc log target checks (unchanged from stage A) ---
 i=0
