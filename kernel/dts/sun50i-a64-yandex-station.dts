@@ -690,6 +690,10 @@
 		enable-gpios = <&pio 3 10 GPIO_ACTIVE_HIGH>;	/* PD10 SN3236_VCC_ENABLE */
 		shutdown-gpios = <&pio 3 6 GPIO_ACTIVE_LOW>,	/* PD6 SDB */
 				 <&pio 3 7 GPIO_ACTIVE_LOW>;	/* PD7 SDB */
+
+		/* the STM32 boot animation: MCU asleep (PE7 high), in reset (PE5 low) */
+		mcu-sleep-gpios = <&pio 4 7 GPIO_ACTIVE_HIGH>;
+		mcu-reset-gpios = <&pio 4 5 GPIO_ACTIVE_LOW>;
 	};
 #endif
 
@@ -1106,28 +1110,6 @@
 &pio {
 	interrupt-parent = <&gic>;
 
-#if WF2_LEDS_KEYS
-	/*
-	 * Stop the STM32 boot animation from the first moment, as the vendor
-	 * rc.local does (gpio135 "STOP MCU LED animation", gpio133 "MCU halt"):
-	 * otherwise the MCU keeps drawing into the SN3236s and the ring flickers
-	 * between its frames and ours. Verified 2026-10-24: PE7 = 1 + PE5 = 0
-	 * freezes the animation, although the AXP803 ALDO1 bit for vcc-pe reads 0.
-	 */
-	stm32-sleep-hog {
-		gpio-hog;
-		gpios = <4 7 GPIO_ACTIVE_HIGH>;		/* PE7 */
-		output-high;
-		line-name = "stm32-sleep";
-	};
-
-	stm32-reset-hog {
-		gpio-hog;
-		gpios = <4 5 GPIO_ACTIVE_HIGH>;		/* PE5, NRST held low */
-		output-low;
-		line-name = "stm32-reset";
-	};
-#endif
 
 #if WF2_AUDIO
 	/*
