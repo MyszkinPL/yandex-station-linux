@@ -3,7 +3,7 @@ name: build
 on:
   push:
     branches: [main]
-    paths: ['kernel/**', 'boot/**', 'gpu/**', 'android/**', 'scripts/**', '.github/workflows/build.yml']
+    paths: ['kernel/**', 'boot/**', 'scripts/**', '.github/workflows/build.yml']
   pull_request:
   workflow_dispatch:
 
@@ -34,10 +34,8 @@ jobs:
       - name: Source tarball cache
         uses: actions/cache@v4
         with:
-          path: |
-            build/linux-*.tar.xz
-            build/DX910-SW-99002-*.tgz
-          key: sources-${{ hashFiles('kernel/linux.sha256', 'gpu/mali/source.sha256') }}
+          path: build/linux-*.tar.xz
+          key: sources-${{ hashFiles('kernel/linux.sha256') }}
       # restore + save as separate steps: a failed build still keeps what it compiled
       - name: ccache restore
         uses: actions/cache/restore@v4
@@ -50,7 +48,6 @@ jobs:
           export CCACHE_DIR=$PWD/.ccache CCACHE_BASEDIR=$PWD CCACHE_MAXSIZE=1500M CCACHE_COMPRESS=1
           ccache -z
           scripts/build-kernel.sh
-          scripts/build-mali.sh
           ccache -s
       - name: ccache save
         if: always()
@@ -85,18 +82,4 @@ jobs:
         with:
           name: userspace
           path: out/userspace/
-          retention-days: 30
-
-  android:
-    # the runner image carries the Android NDK ($ANDROID_NDK_LATEST_HOME)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        run: scripts/build-android.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: android
-          path: out/android/
           retention-days: 30

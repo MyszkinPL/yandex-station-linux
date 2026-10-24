@@ -9,9 +9,6 @@ COMMON="-DWF2_SMP=1 -DWF2_RTC=1 -DWF2_THERMAL=1 -DWF2_CPUFREQ=1 -DWF2_WIFI=0 -DW
 variants=(
 	# Linux mode (stage B): serdev Bluetooth, LED ring and keys, audio
 	"station|$COMMON -DWF2_BT=2 -DWF2_LEDS_KEYS=1 -DWF2_AUDIO=1 -DWF2_PMIC=1"
-	# vendor Android / Quasar on this kernel: tty Bluetooth, LEDs/keys left
-	# to Quasar, PMIC node off, /firmware/android
-	"station-android|$COMMON -DWF2_BT=1 -DWF2_LEDS_KEYS=0 -DWF2_AUDIO=1 -DWF2_PMIC=0 -DWF2_QUASAR=1"
 )
 # Bring-up of a new kernel version: the board with every optional block off
 # (eMMC, Wi-Fi, watchdog: enough for stage B and SSH), then one block at a

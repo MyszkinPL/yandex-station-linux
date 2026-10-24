@@ -5,7 +5,7 @@
  * kernel never touches the voltages vendor U-Boot has set up.
  *
  * wf2 integration: the track DTS pieces (rtc, cpufreq, wifi, bluetooth,
- * leds-keys, audio, pmic, quasar-compat) merged on top of station-e1.dts.
+ * leds-keys, audio, pmic) merged on top of station-e1.dts.
  * Every piece is behind a WF2_* switch so the lead can build the test
  * batches of wf2/PLAN.md from this one file (wf2/integ/mkvariants.sh).
  * Pieces that need the wf2 Image (rtc-sun6i built in) are marked.
@@ -45,7 +45,7 @@
 #define WF2_WIFI_OOB	0
 #endif
 #ifndef WF2_BT
-#define WF2_BT		2	/* 0 none, 1 tty + rfkill (Quasar), 2 serdev no LPM, 3 serdev LPM */
+#define WF2_BT		2	/* 0 none, 2 serdev no LPM, 3 serdev LPM */
 #endif
 #ifndef WF2_BT_LPO
 #define WF2_BT_LPO	0	/* RTC LOSC_OUT as BT LPO, needs WF2_RTC */
@@ -58,9 +58,6 @@
 #endif
 #ifndef WF2_PMIC
 #define WF2_PMIC	1	/* 0 none, 1 node + always-on rails, no consumers (pmic1) */
-#endif
-#ifndef WF2_QUASAR
-#define WF2_QUASAR	0	/* 1: /firmware/android node (Quasar-mode DTB) */
 #endif
 
 #if WF2_BT_LPO && !WF2_RTC
@@ -76,7 +73,7 @@
 
 	aliases {
 		mmc0 = &mmc2;
-		/* vendor bus numbers: Quasar maind opens /dev/i2c-0, monitord /dev/i2c-1 */
+		/* the vendor kernel's bus numbers: /dev/i2c-0 LED ring, /dev/i2c-1 audio */
 		i2c0 = &i2c0;
 		i2c1 = &i2c1;
 #if WF2_BT
@@ -96,38 +93,14 @@
 	 * hw_protection=reboot: a critical thermal trip resets through the WDT
 	 * instead of PSCI SYSTEM_OFF (unsafe on this board, E2).
 	 */
-	/*
-	 * selinux=0 for Debian: SELinux is built in only for the Quasar mode
-	 * (WF2_QUASAR), whose Android userspace loads its own policy. dtc does
-	 * not concatenate adjacent strings, so every combination is spelled out.
-	 */
+	/* dtc does not concatenate adjacent strings: both variants spelled out */
 	chosen {
-#if WF2_SMP && WF2_QUASAR
+#if WF2_SMP
 		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused hw_protection=reboot watchdog.stop_on_reboot=0 rdinit=/init";
-#elif WF2_SMP
-		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused hw_protection=reboot watchdog.stop_on_reboot=0 selinux=0 rdinit=/init";
-#elif WF2_QUASAR
-		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused maxcpus=1 hw_protection=reboot watchdog.stop_on_reboot=0 rdinit=/init";
 #else
-		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused maxcpus=1 hw_protection=reboot watchdog.stop_on_reboot=0 selinux=0 rdinit=/init";
+		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused maxcpus=1 hw_protection=reboot watchdog.stop_on_reboot=0 rdinit=/init";
 #endif
 	};
-
-#if WF2_QUASAR
-	/*
-	 * Android 6 init (Allwinner build of AOSP M) turns every property here
-	 * into ro.boot.<name>, like androidboot.<name>= on the cmdline. Our shim
-	 * replaces the vendor FDT (and with it U-Boot's androidboot.hardware=),
-	 * so the Quasar/Android ramdisk would not find init.sun50iw1p1.rc
-	 * without it. No kernel driver binds to this node. (quasar-compat)
-	 */
-	firmware {
-		android {
-			compatible = "android,firmware";
-			hardware = "sun50iw1p1";
-		};
-	};
-#endif
 
 	memory@40000000 {
 		device_type = "memory";
@@ -312,17 +285,6 @@
 	scp-dvfs {
 		compatible = "allwinner,sun50i-a64-scp-dvfs";
 		allwinner,ccu = <&ccu>;
-	};
-#endif
-
-#if WF2_BT == 1
-	/* BT_REG_ON as an rfkill switch for a userspace BT stack on /dev/ttyS1 */
-	rfkill-bt {
-		compatible = "rfkill-gpio";
-		label = "bt_reg_on";
-		radio-type = "bluetooth";
-		shutdown-gpios = <&r_pio 0 4 GPIO_ACTIVE_HIGH>; /* PL4 */
-		default-blocked;
 	};
 #endif
 
@@ -1038,8 +1000,7 @@
  * Vendor: bt_rst_n PL4 = module BT_REG_ON, btlpm bt_wake PL6 (active high),
  * bt_hostwake PL5 (EINT, active high), uart_index 1, I/O from vcc-wifi-io.
  * UART1 runs from APB2 = 24 MHz: 1.5 Mbaud is the highest exact rate.
- * WF2_BT 1: plain /dev/ttyS1 + rfkill (vendor Bluedroid / Quasar mode).
- * WF2_BT 2/3: serdev + hci_bcm (BlueZ); /dev/ttyS1 does not exist then.
+ * WF2_BT 2/3: serdev + hci_bcm (BlueZ).
  * (bluetooth)
  */
 &uart1 {

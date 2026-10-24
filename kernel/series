@@ -10,7 +10,6 @@
 0010-asoc-dt-bindings-audio-graph-port-allow-tdm-slot-masks.patch
 0011-leds-add-the-yandex-station-led-ring.patch
 0012-mfd-axp20x-reach-the-axp803-through-the-allwinner-bsp-bl31.patch
-0013-android-forward-port-ashmem.patch
 0014-watchdog-sunxi-restart-before-psci.patch
 0015-clk-sunxi-ng-a64-enable-pll-lock-detection.patch
 0016-asoc-tas571x-retry-first-access-after-pvdd.patch
@@ -19,8 +18,6 @@
 0019-asoc-tas571x-keep-tas5751m-at-24-bit-serial-data.patch
 0020-asoc-tas571x-probe-asynchronously.patch
 0021-asoc-tas571x-vendor-compatible-tas5751m-controls.patch
-0022-selinux-read-android-6-ioctl-rule-layout.patch
 0023-wifi-brcmfmac-sdio-take-the-mac-address-from-the-cis.patch
 0024-reset-gpio-support-gpio-controllers-with-more-than-two-cells.patch
 0025-bluetooth-hci_bcm-let-the-controller-settle-after-a-baud-rate-change.patch
-0026-dma-buf-sync_file-the-sync-interface-of-android-6.patch

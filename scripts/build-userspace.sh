@@ -1,6 +1,6 @@
 #!/bin/bash
-# Static arm64 busybox and kexec for the initramfs, and strace for debugging
-# (the Android mode), built from source.
+# Static arm64 busybox and kexec for the initramfs, and strace for debugging,
+# built from source.
 #   usage: scripts/build-userspace.sh [jobs]    -> out/userspace/{busybox,kexec,strace}
 set -euo pipefail
 TOP=$(cd "$(dirname "$0")/.." && pwd)
