@@ -3,11 +3,13 @@
 """Ramdisk to run the Station's own Android 6 / Quasar on this kernel.
 
     mkramdisk.py --boot-img boot.img --busybox busybox --mali mali.ko \
-                 --libion64 lib64/libion.so --libion32 lib/libion.so -o android-ramdisk.cpio.gz
+                 --libion64 lib64/libion.so --libion32 lib/libion.so \
+                 --hwcomposer lib64/hw/hwcomposer.drm.so -o android-ramdisk.cpio.gz
 
 It is the vendor boot.img ramdisk with the smallest changes this kernel needs,
-all in init.sun50iw1p1.rc plus files under /sbin/station; /system is used as
-it is on the Station (some files are bind-mounted over, nothing is written):
+in init.sun50iw1p1.rc and ueventd.sun50iw1p1.rc plus files under /sbin/station;
+/system is used as it is on the Station (some files are bind-mounted over,
+nothing is written):
   - binder from binderfs (/dev/binder is a link; ueventd of Android 6 only
     knows the misc device, which binderfs kernels do not have);
   - station_wd (/sbin/station-android.sh) feeds the watchdog in place of the
@@ -15,10 +17,11 @@ it is on the Station (some files are bind-mounted over, nothing is written):
   - GPU: mali.ko (ARM r10p0 speaking the r6p0 interface of the vendor
     libGLES_mali), loaded at early-init;
   - ION: libion.so over DMA-BUF heaps (android/libion) in place of the
-    vendor libion, whose kernel interface mainline does not have;
-  - no hwcomposer: hwcomposer.tulip needs the Allwinner display driver
-    (/dev/disp); without it SurfaceFlinger posts through the framebuffer HAL
-    of gralloc on /dev/graphics/fb0 (DRM fbdev emulation).
+    vendor libion, whose kernel interface mainline does not have; the heaps
+    are open to all, as /dev/ion was;
+  - display: hwcomposer over DRM/KMS (android/hwcomposer) in place of
+    hwcomposer.tulip, which drives the Allwinner display driver (/dev/disp);
+    the vendor gralloc has no framebuffer HAL to fall back to.
 rdinit=/station-init mirrors the kernel log into misc, then runs /init.
 """
 import argparse
@@ -33,6 +36,7 @@ import cpio  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RC = "init.sun50iw1p1.rc"
+UEVENTD_RC = "ueventd.sun50iw1p1.rc"
 
 
 def strace_service(rc, name):
@@ -72,19 +76,18 @@ def patch_rc(rc):
             "service station_wd /sbin/station/busybox sh /sbin/station-android.sh\n"
             "    class core\n    user root\n    group root\n    seclabel u:r:init:s0\n")
     rc += ("\n# mainline kernel: ION from DMA-BUF heaps, no Allwinner display driver\n"
-           "on init\n"
-           "    chmod 0666 /dev/dma_heap/system\n\n"
            "on post-fs\n"
            "    mount none /sbin/station/libion64.so /system/lib64/libion.so bind\n"
            "    mount none /sbin/station/libion32.so /system/lib/libion.so bind\n"
-           "    mount none /sbin/station/empty /system/lib64/hw/hwcomposer.tulip.so bind\n"
+           "    mount none /sbin/station/hwcomposer.drm.so /system/lib64/hw/hwcomposer.tulip.so bind\n"
+           "    # SurfaceFlinger is 64-bit; nothing 32-bit may load the vendor one\n"
            "    mount none /sbin/station/empty /system/lib/hw/hwcomposer.tulip.so bind\n")
     return rc
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    for name in ("boot-img", "busybox", "mali", "libion64", "libion32"):
+    for name in ("boot-img", "busybox", "mali", "libion64", "libion32", "hwcomposer"):
         ap.add_argument("--" + name, required=True)
     ap.add_argument("--strace", nargs=2, metavar=("STRACE", "SERVICE"),
                     help="debug: run SERVICE under this static strace")
@@ -103,6 +106,10 @@ def main():
         text = None
         if name == RC:
             text = patch_rc(data.decode())
+        elif name == UEVENTD_RC:
+            text = data.decode().rstrip("\n") + (
+                "\n# mainline kernel: ION is DMA-BUF heaps (android/libion)\n"
+                "/dev/dma_heap/*            0666    system      graphics\n")
         if a.strace and name.endswith(".rc"):
             t = strace_service(text if text is not None else data.decode(), a.strace[1])
             if t is not None:
@@ -117,6 +124,7 @@ def main():
         ("sbin/station/mali.ko", 0o100640, open(a.mali, "rb").read()),
         ("sbin/station/libion64.so", 0o100644, open(a.libion64, "rb").read()),
         ("sbin/station/libion32.so", 0o100644, open(a.libion32, "rb").read()),
+        ("sbin/station/hwcomposer.drm.so", 0o100644, open(a.hwcomposer, "rb").read()),
         ("sbin/station/empty", 0o100644, b""),
         ("sbin/station-android.sh", 0o100750, lf(os.path.join(HERE, "station-android.sh"))),
         ("station-init", 0o100750, lf(os.path.join(HERE, "station-init.sh"))),

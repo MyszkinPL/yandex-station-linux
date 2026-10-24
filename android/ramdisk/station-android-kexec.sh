@@ -35,14 +35,14 @@ parts=$parts:media_data@mmcblk0p22:UDISK@mmcblk0p1
 # must never reach the vendor ATF's SYSTEM_SUSPEND. rt_group_sched=1:
 # Android init writes cpu.rt_runtime_us. snd-aloop card 4: Quasar's echo
 # reference. Then U-Boot's androidboot.* arguments.
-# HDMI forced on (the "e"): the framebuffer HAL needs /dev/fb0 even when no
-# TV is connected, as the vendor display driver always provides one
+# HDMI forced on (the "e"): SurfaceFlinger needs a display mode even when no
+# TV is connected, as the vendor display driver always provided one
 cmd="console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60e"
 cmd="$cmd loglevel=4 printk.devkmsg=on panic=5 clk_ignore_unused hw_protection=reboot"
 cmd="$cmd watchdog.stop_on_reboot=0 mem_sleep_default=s2idle rt_group_sched=1"
 cmd="$cmd snd_aloop.index=4 rdinit=/station-init partitions=$parts"
-# two framebuffer pages: gralloc's framebuffer HAL flips with FBIOPAN_DISPLAY
-cmd="$cmd drm_kms_helper.drm_fbdev_overalloc=200"
+# CMA for the buffers the display scans out (android/libion), 64 MiB by default
+cmd="$cmd cma=128M"
 # station.debug: logcat goes into the kernel log too, so give that room
 [ -n "$STATION_DEBUG" ] && cmd="$cmd station.debug=1 log_buf_len=4M"
 cmd="$cmd androidboot.selinux=permissive androidboot.serialno=$sn androidboot.hardware=sun50iw1p1"
