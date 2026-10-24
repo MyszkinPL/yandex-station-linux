@@ -19,33 +19,35 @@ Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 ---
 --- a/drivers/reset/core.c
 +++ b/drivers/reset/core.c
-@@ -903,20 +903,65 @@
- /*
-  * @args:	phandle to the GPIO provider with all the args like GPIO number
-  */
+@@ -1005,6 +1005,47 @@
+ 	       !memcmp(left->args, right->args, sizeof(left->args[0]) * left->nargs);
+ }
+ 
 +#ifdef CONFIG_OF_GPIO
 +/*
 + * Chip-relative number and OF flags of a GPIO specifier that is not the
 + * usual <number flags>, e.g. the <bank pin flags> of Allwinner pin
 + * controllers: the GPIO chip translates it, as it does for gpiolib.
 + */
-+static int reset_gpio_chip_xlate(const struct of_phandle_args *args,
++static int reset_gpio_chip_xlate(struct gpio_device *gdev,
++				 const struct fwnode_reference_args *args,
 +				 unsigned int *offset, unsigned int *flags)
 +{
-+	struct gpio_device *gdev __free(gpio_device_put) =
-+			gpio_device_find_by_fwnode(of_fwnode_handle(args->np));
-+	struct gpio_chip *gc;
++	struct gpio_chip *gc = gpio_device_get_chip(gdev);
++	struct of_phandle_args spec = { };
 +	u32 of_flags = 0;
-+	int ret;
++	int i, ret;
 +
-+	if (!gdev)
-+		return -EPROBE_DEFER;
-+
-+	gc = gpio_device_get_chip(gdev);
-+	if (!gc || !gc->of_xlate || gc->of_gpio_n_cells != args->args_count)
++	if (!is_of_node(args->fwnode) || !gc || !gc->of_xlate ||
++	    gc->of_gpio_n_cells != args->nargs || args->nargs > MAX_PHANDLE_ARGS)
 +		return -ENOENT;
 +
-+	ret = gc->of_xlate(gc, args, &of_flags);
++	spec.np = to_of_node(args->fwnode);
++	spec.args_count = args->nargs;
++	for (i = 0; i < args->nargs; i++)
++		spec.args[i] = args->args[i];
++
++	ret = gc->of_xlate(gc, &spec, &of_flags);
 +	if (ret < 0)
 +		return ret;
 +
@@ -54,59 +56,88 @@ Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 +	return 0;
 +}
 +#else
-+static int reset_gpio_chip_xlate(const struct of_phandle_args *args,
++static int reset_gpio_chip_xlate(struct gpio_device *gdev,
++				 const struct fwnode_reference_args *args,
 +				 unsigned int *offset, unsigned int *flags)
 +{
 +	return -ENOENT;
 +}
 +#endif
 +
- static int __reset_add_reset_gpio_device(const struct of_phandle_args *args)
- {
- 	struct reset_gpio_lookup *rgpio_dev;
- 	struct platform_device *pdev;
-+	unsigned int offset, flags;
- 	int id, ret;
+ /*
+  * @np: OF-node associated with the consumer
+  * @args: Reference to the GPIO provider with all the args like GPIO number
+@@ -1019,23 +1060,31 @@
+ 	int ret, prop = 0;
  
  	/*
 -	 * Currently only #gpio-cells=2 is supported with the meaning of:
-+	 * #gpio-cells=2 means:
- 	 * args[0]: GPIO number
- 	 * args[1]: GPIO flags
+-	 * args[0]: GPIO number
+-	 * args[1]: GPIO flags
 -	 * TODO: Handle other cases.
-+	 * Other layouts are translated by the GPIO chip.
- 	 */
--	if (args->args_count != 2)
+-	 */
+-	if (args->nargs != 2)
 -		return -ENOENT;
-+	if (args->args_count == 2) {
+-
+-	/*
+ 	 * Registering reset-gpio device might cause immediate
+ 	 * bind, resulting in its probe() registering new reset controller thus
+ 	 * taking reset_list_mutex lock via reset_controller_register().
+ 	 */
+ 	lockdep_assert_not_held(&reset_list_mutex);
+ 
+-	offset = args->args[0];
+-	flags = args->args[1];
++	struct gpio_device *gdev __free(gpio_device_put) =
++			gpio_device_find_by_fwnode(args->fwnode);
++	if (!gdev)
++		return -EPROBE_DEFER;
++
++	/*
++	 * #gpio-cells=2 means:
++	 * args[0]: GPIO number
++	 * args[1]: GPIO flags
++	 * Other layouts are translated by the GPIO chip.
++	 */
++	if (args->nargs == 2) {
 +		offset = args->args[0];
 +		flags = args->args[1];
 +	} else {
-+		ret = reset_gpio_chip_xlate(args, &offset, &flags);
++		ret = reset_gpio_chip_xlate(gdev, args, &offset, &flags);
 +		if (ret)
 +			return ret;
 +	}
  
  	/*
- 	 * Registering reset-gpio device might cause immediate
-@@ -945,8 +990,7 @@
- 		goto err_ida_free;
+ 	 * Later we map GPIO flags between OF and Linux, however not all
+@@ -1051,11 +1100,6 @@
+ 		return -EINVAL;
  	}
  
--	ret = __reset_add_reset_gpio_lookup(id, args->np, args->args[0],
--					    args->args[1]);
-+	ret = __reset_add_reset_gpio_lookup(id, args->np, offset, flags);
- 	if (ret < 0)
- 		goto err_kfree;
+-	struct gpio_device *gdev __free(gpio_device_put) =
+-			gpio_device_find_by_fwnode(args->fwnode);
+-	if (!gdev)
+-		return -EPROBE_DEFER;
+-
+ 	guard(mutex)(&reset_gpio_lookup_mutex);
  
+ 	list_for_each_entry(rgpio_dev, &reset_gpio_lookup_list, list) {
 --- a/drivers/reset/reset-gpio.c
 +++ b/drivers/reset/reset-gpio.c
-@@ -92,7 +92,7 @@
- 		return ret;
+@@ -55,6 +55,7 @@
+ 			    const struct auxiliary_device_id *id)
+ {
+ 	struct device *dev = &adev->dev;
++	const struct fwnode_reference_args *spec = dev_get_platdata(dev);
+ 	struct reset_gpio_priv *priv;
+ 
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+@@ -71,7 +72,7 @@
+ 	priv->rc.dev = dev;
  
  	/* Cells to match GPIO specifier, but it's not really used */
--	priv->rc.of_reset_n_cells = 2;
-+	priv->rc.of_reset_n_cells = platdata->args_count;
- 	priv->rc.of_xlate = reset_gpio_of_xlate;
+-	priv->rc.fwnode_reset_n_cells = 2;
++	priv->rc.fwnode_reset_n_cells = spec->nargs;
+ 	priv->rc.fwnode_xlate = reset_gpio_fwnode_xlate;
  	priv->rc.nr_resets = 1;
  
