@@ -7,9 +7,11 @@
  * by the Android-mode ramdisk (bind mount), nothing on /system changes.
  *
  * "Handles" are small integers local to the process, each owning one dma-buf
- * fd; share/map hand out duplicates of that fd. The heap mask is ignored:
- * the GPU has its own MMU and the display reads the framebuffer, so every
- * buffer comes from the system heap.
+ * fd; share/map hand out duplicates of that fd. Heaps: the vendor gralloc
+ * asks for its contiguous heaps (masks 0x2 and 0x10) for buffers the display
+ * scans out (GRALLOC_USAGE_HW_FB), which the display engine, having no IOMMU,
+ * needs physically contiguous: those come from the CMA heap. Everything else
+ * (textures, layers: the GPU has its own MMU) comes from the system heap.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -27,8 +29,32 @@ typedef int ion_user_handle_t;
 
 #define MAX_HANDLES 4096
 
+/* vendor ION heap masks that mean "physically contiguous" */
+#define ION_CONTIG_HEAPS 0x12
+
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int handle_fd[MAX_HANDLES];	/* 0 = free, else dma-buf fd + 1 */
+static int cma_fd = -2;			/* -2: not looked for yet, -1: no CMA heap */
+
+/* the CMA heap; its name follows the kernel's CMA area */
+static int cma_heap(void)
+{
+	static const char *const names[] = {
+		"/dev/dma_heap/linux,cma", "/dev/dma_heap/default_cma_region", "/dev/dma_heap/reserved",
+	};
+
+	pthread_mutex_lock(&lock);
+	for (unsigned int i = 0; cma_fd == -2 && i < sizeof(names) / sizeof(names[0]); i++) {
+		int fd = open(names[i], O_RDONLY | O_CLOEXEC);
+
+		if (fd >= 0)
+			cma_fd = fd;
+	}
+	if (cma_fd == -2)
+		cma_fd = -1;
+	pthread_mutex_unlock(&lock);
+	return cma_fd;
+}
 
 static int heap_open(void)
 {
@@ -85,10 +111,15 @@ int ion_alloc_fd(int fd, size_t len, size_t align, unsigned int heap_mask,
 	};
 
 	(void)align;
-	(void)heap_mask;
 	(void)flags;
 	if (!handle_fd_out || !len)
 		return -EINVAL;
+	/* scanout buffers from CMA; the system heap when there is no CMA heap */
+	if ((heap_mask & ION_CONTIG_HEAPS) && cma_heap() >= 0 &&
+	    ioctl(cma_heap(), DMA_HEAP_IOCTL_ALLOC, &data) == 0) {
+		*handle_fd_out = data.fd;
+		return 0;
+	}
 	if (ioctl(fd, DMA_HEAP_IOCTL_ALLOC, &data) < 0)
 		return -errno;
 	*handle_fd_out = data.fd;
