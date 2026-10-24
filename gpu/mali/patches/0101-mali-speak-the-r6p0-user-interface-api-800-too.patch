@@ -528,10 +528,10 @@ index 42fd544..d6c11ed 100644
  	if (0 != put_user(kargs.version, &uargs->version)) return -EFAULT;
  	if (0 != put_user(kargs.compatible, &uargs->compatible)) return -EFAULT;
 diff --git a/src/devicedrv/mali/linux/mali_ukk_mem.c b/src/devicedrv/mali/linux/mali_ukk_mem.c
-index 1412cfc..3df15b9 100644
+index 1412cfc..4e23d05 100644
 --- a/src/devicedrv/mali/linux/mali_ukk_mem.c
 +++ b/src/devicedrv/mali/linux/mali_ukk_mem.c
-@@ -47,6 +47,41 @@ int mem_alloc_wrapper(struct mali_session_data *session_data, _mali_uk_alloc_mem
+@@ -47,6 +47,42 @@ int mem_alloc_wrapper(struct mali_session_data *session_data, _mali_uk_alloc_mem
  	return 0;
  }
  
@@ -558,6 +558,7 @@ index 1412cfc..3df15b9 100644
 +	kargs.vsize = r6.vsize;
 +	kargs.psize = r6.psize;
 +	kargs.flags = r6.flags;
++	kargs.backend_handle = r6.backend_handle;   /* handed back as it came, as both releases do */
 +	kargs.secure_shared_fd = -1;
 +
 +	err = _mali_ukk_mem_allocate(&kargs);
