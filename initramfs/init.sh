@@ -131,6 +131,9 @@ fi
 writelog early
 
 result=fail
+# --- loopback: services talk over localhost (SSH forwards, local ports) ---
+ip link set lo up
+
 # --- Wi-Fi ---
 i=0
 while [ ! -e /sys/class/net/wlan0 ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done
