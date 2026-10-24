@@ -31,11 +31,13 @@ jobs:
       - name: Tools
         run: apt-get update -qq && apt-get install -y -qq --no-install-recommends $PACKAGES > /dev/null
       - uses: actions/checkout@v4
-      - name: Kernel tarball cache
+      - name: Source tarball cache
         uses: actions/cache@v4
         with:
-          path: build/linux-*.tar.xz
-          key: linux-${{ hashFiles('kernel/linux.sha256') }}
+          path: |
+            build/linux-*.tar.xz
+            build/DX910-SW-99002-*.tgz
+          key: sources-${{ hashFiles('kernel/linux.sha256', 'gpu/mali/source.sha256') }}
       - name: ccache
         uses: actions/cache@v4
         with:
@@ -47,6 +49,7 @@ jobs:
           export CCACHE_DIR=$PWD/.ccache CCACHE_BASEDIR=$PWD CCACHE_MAXSIZE=1500M CCACHE_COMPRESS=1
           ccache -z
           scripts/build-kernel.sh
+          scripts/build-mali.sh
           ccache -s
       - uses: actions/upload-artifact@v4
         with:

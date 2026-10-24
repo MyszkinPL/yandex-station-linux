@@ -1,0 +1,265 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] mali: support building against 6.18
+
+On top of the Bootlin sunxi-mali series (bootlin/, up to 5.10):
+
+- vm_flags are read-only since 6.3: vm_flags_set()/vm_flags_clear();
+- access_ok() takes a user pointer;
+- platform_driver.remove returns void since 6.11;
+- shrinkers are allocated since 6.7 (shrinker_alloc/register/free);
+- of_property_for_each_u32() lost its iterator arguments in 6.11;
+- del_timer*() became timer_delete*() (6.2, the old names are gone);
+- the dma-buf API is in the DMA_BUF symbol namespace (5.16, a string
+  since 6.13).
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+diff --git a/src/devicedrv/mali/linux/mali_kernel_linux.c b/src/devicedrv/mali/linux/mali_kernel_linux.c
+index dfefad7..4adf1c7 100644
+--- a/src/devicedrv/mali/linux/mali_kernel_linux.c
++++ b/src/devicedrv/mali/linux/mali_kernel_linux.c
+@@ -186,7 +186,11 @@ static int mali_ioctl(struct inode *inode, struct file *filp, unsigned int cmd,
+ #endif
+ 
+ static int mali_probe(struct platform_device *pdev);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++static void mali_remove(struct platform_device *pdev);
++#else
+ static int mali_remove(struct platform_device *pdev);
++#endif
+ 
+ static int mali_driver_suspend_scheduler(struct device *dev);
+ static int mali_driver_resume_scheduler(struct device *dev);
+@@ -383,7 +387,11 @@ void mali_init_cpu_time_counters_on_all_cpus(int print_only)
+ 	while (jiffies_wait) jiffies_wait = schedule_timeout_uninterruptible(jiffies_wait);
+ 
+ 	for (i = 0 ; i < 8 ; i++) {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
++		timer_delete_sync(&mali_init_cpu_clock_timers[i]);
++#else
+ 		del_timer_sync(&mali_init_cpu_clock_timers[i]);
++#endif
+ 	}
+ 
+ 	if (print_only) {
+@@ -642,7 +650,11 @@ clock_prepare_failed:
+ 	return -EFAULT;
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++static void mali_remove(struct platform_device *pdev)
++#else
+ static int mali_remove(struct platform_device *pdev)
++#endif
+ {
+ #ifdef CONFIG_MALI_DEVFREQ
+ 	struct mali_device *mdev = dev_get_drvdata(&pdev->dev);
+@@ -680,7 +692,9 @@ static int mali_remove(struct platform_device *pdev)
+ 	mali_platform_device_deinit(mali_platform_device);
+ #endif
+ 	mali_platform_device = NULL;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+ 	return 0;
++#endif
+ }
+ 
+ static int mali_miscdevice_register(struct platform_device *pdev)
+@@ -1150,3 +1164,11 @@ module_exit(mali_module_exit);
+ MODULE_LICENSE(MALI_KERNEL_LINUX_LICENSE);
+ MODULE_AUTHOR("ARM Ltd.");
+ MODULE_VERSION(SVN_REV_STRING);
++#if defined(CONFIG_DMA_SHARED_BUFFER)
++/* the dma-buf API is in its own symbol namespace since 5.16 */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++MODULE_IMPORT_NS("DMA_BUF");
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
++MODULE_IMPORT_NS(DMA_BUF);
++#endif
++#endif
+diff --git a/src/devicedrv/mali/linux/mali_kernel_linux.h b/src/devicedrv/mali/linux/mali_kernel_linux.h
+index 7854d98..1daab66 100644
+--- a/src/devicedrv/mali/linux/mali_kernel_linux.h
++++ b/src/devicedrv/mali/linux/mali_kernel_linux.h
+@@ -40,7 +40,7 @@ extern int vm_insert_pfn(struct vm_area_struct *vma, unsigned long addr,
+ #endif
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+-#define _access_ok(TYPE, BUF, SIZE) access_ok(BUF, SIZE)
++#define _access_ok(TYPE, BUF, SIZE) access_ok((const void __user *)(uintptr_t)(BUF), SIZE)
+ #else
+ #define _access_ok(TYPE, BUF, SIZE) access_ok(TYPE, BUF, SIZE)
+ #endif
+diff --git a/src/devicedrv/mali/linux/mali_memory.c b/src/devicedrv/mali/linux/mali_memory.c
+index 55a5c3a..92366d1 100644
+--- a/src/devicedrv/mali/linux/mali_memory.c
++++ b/src/devicedrv/mali/linux/mali_memory.c
+@@ -266,14 +266,14 @@ int mali_mmap(struct file *filp, struct vm_area_struct *vma)
+ 		 * that it's present and can never be paged out (see also previous
+ 		 * entry)
+ 		 */
+-		vma->vm_flags |= VM_IO;
+-		vma->vm_flags |= VM_DONTCOPY;
+-		vma->vm_flags |= VM_PFNMAP;
++		vm_flags_set(vma, VM_IO);
++		vm_flags_set(vma, VM_DONTCOPY);
++		vm_flags_set(vma, VM_PFNMAP);
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 7, 0)
+-		vma->vm_flags |= VM_RESERVED;
++		vm_flags_set(vma, VM_RESERVED);
+ #else
+-		vma->vm_flags |= VM_DONTDUMP;
+-		vma->vm_flags |= VM_DONTEXPAND;
++		vm_flags_set(vma, VM_DONTDUMP);
++		vm_flags_set(vma, VM_DONTEXPAND);
+ #endif
+ 	} else if (MALI_MEM_SWAP == mali_alloc->type) {
+ 		vma->vm_pgoff = mem_bkend->start_idx;
+@@ -288,7 +288,7 @@ int mali_mmap(struct file *filp, struct vm_area_struct *vma)
+ 	if (!(vma->vm_flags & VM_WRITE)) {
+ 		MALI_DEBUG_PRINT(4, ("mmap allocation with read only !\n"));
+ 		/* add VM_WRITE for do_page_fault will check this when a write fault */
+-		vma->vm_flags |= VM_WRITE | VM_READ;
++		vm_flags_set(vma, VM_WRITE | VM_READ);
+ 		vma->vm_page_prot = PAGE_READONLY;
+ 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+ 		mem_bkend->flags |= MALI_MEM_BACKEND_FLAG_COW_CPU_NO_WRITE;
+diff --git a/src/devicedrv/mali/linux/mali_memory_cow.c b/src/devicedrv/mali/linux/mali_memory_cow.c
+index 7e3b7e5..b2ddae6 100644
+--- a/src/devicedrv/mali/linux/mali_memory_cow.c
++++ b/src/devicedrv/mali/linux/mali_memory_cow.c
+@@ -391,13 +391,13 @@ _mali_osk_errcode_t mali_memory_cow_modify_range(mali_mem_backend *backend,
+ 			}
+ 		} else {
+ 			/* used to trigger page fault for swappable cowed memory. */
+-			alloc->cpu_mapping.vma->vm_flags |= VM_PFNMAP;
+-			alloc->cpu_mapping.vma->vm_flags |= VM_MIXEDMAP;
++			vm_flags_set(alloc->cpu_mapping.vma, VM_PFNMAP);
++			vm_flags_set(alloc->cpu_mapping.vma, VM_MIXEDMAP);
+ 
+ 			zap_vma_ptes(alloc->cpu_mapping.vma, alloc->cpu_mapping.vma->vm_start + range_start, range_size);
+ 			/* delete this flag to let swappble is ummapped regard to stauct page not page frame. */
+-			alloc->cpu_mapping.vma->vm_flags &= ~VM_PFNMAP;
+-			alloc->cpu_mapping.vma->vm_flags &= ~VM_MIXEDMAP;
++			vm_flags_clear(alloc->cpu_mapping.vma, VM_PFNMAP);
++			vm_flags_clear(alloc->cpu_mapping.vma, VM_MIXEDMAP);
+ 		}
+ 	}
+ 
+diff --git a/src/devicedrv/mali/linux/mali_memory_os_alloc.c b/src/devicedrv/mali/linux/mali_memory_os_alloc.c
+index 202784d..274fd54 100644
+--- a/src/devicedrv/mali/linux/mali_memory_os_alloc.c
++++ b/src/devicedrv/mali/linux/mali_memory_os_alloc.c
+@@ -59,11 +59,12 @@ struct mali_mem_os_allocator mali_mem_os_allocator = {
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 12, 0)
+ 	.shrinker.shrink = mali_mem_os_shrink,
+-#else
++	.shrinker.seeks = DEFAULT_SEEKS,
++#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 7, 0)
+ 	.shrinker.count_objects = mali_mem_os_shrink_count,
+ 	.shrinker.scan_objects = mali_mem_os_shrink,
+-#endif
+ 	.shrinker.seeks = DEFAULT_SEEKS,
++#endif
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0)
+ 	.timed_shrinker = __DELAYED_WORK_INITIALIZER(mali_mem_os_allocator.timed_shrinker, mali_mem_os_trim_pool, TIMER_DEFERRABLE),
+ #elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+@@ -785,7 +786,20 @@ _mali_osk_errcode_t mali_mem_os_init(void)
+ 	dma_set_attr(DMA_ATTR_WRITE_COMBINE, &dma_attrs_wc);
+ #endif
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
++	mali_mem_os_allocator.shrinker = shrinker_alloc(0, "mali-mem");
++	if (!mali_mem_os_allocator.shrinker) {
++		destroy_workqueue(mali_mem_os_allocator.wq);
++		mali_mem_os_allocator.wq = NULL;
++		return _MALI_OSK_ERR_NOMEM;
++	}
++	mali_mem_os_allocator.shrinker->count_objects = mali_mem_os_shrink_count;
++	mali_mem_os_allocator.shrinker->scan_objects = mali_mem_os_shrink;
++	mali_mem_os_allocator.shrinker->seeks = DEFAULT_SEEKS;
++	shrinker_register(mali_mem_os_allocator.shrinker);
++#else
+ 	register_shrinker(&mali_mem_os_allocator.shrinker);
++#endif
+ 
+ 	return _MALI_OSK_ERR_OK;
+ }
+@@ -793,7 +807,11 @@ _mali_osk_errcode_t mali_mem_os_init(void)
+ void mali_mem_os_term(void)
+ {
+ 	struct mali_page_node *m_page, *m_tmp;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
++	shrinker_free(mali_mem_os_allocator.shrinker);
++#else
+ 	unregister_shrinker(&mali_mem_os_allocator.shrinker);
++#endif
+ 	cancel_delayed_work_sync(&mali_mem_os_allocator.timed_shrinker);
+ 
+ 	if (NULL != mali_mem_os_allocator.wq) {
+diff --git a/src/devicedrv/mali/linux/mali_memory_types.h b/src/devicedrv/mali/linux/mali_memory_types.h
+index 8202eaa..aec8995 100644
+--- a/src/devicedrv/mali/linux/mali_memory_types.h
++++ b/src/devicedrv/mali/linux/mali_memory_types.h
+@@ -153,7 +153,11 @@ struct mali_mem_os_allocator {
+ 	atomic_t allocated_pages;
+ 	size_t allocation_limit;
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
++	struct shrinker *shrinker;
++#else
+ 	struct shrinker shrinker;
++#endif
+ 	struct delayed_work timed_shrinker;
+ 	struct workqueue_struct *wq;
+ };
+diff --git a/src/devicedrv/mali/linux/mali_osk_mali.c b/src/devicedrv/mali/linux/mali_osk_mali.c
+index f9e72ba..13ec39c 100644
+--- a/src/devicedrv/mali/linux/mali_osk_mali.c
++++ b/src/devicedrv/mali/linux/mali_osk_mali.c
+@@ -238,7 +238,11 @@ void _mali_osk_device_data_pmu_config_get(u16 *domain_config_array, int array_si
+ 		return;
+ 	}
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++	of_property_for_each_u32(node, "pmu_domain_config", u) {
++#else
+ 	of_property_for_each_u32(node, "pmu_domain_config", prop, p, u) {
++#endif
+ 		domain_config_array[i] = (u16)u;
+ 		i++;
+ 	}
+diff --git a/src/devicedrv/mali/linux/mali_osk_timers.c b/src/devicedrv/mali/linux/mali_osk_timers.c
+index 628a9cf..1e434da 100644
+--- a/src/devicedrv/mali/linux/mali_osk_timers.c
++++ b/src/devicedrv/mali/linux/mali_osk_timers.c
+@@ -14,6 +14,7 @@
+  */
+ 
+ #include <linux/timer.h>
++#include <linux/version.h>
+ #include <linux/slab.h>
+ #include "mali_osk.h"
+ #include "mali_kernel_common.h"
+@@ -56,13 +57,21 @@ void _mali_osk_timer_mod(_mali_osk_timer_t *tim, unsigned long ticks_to_expire)
+ void _mali_osk_timer_del(_mali_osk_timer_t *tim)
+ {
+ 	MALI_DEBUG_ASSERT_POINTER(tim);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
++	timer_delete_sync(&(tim->timer));
++#else
+ 	del_timer_sync(&(tim->timer));
++#endif
+ }
+ 
+ void _mali_osk_timer_del_async(_mali_osk_timer_t *tim)
+ {
+ 	MALI_DEBUG_ASSERT_POINTER(tim);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
++	timer_delete(&(tim->timer));
++#else
+ 	del_timer(&(tim->timer));
++#endif
+ }
+ 
+ mali_bool _mali_osk_timer_pending(_mali_osk_timer_t *tim)
