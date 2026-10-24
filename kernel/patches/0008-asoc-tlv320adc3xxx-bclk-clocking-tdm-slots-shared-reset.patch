@@ -18,7 +18,58 @@ single RESET line between them. Support that:
 
 Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 ---
+diff --git a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
+index 66b7665..677f3cd 100644
+--- a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
++++ b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
+@@ -37,11 +37,35 @@ properties:
+ 
+   reset-gpios:
+     maxItems: 1
+-    description: GPIO pin used for codec reset (RESET pin)
++    description: |
++      GPIO pin used for codec reset (RESET pin). Several ADCs may share one
++      line; with the reset-gpio driver enabled the line is then released
++      once, when the first of them probes.
+ 
+   clocks:
+     maxItems: 1
+-    description: Master clock (MCLK)
++    description: |
++      Master clock (MCLK). When absent, the converters are clocked from the
++      bit clock of the audio serial bus (CODEC_CLKIN = BCLK) and the device
++      can only be a bit/frame clock consumer.
++
++  port:
++    $ref: audio-graph-port.yaml#
++    unevaluatedProperties: false
++
++  ti,invert-bclk:
++    type: boolean
++    description: |
++      Invert the bit clock polarity (page 0 / register 29, bit D3) on top of
++      what the DAI format of the link selects, for hosts that sample on the
++      other edge than the one the format implies.
++
++  ti,swap-channels:
++    type: boolean
++    description: |
++      Transmit the right channel first (page 0 / register 38, bit D4), e.g.
++      to put the right ADC into the upper half of a 32-bit host slot that
++      carries both 16-bit channels.
+ 
+   ti,dmdin-gpio1:
+     $ref: /schemas/types.yaml#/definitions/uint32
+@@ -131,7 +155,6 @@ dependencies:
+ required:
+   - compatible
+   - reg
+-  - clocks
+ 
+ unevaluatedProperties: false
+ 
 diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
+index d7d958e..7247eb1 100644
 --- a/sound/soc/codecs/tlv320adc3xxx.c
 +++ b/sound/soc/codecs/tlv320adc3xxx.c
 @@ -22,6 +22,7 @@
@@ -67,7 +118,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  
  /*  Analog PGA control bits */
  #define ADC3XXX_LPGA_MUTE		0x80
-@@ -328,6 +346,19 @@
+@@ -328,6 +346,19 @@ struct adc3xxx {
  	u8 page_no;
  	int use_pll;
  	struct gpio_chip gpio_chip;
@@ -87,7 +138,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  };
  
  static const unsigned int adc3xxx_gpio_ctrl_reg[ADC3XXX_GPIO_PINS] = {
-@@ -781,6 +812,17 @@
+@@ -781,6 +812,17 @@ static const struct snd_kcontrol_new adc3xxx_snd_controls[] = {
  
  	TI_COEFFICIENTS("Right ADC IIR Coefficients N0 N1 D1",
  			ADC3XXX_RIGHT_ADC_IIR_COEFF_N0_MSB, 3),
@@ -105,7 +156,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  };
  
  /* Left input selection, Single Ended inputs and Differential inputs */
-@@ -1188,6 +1230,134 @@
+@@ -1188,6 +1230,134 @@ static void adc3xxx_setup_pll(struct snd_soc_component *component,
  				(adc3xxx_divs[i].pll_d >> 8) & ADC3XXX_PLLD_MSB_MASK);
  }
  
@@ -204,7 +255,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
 +				       struct adc3xxx *adc3xxx,
 +				       struct snd_pcm_hw_params *params)
 +{
-+	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(component);
++	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 +	unsigned int rate = params_rate(params);
 +	unsigned int frame, nadc;
 +
@@ -240,9 +291,9 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  static int adc3xxx_hw_params(struct snd_pcm_substream *substream,
  			     struct snd_pcm_hw_params *params,
  			     struct snd_soc_dai *dai)
-@@ -1195,39 +1365,31 @@
+@@ -1195,39 +1365,31 @@ static int adc3xxx_hw_params(struct snd_pcm_substream *substream,
  	struct snd_soc_component *component = dai->component;
- 	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(dai->component);
+ 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(dai->component);
  	struct adc3xxx *adc3xxx = snd_soc_component_get_drvdata(component);
 -	int i, width = 16;
 +	int i, ret, width;
@@ -297,7 +348,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  	if (adc3xxx_divs[i].pll_p) { /* If PLL used for this mode */
  		adc3xxx_setup_pll(component, i);
  		snd_soc_component_write(component, ADC3XXX_CLKGEN_MUX, ADC3XXX_USE_PLL);
-@@ -1318,6 +1480,11 @@
+@@ -1318,6 +1480,11 @@ static int adc3xxx_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
  		return -EINVAL;
  	}
  
@@ -309,7 +360,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  	/*
  	 * match both interface format and signal polarities since they
  	 * are fixed
-@@ -1359,6 +1526,46 @@
+@@ -1359,6 +1526,46 @@ static int adc3xxx_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
  					    clkdir | format);
  	if (ret < 0)
  		return ret;
@@ -356,7 +407,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  	return 0;
  }
  
-@@ -1366,6 +1573,7 @@
+@@ -1366,6 +1573,7 @@ static const struct snd_soc_dai_ops adc3xxx_dai_ops = {
  	.hw_params	= adc3xxx_hw_params,
  	.set_sysclk	= adc3xxx_set_dai_sysclk,
  	.set_fmt	= adc3xxx_set_dai_fmt,
@@ -364,7 +415,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  };
  
  static struct snd_soc_dai_driver adc3xxx_dai = {
-@@ -1397,6 +1605,11 @@
+@@ -1397,6 +1605,11 @@ static const struct i2c_device_id adc3xxx_i2c_id[] = {
  };
  MODULE_DEVICE_TABLE(i2c, adc3xxx_i2c_id);
  
@@ -376,7 +427,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  static int adc3xxx_i2c_probe(struct i2c_client *i2c)
  {
  	struct device *dev = &i2c->dev;
-@@ -1408,21 +1621,31 @@
+@@ -1408,21 +1621,31 @@ static int adc3xxx_i2c_probe(struct i2c_client *i2c)
  		return -ENOMEM;
  	adc3xxx->dev = dev;
  
@@ -420,7 +471,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  		return dev_err_probe(dev, PTR_ERR(adc3xxx->mclk),
  				     "Failed to acquire MCLK\n");
  	} else if (adc3xxx->mclk) {
-@@ -1430,8 +1653,14 @@
+@@ -1430,8 +1653,14 @@ static int adc3xxx_i2c_probe(struct i2c_client *i2c)
  		if (ret < 0)
  			return ret;
  		dev_dbg(dev, "Enabled MCLK, freq %lu Hz\n", clk_get_rate(adc3xxx->mclk));
@@ -435,7 +486,7 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  	/* Configure mode for DMDIN/GPIO1 pin */
  	ret = adc3xxx_parse_dt_gpio(adc3xxx, "ti,dmdin-gpio1", &adc3xxx->gpio_cfg[0]);
  	if (ret < 0)
-@@ -1468,9 +1697,37 @@
+@@ -1468,9 +1697,37 @@ static int adc3xxx_i2c_probe(struct i2c_client *i2c)
  	adc3xxx->type = (uintptr_t)i2c_get_match_data(i2c);
  
  	/* Reset codec chip */
@@ -476,52 +527,3 @@ diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
  
  	/* Potentially set up pins used as GPIOs */
  	adc3xxx_init_gpio(adc3xxx);
-diff --git a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
---- a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
-+++ b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
-@@ -37,11 +37,35 @@
- 
-   reset-gpios:
-     maxItems: 1
--    description: GPIO pin used for codec reset (RESET pin)
-+    description: |
-+      GPIO pin used for codec reset (RESET pin). Several ADCs may share one
-+      line; with the reset-gpio driver enabled the line is then released
-+      once, when the first of them probes.
- 
-   clocks:
-     maxItems: 1
--    description: Master clock (MCLK)
-+    description: |
-+      Master clock (MCLK). When absent, the converters are clocked from the
-+      bit clock of the audio serial bus (CODEC_CLKIN = BCLK) and the device
-+      can only be a bit/frame clock consumer.
-+
-+  port:
-+    $ref: audio-graph-port.yaml#
-+    unevaluatedProperties: false
-+
-+  ti,invert-bclk:
-+    type: boolean
-+    description: |
-+      Invert the bit clock polarity (page 0 / register 29, bit D3) on top of
-+      what the DAI format of the link selects, for hosts that sample on the
-+      other edge than the one the format implies.
-+
-+  ti,swap-channels:
-+    type: boolean
-+    description: |
-+      Transmit the right channel first (page 0 / register 38, bit D4), e.g.
-+      to put the right ADC into the upper half of a 32-bit host slot that
-+      carries both 16-bit channels.
- 
-   ti,dmdin-gpio1:
-     $ref: /schemas/types.yaml#/definitions/uint32
-@@ -131,7 +155,6 @@
- required:
-   - compatible
-   - reg
--  - clocks
- 
- unevaluatedProperties: false
- 
