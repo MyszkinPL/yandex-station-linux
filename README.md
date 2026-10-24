@@ -1,49 +1,48 @@
-# Linux 6.18 for the Yandex Station 1
+# Linux 6.18 для Яндекс Станции 1
 
-> Свежее ядро Linux для первой Яндекс Станции. Цель: родной Android с Алисой поверх него без изменений
-> (в работе) или своя система (уже работает: Wi-Fi, звук, кольцо, кнопки). Стоковая прошивка остаётся на месте, образ ставится в слот recovery.
+Свежее ядро Linux (mainline 6.18) для первой Яндекс Станции (YNDX-0001, Allwinner A64)
+вместо вендорского 3.10. Два режима:
 
-Mainline Linux on the first-generation Yandex Station (YNDX-0001, Allwinner A64),
-in place of the vendor 3.10 kernel. Two ways to use it:
+- **Linux-режим**: своя система (initramfs на busybox, дальше Debian с eMMC Станции),
+  с Wi-Fi, звуком, кольцом и кнопками;
+- **Android-режим**: родной Android 6 / Алиса Станции поверх этого ядра, без изменений
+  в самом Android (`android/`). В работе.
 
-- **Linux mode**: our own userspace (busybox initramfs, then Debian from the
-  Station's eMMC), with Wi-Fi, sound, the LED ring and the keys;
-- **Android mode**: the Station's own Android 6 / Quasar on this kernel,
-  unmodified (`android/`), for people who want to keep the stock assistant.
+Образ ставится в слот recovery. boot0, U-Boot, вендорское ядро и Android остаются на месте,
+так что Станция всегда может вернуться на стоковую прошивку.
 
-It boots from the recovery slot and leaves boot0, U-Boot, the vendor kernel and
-Android where they are, so the Station always falls back to the stock firmware.
-
-## Status
+## Что работает
 
 | | |
 |---|---|
-| CPU, 4 cores, DVFS through the vendor SCP firmware | works |
-| eMMC, Wi-Fi (AP6356S, brcmfmac) | works |
-| Speakers (2× TAS5751M), mic array (5× TLV320ADC3101) | works, vendor sound quality |
-| LED ring, keys, RTC, thermal | works |
-| HDMI console | works |
-| Bluetooth | in progress |
-| Android 6 on this kernel | init and services start; needs the GPU (Mali-400, in progress) for SurfaceFlinger |
+| CPU, 4 ядра, DVFS через вендорскую прошивку SCP | работает |
+| eMMC, Wi-Fi (AP6356S, brcmfmac) | работает |
+| Динамики (2× TAS5751M), микрофоны (5× TLV320ADC3101) | работает, звук как у вендора |
+| Кольцо, кнопки, RTC, датчики температуры | работает |
+| Консоль на HDMI | работает |
+| Bluetooth | в работе |
+| Android 6 на этом ядре | init и службы стартуют; для SurfaceFlinger нужна GPU (Mali-400, в работе) |
 
-## Layout
+## Что где
 
 ```
-kernel/VERSION, linux.sha256   upstream stable release we build on
-kernel/series, patches/        our patches, in order (git am / patch -p1)
-kernel/station.config          kernel configuration
-kernel/dts/                    the board's device tree (one source, DTB variants)
-boot/                          boot shim and the image packer (pure Python)
-initramfs/                     Linux-mode init
-android/                       running the vendor Android on this kernel
-scripts/                       build scripts used by CI
+kernel/VERSION, linux.sha256   версия upstream stable, на которой собираем
+kernel/series, patches/        наши патчи по порядку (patch -p1 / git am)
+kernel/station.config          конфиг ядра
+kernel/dts/                    device tree платы (один исходник, несколько вариантов DTB)
+boot/                          загрузочный shim и упаковщик образа (чистый Python)
+initramfs/                     init Linux-режима
+android/                       запуск вендорского Android на этом ядре
+scripts/                       скрипты сборки (их же запускает CI)
 ```
 
-## Building
+Описания патчей в `kernel/patches/` на английском: это формат ядра, иначе их не примут в mainline.
 
-Every push builds in GitHub Actions (`.github/workflows/build.yml`): the
-kernel, the DTBs, modules, the boot shim, and static busybox/kexec. The
-artifacts are on the run's page. Locally, on Debian/Ubuntu:
+## Сборка
+
+Каждый пуш собирается в GitHub Actions (`.github/workflows/build.yml`): ядро, DTB, модули,
+shim, статические busybox и kexec. Готовые файлы лежат на странице запуска (Artifacts).
+Локально, на Debian/Ubuntu:
 
 ```bash
 sudo apt install gcc-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev cpio kmod python3 ccache
@@ -51,21 +50,20 @@ scripts/build-kernel.sh
 scripts/build-userspace.sh
 ```
 
-### Packing a recovery image
+### Сборка образа recovery
 
-The kernel has no built-in initramfs: the files that cannot be published
-(your SSH key, the Wi-Fi firmware and the amplifier tuning from your own
-Station) go into `private/`, which git ignores; see the top of
-`initramfs/initramfs.list` for the list. Then, on any OS with Python 3:
+В ядре нет встроенного initramfs: то, что нельзя публиковать (свой SSH-ключ, прошивка Wi-Fi
+и настройки усилителей со своей же Станции), лежит в `private/`, которую git игнорирует.
+Список файлов в начале `initramfs/initramfs.list`. Дальше на любой ОС с Python 3:
 
 ```bash
 python3 boot/pack.py --shim out/shim.bin --image out/Image --dtb out/dtb/station.dtb --initramfs initramfs/initramfs.list -D BUILD=out/userspace -D PRIVATE=private -o recovery.img
 ```
 
-`pack.py` checks the memory layout against what the vendor U-Boot does
-(see its header) and refuses images that would not boot.
+`pack.py` сверяет раскладку памяти с тем, что делает вендорский U-Boot (см. начало файла),
+и не соберёт образ, который не загрузится.
 
-## Licence
+## Лицензия
 
-GPL-2.0, as the kernel (`COPYING`). `android/libion/` is Apache-2.0, as
-Android's own libion. No vendor binaries are included.
+GPL-2.0, как у ядра (`COPYING`). `android/libion/` под Apache-2.0, как libion самого Android.
+Вендорских бинарников в репозитории нет.
