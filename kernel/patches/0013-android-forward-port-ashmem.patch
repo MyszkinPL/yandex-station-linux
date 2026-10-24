@@ -45,7 +45,7 @@ new file mode 100644
 index 0000000..305bb9b
 --- /dev/null
 +++ b/drivers/android/ashmem.c
-@@ -0,0 +1,992 @@
+@@ -0,0 +1,998 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* mm/ashmem.c
 + *
@@ -512,16 +512,22 @@ index 0000000..305bb9b
 +	/*
 +	 * 5.15 did shmem_zero_setup() + vma_set_file(asma->file). The former
 +	 * is not exported any more, so do what the pair amounted to: make the
-+	 * backing shmem file the vma's file and let shmem's ->mmap() set the
-+	 * vm_ops (it does nothing else). Private mappings stay anonymous.
++	 * backing shmem file the vma's file and let shmem set the vm_ops (it
++	 * does nothing else). shmem has only ->mmap_prepare(); run it on this
++	 * vma the way stacked drivers do. Private mappings stay anonymous.
 +	 */
 +	vma_set_file(vma, asma->file);
 +	if (vma->vm_flags & VM_SHARED) {
-+		if (!ashmem_shmem_fops || !ashmem_shmem_fops->mmap) {
++		struct vm_area_desc desc;
++
++		if (!ashmem_shmem_fops || !ashmem_shmem_fops->mmap_prepare) {
 +			ret = -ENODEV;
 +			goto out;
 +		}
-+		ret = ashmem_shmem_fops->mmap(asma->file, vma);
++		compat_set_desc_from_vma(&desc, asma->file, vma);
++		ret = ashmem_shmem_fops->mmap_prepare(&desc);
++		if (!ret)
++			ret = __compat_vma_mmap(&desc, vma);
 +	} else {
 +		vma_set_anonymous(vma);
 +	}
