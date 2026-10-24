@@ -45,7 +45,7 @@ shim, статические busybox и kexec. Готовые файлы леж�
 Локально, на Debian/Ubuntu:
 
 ```bash
-sudo apt install gcc-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev cpio kmod python3 ccache
+sudo apt install gcc-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev cpio kmod python3 ccache wireless-regdb
 scripts/build-kernel.sh
 scripts/build-userspace.sh
 ```

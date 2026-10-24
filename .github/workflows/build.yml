@@ -20,7 +20,7 @@ env:
   PACKAGES: >-
     git ca-certificates curl xz-utils bzip2 zstd patch file make bc bison flex
     gcc gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross
-    libssl-dev libelf-dev cpio kmod python3 ccache
+    libssl-dev libelf-dev cpio kmod python3 ccache wireless-regdb
 
 jobs:
   kernel:
