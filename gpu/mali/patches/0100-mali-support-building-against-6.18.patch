@@ -10,10 +10,55 @@ On top of the Bootlin sunxi-mali series (bootlin/, up to 5.10):
 - of_property_for_each_u32() lost its iterator arguments in 6.11;
 - del_timer*() became timer_delete*() (6.2, the old names are gone);
 - the dma-buf API is in the DMA_BUF symbol namespace (5.16, a string
-  since 6.13).
+  since 6.13);
+- strlcpy() is gone since 6.8: strscpy();
+- dma_fence_ops.fence_value_str is gone since 6.16;
+- sunxi.c includes <linux/platform_device.h> itself.
 
 Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 ---
+diff --git a/src/devicedrv/mali/linux/mali_internal_sync.c b/src/devicedrv/mali/linux/mali_internal_sync.c
+index f608ba8..cadbf67 100644
+--- a/src/devicedrv/mali/linux/mali_internal_sync.c
++++ b/src/devicedrv/mali/linux/mali_internal_sync.c
+@@ -167,7 +167,11 @@ struct mali_internal_sync_timeline *mali_internal_sync_timeline_create(const str
+ #else
+ 	sync_timeline->fence_context = fence_context_alloc(1);
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
++	strscpy(sync_timeline->name, name, sizeof(sync_timeline->name));
++#else
+ 	strlcpy(sync_timeline->name, name, sizeof(sync_timeline->name));
++#endif
+ 
+ 	INIT_LIST_HEAD(&sync_timeline->sync_pt_list_head);
+ 	spin_lock_init(&sync_timeline->sync_pt_list_lock);
+@@ -760,6 +764,8 @@ static bool mali_internal_fence_enable_signaling(struct fence *fence)
+ 	return true;
+ }
+ 
++/* dma_fence_ops.fence_value_str is gone since 6.16 */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
+ static void mali_internal_fence_value_str(struct dma_fence *fence, char *str, int size)
+ #else
+@@ -778,6 +784,7 @@ static void mali_internal_fence_value_str(struct fence *fence, char *str, int si
+ 
+ 	parent->ops->print_sync_pt(sync_pt);
+ }
++#endif
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
+ static const struct dma_fence_ops fence_ops = {
+@@ -794,6 +801,8 @@ static const struct fence_ops fence_ops = {
+ 	.wait = fence_default_wait,
+ #endif
+ 	.release = mali_internal_fence_release,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+ 	.fence_value_str = mali_internal_fence_value_str,
++#endif
+ };
+ #endif
 diff --git a/src/devicedrv/mali/linux/mali_kernel_linux.c b/src/devicedrv/mali/linux/mali_kernel_linux.c
 index dfefad7..4adf1c7 100644
 --- a/src/devicedrv/mali/linux/mali_kernel_linux.c
@@ -263,3 +308,15 @@ index 628a9cf..1e434da 100644
  }
  
  mali_bool _mali_osk_timer_pending(_mali_osk_timer_t *tim)
+diff --git a/src/devicedrv/mali/platform/sunxi/sunxi.c b/src/devicedrv/mali/platform/sunxi/sunxi.c
+index a8df0d9..e9c1315 100644
+--- a/src/devicedrv/mali/platform/sunxi/sunxi.c
++++ b/src/devicedrv/mali/platform/sunxi/sunxi.c
+@@ -15,6 +15,7 @@
+ #include <linux/of_device.h>
+ #include <linux/of_irq.h>
+ #include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
+ #include <linux/slab.h>
