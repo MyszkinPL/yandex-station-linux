@@ -1,0 +1,302 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] ASoC: sun4i-i2s: add EDGE_TRANSFER, the MCLK output as a clock, round BCLK
+
+allwinner,edge-transfer sets FMT0 EDGE_TRANSFER on sun8i-h3 compatible
+controllers, as the Allwinner BSP always does. Without it the TAS5751M
+amplifiers and TLV320ADC3101 ADCs of the Yandex Station read every word's
+MSB on its transition.
+
+With #clock-cells the MCLK output is registered as a clock: while it is
+prepared the controller stays powered with MCLK on, so codecs on another
+controller (the Yandex Station amplifiers hang off I2S1, which has no
+MCLK pin, and take I2S0's) get MCLK without a capture stream running.
+The divider is shared with the DAI, and setting up a stream no longer
+clears the MCLK output enable for a moment (the amplifiers flagged an
+MCLK error each time a capture started).
+
+Round the BCLK divider to the closest value: with integer PLL-Audio
+factors the module clock runs 24.571 MHz, and truncating 7.998 to 7
+fails every 48 kHz stream.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/sound/soc/sunxi/sun4i-i2s.c
++++ b/sound/soc/sunxi/sun4i-i2s.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <linux/clk.h>
++#include <linux/clk-provider.h>
+ #include <linux/dmaengine.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -107,6 +108,7 @@
+ #define SUN8I_I2S_FMT0_BCLK_POLARITY_MASK	BIT(7)
+ #define SUN8I_I2S_FMT0_BCLK_POLARITY_INVERTED		(1 << 7)
+ #define SUN8I_I2S_FMT0_BCLK_POLARITY_NORMAL		(0 << 7)
++#define SUN8I_I2S_FMT0_EDGE_TRANSFER		BIT(3)
+ 
+ #define SUN8I_I2S_FMT1_REG_SEXT_MASK		GENMASK(5, 4)
+ #define SUN8I_I2S_FMT1_REG_SEXT(sext)			((sext) << 4)
+@@ -209,6 +211,7 @@
+ };
+ 
+ struct sun4i_i2s {
++	struct device	*dev;
+ 	struct clk	*bus_clk;
+ 	struct clk	*mod_clk;
+ 	struct regmap	*regmap;
+@@ -218,6 +221,10 @@
+ 	unsigned int	mclk_freq;
+ 	unsigned int	slots;
+ 	unsigned int	slot_width;
++	bool		edge_transfer;
++
++	/* MCLK output as a clock provider, see sun4i_i2s_register_mclk() */
++	struct clk_hw	mclk_hw;
+ 
+ 	struct snd_dmaengine_dai_dma_data	capture_dma_data;
+ 	struct snd_dmaengine_dai_dma_data	playback_dma_data;
+@@ -292,7 +299,12 @@
+ 				  unsigned int word_size)
+ {
+ 	const struct sun4i_i2s_clk_div *dividers = i2s->variant->bclk_dividers;
+-	int div = parent_rate / sampling_rate / word_size / channels;
++	/*
++	 * Round: the module clock may run a few hundred ppm off the
++	 * nominal 22.5792/24.576 MHz (integer PLL factors).
++	 */
++	int div = DIV_ROUND_CLOSEST(parent_rate,
++				    sampling_rate * word_size * channels);
+ 	int i;
+ 
+ 	for (i = 0; i < i2s->variant->num_bclk_dividers; i++) {
+@@ -397,9 +409,14 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	regmap_write(i2s->regmap, SUN4I_I2S_CLK_DIV_REG,
+-		     SUN4I_I2S_CLK_DIV_BCLK(bclk_div) |
+-		     SUN4I_I2S_CLK_DIV_MCLK(mclk_div));
++	/*
++	 * Leave the MCLK output enable alone: through the MCLK clock it
++	 * may feed codecs that must not see it drop when a stream starts.
++	 */
++	regmap_update_bits(i2s->regmap, SUN4I_I2S_CLK_DIV_REG,
++			   ~BIT(i2s->variant->field_clkdiv_mclk_en.lsb),
++			   SUN4I_I2S_CLK_DIV_BCLK(bclk_div) |
++			   SUN4I_I2S_CLK_DIV_MCLK(mclk_div));
+ 
+ 	regmap_field_write(i2s->field_clkdiv_mclk_en, 1);
+ 
+@@ -801,10 +818,18 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * EDGE_TRANSFER moves the data to the other BCLK edge, as the
++	 * Allwinner BSP always does. Some codecs otherwise sample on the
++	 * edge the controller launches data on and read garbage as soon
++	 * as the data is not all zeroes.
++	 */
+ 	regmap_update_bits(i2s->regmap, SUN4I_I2S_FMT0_REG,
+ 			   SUN8I_I2S_FMT0_LRCLK_POLARITY_MASK |
+-			   SUN8I_I2S_FMT0_BCLK_POLARITY_MASK,
+-			   lrclk_pol | bclk_pol);
++			   SUN8I_I2S_FMT0_BCLK_POLARITY_MASK |
++			   SUN8I_I2S_FMT0_EDGE_TRANSFER,
++			   lrclk_pol | bclk_pol |
++			   (i2s->edge_transfer ? SUN8I_I2S_FMT0_EDGE_TRANSFER : 0));
+ 
+ 	/* DAI clock master masks */
+ 	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+@@ -1499,6 +1524,138 @@
+ 	.set_fmt		= sun50i_h6_i2s_set_soc_fmt,
+ };
+ 
++/*
++ * The MCLK output as a clock, for boards whose codecs need MCLK while
++ * this controller is not streaming (e.g. amplifiers on another I2S
++ * controller that has no MCLK pin). While it is prepared the controller
++ * stays powered with the MCLK output on. The divider is shared with the
++ * DAI, so the DAI's mclk-fs must give the same MCLK rate.
++ */
++static struct sun4i_i2s *mclk_hw_to_sun4i_i2s(struct clk_hw *hw)
++{
++	return container_of(hw, struct sun4i_i2s, mclk_hw);
++}
++
++static int sun4i_i2s_mclk_prepare(struct clk_hw *hw)
++{
++	struct sun4i_i2s *i2s = mclk_hw_to_sun4i_i2s(hw);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(i2s->dev);
++	if (ret)
++		return ret;
++
++	return regmap_field_write(i2s->field_clkdiv_mclk_en, 1);
++}
++
++static void sun4i_i2s_mclk_unprepare(struct clk_hw *hw)
++{
++	struct sun4i_i2s *i2s = mclk_hw_to_sun4i_i2s(hw);
++
++	pm_runtime_put(i2s->dev);
++}
++
++static unsigned long sun4i_i2s_mclk_recalc_rate(struct clk_hw *hw,
++						unsigned long parent_rate)
++{
++	struct sun4i_i2s *i2s = mclk_hw_to_sun4i_i2s(hw);
++	unsigned int val;
++	int i;
++
++	regmap_read(i2s->regmap, SUN4I_I2S_CLK_DIV_REG, &val);
++	val &= SUN4I_I2S_CLK_DIV_MCLK_MASK;
++
++	for (i = 0; i < i2s->variant->num_mclk_dividers; i++)
++		if (i2s->variant->mclk_dividers[i].val == val)
++			return parent_rate / i2s->variant->mclk_dividers[i].div;
++
++	return 0;
++}
++
++static int sun4i_i2s_mclk_determine_rate(struct clk_hw *hw,
++					 struct clk_rate_request *req)
++{
++	struct sun4i_i2s *i2s = mclk_hw_to_sun4i_i2s(hw);
++	struct clk_hw *parent = clk_hw_get_parent(hw);
++	unsigned long best_rate = 0, best_parent_rate = 0;
++	int i;
++
++	for (i = 0; i < i2s->variant->num_mclk_dividers; i++) {
++		unsigned int div = i2s->variant->mclk_dividers[i].div;
++		unsigned long parent_rate, rate;
++
++		parent_rate = clk_hw_round_rate(parent, req->rate * div);
++		rate = parent_rate / div;
++		if (abs_diff(rate, req->rate) < abs_diff(best_rate, req->rate)) {
++			best_rate = rate;
++			best_parent_rate = parent_rate;
++		}
++	}
++
++	if (!best_rate)
++		return -EINVAL;
++
++	req->rate = best_rate;
++	req->best_parent_hw = parent;
++	req->best_parent_rate = best_parent_rate;
++
++	return 0;
++}
++
++static int sun4i_i2s_mclk_set_rate(struct clk_hw *hw, unsigned long rate,
++				   unsigned long parent_rate)
++{
++	struct sun4i_i2s *i2s = mclk_hw_to_sun4i_i2s(hw);
++	int div;
++
++	div = sun4i_i2s_get_mclk_div(i2s, parent_rate, rate);
++	if (div < 0)
++		return div;
++
++	return regmap_update_bits(i2s->regmap, SUN4I_I2S_CLK_DIV_REG,
++				  SUN4I_I2S_CLK_DIV_MCLK_MASK,
++				  SUN4I_I2S_CLK_DIV_MCLK(div));
++}
++
++static const struct clk_ops sun4i_i2s_mclk_ops = {
++	.prepare	= sun4i_i2s_mclk_prepare,
++	.unprepare	= sun4i_i2s_mclk_unprepare,
++	.recalc_rate	= sun4i_i2s_mclk_recalc_rate,
++	.determine_rate	= sun4i_i2s_mclk_determine_rate,
++	.set_rate	= sun4i_i2s_mclk_set_rate,
++};
++
++static int sun4i_i2s_register_mclk(struct sun4i_i2s *i2s)
++{
++	struct device *dev = i2s->dev;
++	const struct clk_hw *parent = __clk_get_hw(i2s->mod_clk);
++	struct clk_init_data init = {};
++	int ret;
++
++	if (!of_property_present(dev->of_node, "#clock-cells"))
++		return 0;
++
++	if (of_property_read_string(dev->of_node, "clock-output-names",
++				    &init.name))
++		init.name = devm_kasprintf(dev, GFP_KERNEL, "%s-mclk",
++					   dev_name(dev));
++	if (!init.name)
++		return -ENOMEM;
++
++	init.ops = &sun4i_i2s_mclk_ops;
++	init.parent_hws = &parent;
++	init.num_parents = 1;
++	init.flags = CLK_SET_RATE_PARENT;
++	i2s->mclk_hw.init = &init;
++
++	ret = devm_clk_hw_register(dev, &i2s->mclk_hw);
++	if (ret)
++		return ret;
++
++	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get,
++					   &i2s->mclk_hw);
++}
++
+ static int sun4i_i2s_init_regmap_fields(struct device *dev,
+ 					struct sun4i_i2s *i2s)
+ {
+@@ -1534,6 +1691,7 @@
+ 	if (!i2s)
+ 		return -ENOMEM;
+ 	platform_set_drvdata(pdev, i2s);
++	i2s->dev = &pdev->dev;
+ 
+ 	regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+ 	if (IS_ERR(regs))
+@@ -1605,6 +1763,15 @@
+ 		goto err_suspend;
+ 	}
+ 
++	i2s->edge_transfer = of_property_read_bool(pdev->dev.of_node,
++						   "allwinner,edge-transfer");
++
++	ret = sun4i_i2s_register_mclk(i2s);
++	if (ret) {
++		dev_err(&pdev->dev, "Could not register the MCLK output\n");
++		goto err_suspend;
++	}
++
+ 	ret = devm_snd_dmaengine_pcm_register(&pdev->dev, NULL, 0);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "Could not register PCM\n");
+--- a/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-i2s.yaml
++++ b/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-i2s.yaml
+@@ -64,6 +64,24 @@
+     $ref: audio-graph-port.yaml#
+     unevaluatedProperties: false
+ 
++  "#clock-cells":
++    const: 0
++    description:
++      The controller's MCLK output, for codecs that need MCLK while
++      this controller is not streaming. The DAI's mclk-fs must give the
++      same rate.
++
++  clock-output-names:
++    maxItems: 1
++
++  allwinner,edge-transfer:
++    type: boolean
++    description:
++      Move the serial data to the other BCLK edge (FMT0 EDGE_TRANSFER,
++      sun8i-h3 compatible controllers), as the Allwinner BSP does. Needed
++      when the codec samples data on the edge the controller launches
++      it on.
++
+ allOf:
+   - $ref: dai-common.yaml#
+   - if:

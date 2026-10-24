@@ -1,0 +1,75 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] wifi: brcmfmac: sdio: take the MAC address from the CIS
+
+Modules such as the AMPAK AP6356S of the Yandex Station keep their own
+MAC address in OTP, which the chip presents as a Broadcom vendor tuple
+(CISTPL_BRCM_HNBU, HNBU_MACADDR) of its SDIO CIS, and ship an nvram file
+that names one sample address (00:90:4c:1a:10:01) for every module. The
+firmware takes the nvram one, so all such boards come up with the same
+address unless the device tree gives each its own.
+
+The MMC core already keeps the unknown CIS tuples on the function. When
+the platform gives no address, use the one found there, as the vendor
+bcmdhd driver does (dhd_conf_get_otp()). A device tree address still
+wins, and nothing changes for modules without the tuple.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/sdio.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/sdio.c
+@@ -10,6 +10,7 @@
+ #include <linux/printk.h>
+ #include <linux/pci_ids.h>
+ #include <linux/netdevice.h>
++#include <linux/etherdevice.h>
+ #include <linux/interrupt.h>
+ #include <linux/sched/signal.h>
+ #include <linux/mmc/sdio.h>
+@@ -3947,6 +3948,38 @@
+ 	.write32 = brcmf_sdio_buscore_write32,
+ };
+ 
++/* Broadcom vendor tuple in the SDIO CIS and its MAC address entry */
++#define BRCMF_CISTPL_BRCM_HNBU	0x80
++#define BRCMF_HNBU_MACADDR	0x19
++
++/*
++ * Without an address from the platform (device tree), take the one in the
++ * module's OTP, which the chip shows as a vendor tuple of its SDIO CIS.
++ * Modules such as the AMPAK AP6356S carry their own address there, while
++ * the nvram file they ship with names one sample address for all of them;
++ * the vendor driver (bcmdhd dhd_conf_get_otp()) reads it the same way.
++ */
++static void brcmf_sdio_cis_mac(struct brcmf_sdio_dev *sdiodev)
++{
++	u8 *mac = sdiodev->settings->mac;
++	struct sdio_func_tuple *t;
++
++	if (is_valid_ether_addr(mac))
++		return;
++
++	for (t = sdiodev->func1->tuples; t; t = t->next) {
++		if (t->code != BRCMF_CISTPL_BRCM_HNBU || t->size < 1 + ETH_ALEN ||
++		    t->data[0] != BRCMF_HNBU_MACADDR)
++			continue;
++		if (!is_valid_ether_addr(&t->data[1]))
++			break;
++		ether_addr_copy(mac, &t->data[1]);
++		brcmf_dbg(INFO, "MAC address from the SDIO CIS: %pM
++", mac);
++		return;
++	}
++}
++
+ static int
+ brcmf_sdio_probe_attach(struct brcmf_sdio *bus)
+ {
+@@ -4011,6 +4044,8 @@
+ 		ret = PTR_ERR_OR_ZERO(sdiodev->settings);
+ 		goto fail;
+ 	}
++	brcmf_sdio_cis_mac(sdiodev);
++
+ 	/* platform specific configuration:
+ 	 *   alignments must be at least 4 bytes for ADMA
+ 	 */

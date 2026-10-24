@@ -1,0 +1,118 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] clk: sunxi-ng: a64: run PLL-Audio from integer factors
+
+The sigma-delta modulated 24.576 MHz setting jitters badly enough that the
+TAS5751M amplifiers of the Yandex Station, clocked from MCLK/BCLK derived
+from it, flag MCLK errors all the time and output noise that follows the
+signal envelope instead of the signal. With the vendor (Allwinner BSP)
+setting, N = 86, M = 21, P = 4 and the modulator off, the error flag stays
+clear and the speech is reproduced (mic loopback: waveform correlation
+0.68 against 0.01).
+
+Run pll-audio-base from integer N/M only, hard code the 1x post-divider to
+4 again and keep the base at 90 MHz or more, so the I2S/codec mux always
+picks the 1x output. 24.576 MHz becomes 24.571 MHz (-186 ppm), 22.5792
+MHz becomes 22.571 MHz (-340 ppm). Pick the closest rate: rates passed
+down from child clocks are truncated, and rounding down made the PLL flip
+between 86/21 and 45/11 on stream starts.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-a64.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-a64.c
+@@ -40,34 +40,43 @@
+ };
+ 
+ /*
+- * The Audio PLL is supposed to have 4 outputs: 3 fixed factors from
+- * the base (2x, 4x and 8x), and one variable divider (the one true
+- * pll audio).
++ * The Audio PLL has 4 outputs: 3 fixed factors from the base (2x, 4x
++ * and 8x), and one variable divider (the one true pll audio), which is
++ * hard coded to 4 here.
+  *
+- * With sigma-delta modulation for fractional-N on the audio PLL,
+- * we have to use specific dividers. This means the variable divider
+- * can no longer be used, as the audio codec requests the exact clock
+- * rates we support through this mechanism. So we now hard code the
+- * variable divider to 1. This means the clock rates will no longer
+- * match the clock names.
++ * The base runs from integer N/M factors only. With the sigma-delta
++ * modulator enabled for fractional-N rates the PLL output jitters badly
++ * enough that a TAS5751M amplifier fed with an MCLK and BCLK derived
++ * from it keeps flagging MCLK errors and outputs noise instead of the
++ * signal (Yandex Station). The Allwinner BSP kernel never enables the
++ * modulator either and runs 24.571 MHz from N = 86, M = 21, P = 4, the
++ * closest integer match to 24.576 MHz (-186 ppm); the 22.5792 MHz
++ * family gets 90.286 MHz / 4 (-340 ppm).
++ *
++ * The lower limit keeps the VCO at the BSP's 90+ MHz and makes the
++ * 2x/4x/8x outputs useless for audio rates, so the I2S and codec
++ * clocks always take the 1x output. The closest rate is picked: rates
++ * passed down from children are truncated (4 * 24571428 is 2 Hz below
++ * 86/21), and rounding down would flip the PLL between 86/21 and 45/11
++ * on every stream start, glitching any MCLK taken from it.
+  */
+ #define SUN50I_A64_PLL_AUDIO_REG	0x008
+ 
+-static struct ccu_sdm_setting pll_audio_sdm_table[] = {
+-	{ .rate = 22579200, .pattern = 0xc0010d84, .m = 8, .n = 7 },
+-	{ .rate = 24576000, .pattern = 0xc000ac02, .m = 14, .n = 14 },
++static struct ccu_nm pll_audio_base_clk = {
++	.enable		= BIT(31),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT(8, 7),
++	.m		= _SUNXI_CCU_DIV(0, 5),
++	.min_rate	= 90000000,
++	.common		= {
++		.reg		= 0x008,
++		.features	= CCU_FEATURE_CLOSEST_RATE,
++		.hw.init	= CLK_HW_INIT("pll-audio-base", "osc24M",
++					      &ccu_nm_ops,
++					      CLK_SET_RATE_UNGATE),
++	},
+ };
+ 
+-static SUNXI_CCU_NM_WITH_SDM_GATE_LOCK(pll_audio_base_clk, "pll-audio-base",
+-				       "osc24M", 0x008,
+-				       8, 7,	/* N */
+-				       0, 5,	/* M */
+-				       pll_audio_sdm_table, BIT(24),
+-				       0x284, BIT(31),
+-				       BIT(31),	/* gate */
+-				       BIT(28),	/* lock */
+-				       CLK_SET_RATE_UNGATE);
+-
+ static SUNXI_CCU_NM_WITH_FRAC_GATE_LOCK_MIN_MAX_CLOSEST(pll_video0_clk, "pll-video0",
+ 						"osc24M", 0x010,
+ 						192000000,	/* Minimum rate */
+@@ -613,10 +622,10 @@
+ 	&pll_audio_base_clk.common.hw
+ };
+ 
+-/* We hardcode the divider to 1 for now */
++/* We hardcode the divider to 4 for now */
+ static CLK_FIXED_FACTOR_HWS(pll_audio_clk, "pll-audio",
+ 			    clk_parent_pll_audio,
+-			    1, 1, CLK_SET_RATE_PARENT);
++			    4, 1, CLK_SET_RATE_PARENT);
+ static CLK_FIXED_FACTOR_HWS(pll_audio_2x_clk, "pll-audio-2x",
+ 			    clk_parent_pll_audio,
+ 			    2, 1, CLK_SET_RATE_PARENT);
+@@ -955,10 +964,13 @@
+ 	if (IS_ERR(reg))
+ 		return PTR_ERR(reg);
+ 
+-	/* Force the PLL-Audio-1x divider to 1 */
++	/*
++	 * Force the PLL-Audio-1x divider to 4 and switch the sigma-delta
++	 * modulator off, see pll_audio_base_clk.
++	 */
+ 	val = readl(reg + SUN50I_A64_PLL_AUDIO_REG);
+-	val &= ~GENMASK(19, 16);
+-	writel(val | (0 << 16), reg + SUN50I_A64_PLL_AUDIO_REG);
++	val &= ~(GENMASK(19, 16) | BIT(24));
++	writel(val | (3 << 16), reg + SUN50I_A64_PLL_AUDIO_REG);
+ 
+ 	writel(0x515, reg + SUN50I_A64_PLL_MIPI_REG);
+ 

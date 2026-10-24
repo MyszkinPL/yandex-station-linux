@@ -1,0 +1,44 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] clk: sunxi-ng: a64: enable PLL lock detection
+
+The PLL lock bits (bit 28 of each PLL control register) only report lock
+when the matching enable bit in PLL_LOCK_CTRL (0x320, bits 0-12) is set.
+The vendor boot firmware of the Yandex Station 1 leaves all of them clear
+(the register reads 0x10000000), so every rate change of a PLL waits the
+whole 70 ms timeout in ccu_helper_wait_for_lock() and warns, e.g. on each
+cpufreq transition of PLL-CPUX.
+
+Verified on the board: with bits 0-12 set, every running PLL (CPUX,
+VIDEO0, PERIPH0, MIPI, HSIC, DE, DDR1) reads locked, disabled ones read
+unlocked, and cpufreq transitions complete without the timeout.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-a64.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-a64.c
+@@ -165,6 +165,9 @@
+  */
+ #define SUN50I_A64_PLL_MIPI_REG		0x040
+ 
++#define SUN50I_A64_PLL_LOCK_CTRL_REG	0x320
++#define SUN50I_A64_PLL_LOCK_ENABLE_ALL	GENMASK(12, 0)
++
+ static struct ccu_nkm pll_mipi_clk = {
+ 	/*
+ 	 * The bit 23 and 22 are called "LDO{1,2}_EN" on the SoC's
+@@ -959,6 +962,15 @@
+ 
+ 	writel(0x515, reg + SUN50I_A64_PLL_MIPI_REG);
+ 
++	/*
++	 * The PLL lock bits only report lock when enabled here; some boot
++	 * firmware leaves them all off, and every PLL rate change would then
++	 * wait out the 70 ms lock timeout and warn.
++	 */
++	val = readl(reg + SUN50I_A64_PLL_LOCK_CTRL_REG);
++	writel(val | SUN50I_A64_PLL_LOCK_ENABLE_ALL,
++	       reg + SUN50I_A64_PLL_LOCK_CTRL_REG);
++
+ 	ret = devm_sunxi_ccu_probe(&pdev->dev, reg, &sun50i_a64_ccu_desc);
+ 	if (ret)
+ 		return ret;

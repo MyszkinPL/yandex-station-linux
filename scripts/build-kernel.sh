@@ -1,0 +1,57 @@
+#!/bin/bash
+# Build the Station kernel: linux-$(cat kernel/VERSION) + kernel/series, our
+# config and DTBs, plus the boot shim. Used by CI; runs the same on any
+# Debian/Ubuntu machine with gcc-aarch64-linux-gnu.
+#   usage: scripts/build-kernel.sh [jobs]      (tarball in build/ or downloaded)
+# Output in out/: Image, dtb/*.dtb, modules.tar.gz, shim.bin, config,
+# System.map, kernel.release, SHA256SUMS.
+set -euo pipefail
+TOP=$(cd "$(dirname "$0")/.." && pwd)
+V=$(cat "$TOP/kernel/VERSION")
+B=$TOP/build; S=$B/linux-$V; O=$B/obj; OUT=$TOP/out
+J=${1:-$(nproc)}
+export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+export KBUILD_BUILD_USER=station KBUILD_BUILD_HOST=station-linux
+CC="aarch64-linux-gnu-gcc"
+command -v ccache >/dev/null && CC="ccache $CC"
+mkdir -p "$B" "$OUT"
+
+# --- source ---
+T=$B/linux-$V.tar.xz
+[ -f "$T" ] || curl -fL --retry 3 -o "$T" "https://cdn.kernel.org/pub/linux/kernel/v${V%%.*}.x/linux-$V.tar.xz"
+(cd "$B" && sha256sum -c --quiet "$TOP/kernel/linux.sha256")
+rm -rf "$S"
+tar -C "$B" -xf "$T"
+while read -r p; do
+	case "$p" in ''|'#'*) continue ;; esac
+	patch -d "$S" -p1 -s --no-backup-if-mismatch < "$TOP/kernel/patches/$p" || { echo "FAILED: $p"; exit 1; }
+	echo "applied $p"
+done < "$TOP/kernel/series"
+cp "$TOP/kernel/dts/sun50i-a64-yandex-station.dts" "$S/arch/arm64/boot/dts/allwinner/"
+echo 'dtb-$(CONFIG_ARCH_SUNXI) += sun50i-a64-yandex-station.dtb' >> "$S/arch/arm64/boot/dts/allwinner/Makefile"
+
+# --- config ---
+mkdir -p "$O"
+cp "$TOP/kernel/station.config" "$O/.config"
+make -s -C "$S" O="$O" CC="$CC" olddefconfig
+missing=$(grep '^CONFIG_.*=[ym]$' "$TOP/kernel/station.config" | while IFS= read -r l; do
+	grep -qxF "$l" "$O/.config" || echo "  $l"; done)
+[ -z "$missing" ] || { echo "options lost by olddefconfig:"; echo "$missing"; exit 1; }
+
+# --- build ---
+make -s -C "$S" O="$O" CC="$CC" -j"$J" Image modules
+rm -rf "$B/modroot"
+make -s -C "$S" O="$O" INSTALL_MOD_PATH="$B/modroot" INSTALL_MOD_STRIP=1 modules_install
+tar -C "$B/modroot" --owner=0 --group=0 --sort=name --mtime=@0 -czf "$OUT/modules.tar.gz" lib
+"$TOP/kernel/dts/build-dtbs.sh" "$S" "$OUT/dtb"
+
+# --- boot shim (boot/pack.py puts DTB, Image and initramfs behind it) ---
+aarch64-linux-gnu-gcc -c -o "$B/shim.o" "$TOP/boot/shim.S"
+aarch64-linux-gnu-ld -Ttext=0x40080000 -o "$B/shim.elf" "$B/shim.o"
+aarch64-linux-gnu-objcopy -O binary "$B/shim.elf" "$OUT/shim.bin"
+
+cp "$O/arch/arm64/boot/Image" "$O/System.map" "$OUT/"
+cp "$O/.config" "$OUT/config"
+cat "$O/include/config/kernel.release" > "$OUT/kernel.release"
+(cd "$OUT" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
+echo "kernel $(cat "$OUT/kernel.release"), modules: $(find "$B/modroot" -name '*.ko' | wc -l)"

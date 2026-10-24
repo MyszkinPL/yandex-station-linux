@@ -1,0 +1,42 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] ASoC: tas571x: retry the first register access after PVDD comes up
+
+On the Yandex Station 1 the first write to the first TAS5751M (0x2a) after
+the shared 20 V PVDD rail is switched on ends in an I2C bus error
+("mv64xxx_i2c_fsm: Ctlr Error -- state: 0x2, status: 0x0") and the probe
+fails with -EAGAIN; the second amplifier, probed once the rail is up, and a
+re-bind of the first one both succeed. The rail takes longer than the 100 ms
+settle time to come up. Retry the first access for up to half a second.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/sound/soc/codecs/tas571x.c
++++ b/sound/soc/codecs/tas571x.c
+@@ -1207,6 +1207,7 @@
+  * the digital supplies may go. The bulk capacitance is board specific and
+  * unknown here, so this is a generous guess.
+  */
++#define TAS571X_FIRST_ACCESS_TRIES	10
+ #define TAS571X_LATE_SUPPLY_OFF_MS	300
+ 
+ /*
+@@ -1335,7 +1336,18 @@
+ 		msleep(100);
+ 	}
+ 
+-	ret = regmap_write(priv->regmap, TAS571X_OSC_TRIM_REG, 0);
++	/*
++	 * The first access right after PVDD comes up can hit the power stage
++	 * still ramping: on the Yandex Station the 20 V rail takes longer than
++	 * the 100 ms above, and the transfer ends in an I2C bus error (-EAGAIN
++	 * from i2c-mv64xxx). Retry it for up to half a second.
++	 */
++	for (i = 0; i < TAS571X_FIRST_ACCESS_TRIES; i++) {
++		ret = regmap_write(priv->regmap, TAS571X_OSC_TRIM_REG, 0);
++		if (!ret)
++			break;
++		msleep(50);
++	}
+ 	if (ret)
+ 		goto disable_late;
+ 

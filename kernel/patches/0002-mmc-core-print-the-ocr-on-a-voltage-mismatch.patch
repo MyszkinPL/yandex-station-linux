@@ -1,0 +1,30 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] mmc: core: print the OCR on a voltage mismatch
+
+mmc_select_voltage() only says that the card voltage is not supported;
+print the card OCR next to the host mask, so a board with a wrong
+vmmc/vqmmc setup can be told from a card asking for an unsupported range.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -1119,6 +1119,7 @@
+  */
+ u32 mmc_select_voltage(struct mmc_host *host, u32 ocr)
+ {
++	u32 card_ocr = ocr;
+ 	int bit;
+ 
+ 	/*
+@@ -1133,7 +1134,9 @@
+ 
+ 	ocr &= host->ocr_avail;
+ 	if (!ocr) {
+-		dev_warn(mmc_dev(host), "no support for card's volts\n");
++		dev_warn(mmc_dev(host),
++			 "no support for card's volts (card ocr %#010x, host ocr_avail %#010x)\n",
++			 card_ocr, host->ocr_avail);
+ 		return 0;
+ 	}
+ 

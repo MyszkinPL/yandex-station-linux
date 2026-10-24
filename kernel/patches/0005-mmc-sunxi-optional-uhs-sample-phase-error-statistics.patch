@@ -1,0 +1,101 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] mmc: sunxi: optional UHS sample phase, error statistics
+
+Add an optional "allwinner,uhs-sample-phase" property (90/180/270 degrees)
+for SDR50/SDR104 in the new timing mode (SMHC_NTSR bits 5:4); without it
+the reset default stays as before. Also count command and data errors in
+the debugfs err_stats, so marginal links (the Station's SDIO Wi-Fi) can be
+measured.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -221,6 +221,8 @@
+ #define SDXC_CLK_50M_DDR_8BIT	4
+ 
+ #define SDXC_2X_TIMING_MODE	BIT(31)
++#define SDXC_NTSR_SAMPLE_PHASE_SHIFT	4	/* 0: 90, 1: 180, 2: 270 deg */
++#define SDXC_NTSR_SAMPLE_PHASE_MASK	(0x3 << SDXC_NTSR_SAMPLE_PHASE_SHIFT)
+ 
+ #define SDXC_CAL_START		BIT(15)
+ #define SDXC_CAL_DONE		BIT(14)
+@@ -301,6 +303,14 @@
+ 
+ 	/* timings */
+ 	bool		use_new_timings;
++
++	/*
++	 * NTSR sample phase field for UHS SDR50/SDR104 from the optional
++	 * "allwinner,uhs-sample-phase" property (-1: not set, keep the
++	 * reset default as before), and the field as found after reset.
++	 */
++	int		uhs_sample_phase;
++	u32		ntsr_phase_default;
+ };
+ 
+ static int sunxi_mmc_reset_host(struct sunxi_mmc_host *host)
+@@ -505,6 +515,17 @@
+ 		host->int_sum & SDXC_START_BIT_ERROR ? " SBE"    : "",
+ 		host->int_sum & SDXC_END_BIT_ERROR   ? " EBE"    : ""
+ 		);
++
++	/* make the errors visible in <debugfs>/mmcN/err_stats */
++	if (host->int_sum & SDXC_RESP_TIMEOUT)
++		mmc_debugfs_err_stats_inc(host->mmc, MMC_ERR_CMD_TIMEOUT);
++	if (host->int_sum & (SDXC_RESP_CRC_ERROR | SDXC_RESP_ERROR))
++		mmc_debugfs_err_stats_inc(host->mmc, MMC_ERR_CMD_CRC);
++	if (host->int_sum & SDXC_DATA_TIMEOUT)
++		mmc_debugfs_err_stats_inc(host->mmc, MMC_ERR_DAT_TIMEOUT);
++	if (host->int_sum & (SDXC_DATA_CRC_ERROR | SDXC_START_BIT_ERROR |
++			     SDXC_END_BIT_ERROR))
++		mmc_debugfs_err_stats_inc(host->mmc, MMC_ERR_DAT_CRC);
+ }
+ 
+ /* Called in interrupt context! */
+@@ -836,6 +857,15 @@
+ 		/* Don't touch the delay bits */
+ 		rval = mmc_readl(host, REG_SD_NTSR);
+ 		rval |= SDXC_2X_TIMING_MODE;
++		if (host->uhs_sample_phase >= 0) {
++			rval &= ~SDXC_NTSR_SAMPLE_PHASE_MASK;
++			if (ios->timing == MMC_TIMING_UHS_SDR50 ||
++			    ios->timing == MMC_TIMING_UHS_SDR104)
++				rval |= host->uhs_sample_phase <<
++					SDXC_NTSR_SAMPLE_PHASE_SHIFT;
++			else
++				rval |= host->ntsr_phase_default;
++		}
+ 		mmc_writel(host, REG_SD_NTSR, rval);
+ 	}
+ 
+@@ -1443,6 +1473,29 @@
+ 		goto error_free_dma;
+ 
+ 	/*
++	 * Optional sample phase for UHS SDR50/SDR104 in the new timing mode
++	 * (SMHC_NTSR bits 5:4, SMHC0/1 only). The vendor DT for this board
++	 * seems to ask for 180 degrees at 104/208 MHz (sunxi-dly-*, field
++	 * order not verified); without the property the reset default
++	 * (90 degrees) stays, as before.
++	 */
++	host->uhs_sample_phase = -1;
++	host->ntsr_phase_default = mmc_readl(host, REG_SD_NTSR) &
++				   SDXC_NTSR_SAMPLE_PHASE_MASK;
++	if (host->use_new_timings) {
++		u32 deg;
++
++		if (!of_property_read_u32(pdev->dev.of_node,
++					  "allwinner,uhs-sample-phase", &deg)) {
++			if (deg == 90 || deg == 180 || deg == 270)
++				host->uhs_sample_phase = deg / 90 - 1;
++			else
++				dev_warn(&pdev->dev,
++					 "ignoring uhs-sample-phase %u\n", deg);
++		}
++	}
++
++	/*
+ 	 * If we don't support delay chains in the SoC, we can't use any
+ 	 * of the higher speed modes. Mask them out in case the device
+ 	 * tree specifies the properties for them, which gets added to
+

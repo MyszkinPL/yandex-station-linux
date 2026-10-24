@@ -1,0 +1,544 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] ASoC: tas571x: add TAS5751M and PurePath Console register scripts
+
+The TAS5751M has the TAS5733/TAS5753 register layout (2-byte volumes,
+the same biquad, cross-over biquad and output mixer addresses) with its
+own reset defaults (TI SLASEC1B, 7.7.1). Add it with:
+
+- PVDD sequenced after AVDD/DVDD and after RST/PDN have been released,
+  as the start-up sequence in the data sheet (8.2.1.2.5.1) asks for, and
+  the matching power-down sequence (8.2.1.2.5.4) on remove and on probe
+  failure: shutdown, soft-stop wait, PDN/RST, PVDD off, a decay wait,
+  only then AVDD/DVDD;
+- a guard against sending exit-shutdown during the first 240 ms + 1.3 *
+  tstart after the oscillator trim, which the chip silently ignores. It
+  is kept in ktime and only armed for chips that need it, so the other
+  parts see no change;
+- an optional "firmware-name" register script in the PurePath Console
+  text format, loaded right after the trim. Boards such as the Yandex
+  Station ship their complete amplifier tuning (EQ, DRC, PBTL output mux,
+  mixers) only in this form.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+diff --git a/sound/soc/codecs/tas571x.c b/sound/soc/codecs/tas571x.c
+index 41d73f4..c389aba 100644
+--- a/sound/soc/codecs/tas571x.c
++++ b/sound/soc/codecs/tas571x.c
+@@ -13,17 +13,22 @@
+  */
+ 
+ #include <linux/clk.h>
++#include <linux/ctype.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
++#include <linux/firmware.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
++#include <linux/ktime.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/stddef.h>
++#include <linux/string.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+ #include <sound/tlv.h>
+@@ -36,20 +41,30 @@
+ struct tas571x_chip {
+ 	const char			*const *supply_names;
+ 	int				num_supply_names;
++	/*
++	 * Power stage supply that must only come up after the digital
++	 * supplies are stable and RST has been released (optional).
++	 */
++	const char			*late_supply_name;
+ 	const struct snd_kcontrol_new	*controls;
+ 	int				num_controls;
+ 	const struct regmap_config	*regmap_config;
+ 	int				vol_reg_size;
++	/* exit-shutdown is ignored for this long after the oscillator trim */
++	unsigned int			trim_settle_ms;
+ };
+ 
+ struct tas571x_private {
+ 	const struct tas571x_chip	*chip;
+ 	struct regmap			*regmap;
+ 	struct regulator_bulk_data	supplies[TAS571X_MAX_SUPPLIES];
++	struct regulator		*late_supply;
+ 	struct clk			*mclk;
+ 	unsigned int			format;
+ 	struct gpio_desc		*reset_gpio;
+ 	struct gpio_desc		*pdn_gpio;
++	/* earliest time for exit-shutdown, 0 once that has passed */
++	ktime_t				sdn_exit_ready;
+ 	struct snd_soc_component_driver	component_driver;
+ };
+ 
+@@ -304,9 +319,19 @@ static int tas571x_hw_params(struct snd_pcm_substream *substream,
+ static int tas571x_mute(struct snd_soc_dai *dai, int mute, int direction)
+ {
+ 	struct snd_soc_component *component = dai->component;
++	struct tas571x_private *priv = snd_soc_component_get_drvdata(component);
+ 	u8 sysctl2;
+ 	int ret;
+ 
++	/* an exit-shutdown command sent too early after the trim is lost */
++	if (!mute && priv->sdn_exit_ready) {
++		s64 settle = ktime_ms_delta(priv->sdn_exit_ready, ktime_get());
++
++		if (settle > 0)
++			msleep(settle);
++		priv->sdn_exit_ready = 0;
++	}
++
+ 	sysctl2 = mute ? TAS571X_SYS_CTRL_2_SDN_MASK : 0;
+ 
+ 	ret = snd_soc_component_update_bits(component,
+@@ -839,6 +864,69 @@ static const struct tas571x_chip tas5733_chip = {
+ 	.vol_reg_size                   = 2,
+ };
+ 
++/*
++ * The TAS5751M has the TAS5733 register layout (2-byte volumes, the same
++ * biquad, cross-over biquad and mixer addresses); only the reset defaults
++ * differ. PVDD is sequenced separately: the data sheet (SLASEC1B, 8.2.1.2.5)
++ * wants it below 6 V until DVDD/AVDD are up and RST has been high for
++ * 13.5 ms, and exit-shutdown is not serviced for 240 ms + 1.3 * tstart
++ * after the first trim.
++ */
++static const char *const tas5751m_supply_names[] = {
++	"AVDD",
++	"DVDD",
++};
++
++static const struct reg_default tas5751m_reg_defaults[] = {
++	{TAS571X_SYS_CTRL_1_REG,        0xa0},
++	{TAS571X_SDI_REG,               0x05},
++	{TAS571X_SYS_CTRL_2_REG,        0x40},
++	{TAS571X_SOFT_MUTE_REG,         0x00},
++	{TAS571X_MVOL_REG,              0x03ff},
++	{TAS571X_CH1_VOL_REG,           0x00c0},
++	{TAS571X_CH2_VOL_REG,           0x00c0},
++	{TAS571X_VOL_CFG_REG,           0xf0},
++	{TAS571X_MODULATION_LIMIT_REG,  0x01},
++	{TAS571X_IC_DELAY_CH1_REG,      0xac},
++	{TAS571X_IC_DELAY_CH2_REG,      0x54},
++	{TAS571X_IC_DELAY_CH3_REG,      0xac},
++	{TAS571X_IC_DELAY_CH4_REG,      0x54},
++	{TAS571X_PWM_CH_SDN_GROUP_REG,  0x30},
++	{TAS571X_START_STOP_PERIOD_REG, 0x68},
++	{TAS571X_OSC_TRIM_REG,          0x82},
++	{TAS571X_BKND_ERR_REG,          0x57},
++	{TAS571X_INPUT_MUX_REG,         0x00017772},
++	{TAS571X_PWM_MUX_REG,           0x01021345},
++	{TAS5717_CH1_RIGHT_CH_MIX_REG,  0x00},
++	{TAS5717_CH1_LEFT_CH_MIX_REG,   0x800000},
++	{TAS5717_CH2_LEFT_CH_MIX_REG,   0x00},
++	{TAS5717_CH2_RIGHT_CH_MIX_REG,  0x800000},
++};
++
++static const struct regmap_config tas5751m_regmap_config = {
++	.reg_bits                       = 8,
++	.val_bits                       = 32,
++	.max_register                   = 0xff,
++	.reg_read                       = tas571x_reg_read,
++	.reg_write                      = tas571x_reg_write,
++	.reg_defaults                   = tas5751m_reg_defaults,
++	.num_reg_defaults               = ARRAY_SIZE(tas5751m_reg_defaults),
++	.cache_type                     = REGCACHE_RBTREE,
++	.wr_table                       = &tas571x_write_regs,
++	.volatile_table                 = &tas571x_volatile_regs,
++};
++
++static const struct tas571x_chip tas5751m_chip = {
++	.supply_names                   = tas5751m_supply_names,
++	.num_supply_names               = ARRAY_SIZE(tas5751m_supply_names),
++	.late_supply_name               = "PVDD",
++	.controls                       = tas5733_controls,
++	.num_controls                   = ARRAY_SIZE(tas5733_controls),
++	.regmap_config                  = &tas5751m_regmap_config,
++	.vol_reg_size                   = 2,
++	.trim_settle_ms                 = 500,
++};
++
+ static const struct reg_default tas5753_reg_defaults[] = {
+ 	{TAS571X_CLK_CTRL_REG,		0x6c},
+ 	{TAS571X_DEV_ID_REG,		0x41},
+@@ -942,10 +1030,223 @@ static struct snd_soc_dai_driver tas571x_dai = {
+ 	.ops = &tas571x_dai_ops,
+ };
+ 
++/*
++ * Register scripts in the text format written by TI PurePath Console, as
++ * shipped by some products next to their vendor driver:
++ *
++ *   w <addr> <reg> <data>...	write <data> to <reg>; <addr> is ignored
++ *   > <data>...		more data for the preceding "w" line
++ *   d ...			delay marker; ignored, like the vendor loader does
++ *   # ...			comment
++ *
++ * All numbers are hexadecimal bytes. A "w" line and its continuation lines
++ * form one I2C write, which is how the multi-byte coefficient registers
++ * are loaded.
++ */
++#define TAS571X_SCRIPT_MAX_DATA		32
++#define TAS571X_SCRIPT_MAX_LINE		160
++
++struct tas571x_script {
++	struct i2c_client	*client;
++	u8			buf[1 + TAS571X_SCRIPT_MAX_DATA];
++	unsigned int		len;
++	unsigned int		line;
++	unsigned int		write_line;
++};
++
++static int tas571x_script_flush(struct tas571x_script *s)
++{
++	int ret;
++
++	if (!s->len)
++		return 0;
++
++	if (s->len < 2) {
++		dev_err(&s->client->dev, "script line %u: no data for register 0x%02x\n",
++			s->write_line, s->buf[0]);
++		return -EINVAL;
++	}
++
++	ret = i2c_master_send(s->client, s->buf, s->len);
++	if (ret != s->len) {
++		ret = ret < 0 ? ret : -EIO;
++		dev_err(&s->client->dev, "script line %u: writing register 0x%02x failed: %d\n",
++			s->write_line, s->buf[0], ret);
++		return ret;
++	}
++
++	/* the trim needs 50 ms before the next register access */
++	if (s->buf[0] == TAS571X_OSC_TRIM_REG)
++		msleep(50);
++
++	s->len = 0;
++	return 0;
++}
++
++static int tas571x_script_bytes(struct tas571x_script *s, char *p)
++{
++	char *tok;
++	u8 val;
++
++	while ((tok = strsep(&p, " \t"))) {
++		if (!*tok)
++			continue;
++		if (kstrtou8(tok, 16, &val))
++			return -EINVAL;
++		if (s->len >= ARRAY_SIZE(s->buf))
++			return -E2BIG;
++		s->buf[s->len++] = val;
++	}
++
++	return 0;
++}
++
++static int tas571x_script_line(struct tas571x_script *s, char *line)
++{
++	char *p = line + 1;
++	char *tok;
++	u8 addr;
++	int ret;
++
++	switch (line[0]) {
++	case '\0':
++	case '#':
++	case 'd':
++		return tas571x_script_flush(s);
++	case 'w':
++		ret = tas571x_script_flush(s);
++		if (ret)
++			return ret;
++		s->write_line = s->line;
++		do {
++			tok = strsep(&p, " \t");
++		} while (tok && !*tok);
++		if (!tok || kstrtou8(tok, 16, &addr))
++			return -EINVAL;
++		ret = tas571x_script_bytes(s, p);
++		if (ret)
++			return ret;
++		return s->len ? 0 : -EINVAL;
++	case '>':
++		if (!s->len)
++			return -EINVAL;
++		return tas571x_script_bytes(s, p);
++	default:
++		return -EINVAL;
++	}
++}
++
++static int tas571x_load_script(struct tas571x_private *priv,
++			       struct i2c_client *client, const char *name)
++{
++	struct device *dev = &client->dev;
++	struct tas571x_script s = { .client = client };
++	char line[TAS571X_SCRIPT_MAX_LINE];
++	const struct firmware *fw;
++	const char *p, *end, *eol;
++	size_t n;
++	int ret;
++
++	ret = request_firmware(&fw, name, dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to load register script %s\n",
++				     name);
++
++	p = fw->data;
++	end = p + fw->size;
++	while (p < end) {
++		eol = memchr(p, '\n', end - p);
++		n = (eol ? eol : end) - p;
++		s.line++;
++
++		while (n && isspace(p[n - 1]))
++			n--;
++		if (n >= sizeof(line)) {
++			ret = -EINVAL;
++			break;
++		}
++		memcpy(line, p, n);
++		line[n] = '\0';
++
++		ret = tas571x_script_line(&s, line);
++		if (ret)
++			break;
++
++		p = eol ? eol + 1 : end;
++	}
++	if (!ret)
++		ret = tas571x_script_flush(&s);
++
++	release_firmware(fw);
++
++	/* the script went around the register cache */
++	regcache_drop_region(priv->regmap, 0,
++			     priv->chip->regmap_config->max_register);
++
++	if (ret)
++		dev_err(dev, "%s: error at line %u: %d\n", name, s.line, ret);
++	else
++		dev_info(dev, "loaded register script %s (%u lines)\n", name,
++			 s.line);
++
++	return ret;
++}
++
++/*
++ * 1 ms + 1.3 * tstop for the start/stop period settings 0x08...0x1f of
++ * register 0x1a (SLASEC1B, 7.7.2.13), rounded up.
++ */
++static const u16 tas571x_stop_wait_ms[] = {
++	23, 33, 42, 54, 72, 93, 124, 165,
++	215, 313, 410, 527, 702, 916, 1227, 1635,
++	2248, 3269, 4290, 5516, 7354, 9600, 12868, 17157,
++};
++
++/*
++ * Time a separately switched PVDD rail is given to decay below 6 V before
++ * the digital supplies may go. The bulk capacitance is board specific and
++ * unknown here, so this is a generous guess.
++ */
++#define TAS571X_LATE_SUPPLY_OFF_MS	300
++
++/*
++ * Power-down sequence for parts with a separately switched power stage
++ * supply (SLASEC1B, 8.2.1.2.5.3 and 8.2.1.2.5.4): enter shutdown and let
++ * the soft-stop finish, assert PDN and RST, drop PVDD and keep AVDD/DVDD
++ * up until PVDD has decayed. Register access errors are ignored, a dead
++ * device may be the reason for tearing down.
++ */
++static void tas571x_late_supply_off(struct tas571x_private *priv)
++{
++	unsigned int val, wait_ms = 165;	/* reset default, 125.7 ms */
++
++	if (!regmap_read(priv->regmap, TAS571X_START_STOP_PERIOD_REG, &val)) {
++		val &= 0x1f;
++		wait_ms = val < 0x08 ? 2 : tas571x_stop_wait_ms[val - 0x08];
++	}
++
++	regmap_write(priv->regmap, TAS571X_SYS_CTRL_2_REG,
++		     TAS571X_SYS_CTRL_2_SDN_MASK);
++	msleep(wait_ms);
++
++	if (priv->pdn_gpio) {
++		gpiod_set_value(priv->pdn_gpio, 1);
++		usleep_range(2000, 3000);
++	}
++	if (priv->reset_gpio) {
++		gpiod_set_value(priv->reset_gpio, 1);
++		usleep_range(10, 20);
++	}
++
++	regulator_disable(priv->late_supply);
++	msleep(TAS571X_LATE_SUPPLY_OFF_MS);
++}
++
+ static int tas571x_i2c_probe(struct i2c_client *client)
+ {
+ 	struct tas571x_private *priv;
+ 	struct device *dev = &client->dev;
++	const char *script;
+ 	int i, ret;
+ 
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+@@ -973,6 +1274,16 @@ static int tas571x_i2c_probe(struct i2c_client *client)
+ 		dev_err(dev, "Failed to get supplies: %d\n", ret);
+ 		return ret;
+ 	}
++
++	if (priv->chip->late_supply_name) {
++		priv->late_supply = devm_regulator_get(dev,
++					priv->chip->late_supply_name);
++		if (IS_ERR(priv->late_supply))
++			return dev_err_probe(dev, PTR_ERR(priv->late_supply),
++					     "Failed to get %s supply\n",
++					     priv->chip->late_supply_name);
++	}
++
+ 	ret = regulator_bulk_enable(priv->chip->num_supply_names,
+ 				    priv->supplies);
+ 	if (ret) {
+@@ -1009,12 +1320,38 @@ static int tas571x_i2c_probe(struct i2c_client *client)
+ 		usleep_range(13500, 20000);
+ 	}
+ 
++	if (priv->late_supply) {
++		/* RST may be strapped: keep PVDD off for 13.5 ms anyway */
++		if (!priv->reset_gpio)
++			usleep_range(13500, 20000);
++
++		ret = regulator_enable(priv->late_supply);
++		if (ret) {
++			dev_err(dev, "Failed to enable %s supply: %d\n",
++				priv->chip->late_supply_name, ret);
++			goto disable_regs;
++		}
++		/* let the power stage supply settle before the trim */
++		msleep(100);
++	}
++
+ 	ret = regmap_write(priv->regmap, TAS571X_OSC_TRIM_REG, 0);
+ 	if (ret)
+-		goto disable_regs;
++		goto disable_late;
+ 
+ 	usleep_range(50000, 60000);
+ 
++	if (!device_property_read_string(dev, "firmware-name", &script)) {
++		ret = tas571x_load_script(priv, client, script);
++		if (ret)
++			goto disable_late;
++	}
++
++	/* counted from here, as register scripts usually trim once more */
++	if (priv->chip->trim_settle_ms)
++		priv->sdn_exit_ready = ktime_add_ms(ktime_get(),
++						    priv->chip->trim_settle_ms);
++
+ 	memcpy(&priv->component_driver, &tas571x_component, sizeof(priv->component_driver));
+ 	priv->component_driver.controls = priv->chip->controls;
+ 	priv->component_driver.num_controls = priv->chip->num_controls;
+@@ -1027,17 +1364,20 @@ static int tas571x_i2c_probe(struct i2c_client *client)
+ 		 */
+ 		ret = regmap_update_bits(priv->regmap, TAS571X_MVOL_REG, 1, 0);
+ 		if (ret)
+-			goto disable_regs;
++			goto disable_late;
+ 	}
+ 
+ 	ret = devm_snd_soc_register_component(&client->dev,
+ 				      &priv->component_driver,
+ 				      &tas571x_dai, 1);
+ 	if (ret)
+-		goto disable_regs;
++		goto disable_late;
+ 
+ 	return ret;
+ 
++disable_late:
++	if (priv->late_supply)
++		tas571x_late_supply_off(priv);
+ disable_regs:
+ 	regulator_bulk_disable(priv->chip->num_supply_names, priv->supplies);
+ 	return ret;
+@@ -1047,6 +1387,8 @@ static void tas571x_i2c_remove(struct i2c_client *client)
+ {
+ 	struct tas571x_private *priv = i2c_get_clientdata(client);
+ 
++	if (priv->late_supply)
++		tas571x_late_supply_off(priv);
+ 	regulator_bulk_disable(priv->chip->num_supply_names, priv->supplies);
+ }
+ 
+@@ -1057,6 +1399,7 @@ static const struct of_device_id tas571x_of_match[] __maybe_unused = {
+ 	{ .compatible = "ti,tas5719", .data = &tas5717_chip, },
+ 	{ .compatible = "ti,tas5721", .data = &tas5721_chip, },
+ 	{ .compatible = "ti,tas5733", .data = &tas5733_chip, },
++	{ .compatible = "ti,tas5751m", .data = &tas5751m_chip, },
+ 	{ .compatible = "ti,tas5753", .data = &tas5753_chip, },
+ 	{ }
+ };
+@@ -1069,6 +1412,7 @@ static const struct i2c_device_id tas571x_i2c_id[] = {
+ 	{ "tas5719", (kernel_ulong_t) &tas5717_chip },
+ 	{ "tas5721", (kernel_ulong_t) &tas5721_chip },
+ 	{ "tas5733", (kernel_ulong_t) &tas5733_chip },
++	{ "tas5751m", (kernel_ulong_t) &tas5751m_chip },
+ 	{ "tas5753", (kernel_ulong_t) &tas5753_chip },
+ 	{ }
+ };
+diff --git a/Documentation/devicetree/bindings/sound/ti,tas57xx.yaml b/Documentation/devicetree/bindings/sound/ti,tas57xx.yaml
+index 0b013a3..cad4611 100644
+--- a/Documentation/devicetree/bindings/sound/ti,tas57xx.yaml
++++ b/Documentation/devicetree/bindings/sound/ti,tas57xx.yaml
+@@ -4,7 +4,7 @@
+ $id: http://devicetree.org/schemas/sound/ti,tas57xx.yaml#
+ $schema: http://devicetree.org/meta-schemas/core.yaml#
+ 
+-title: Texas Instruments TAS5711/TAS5717/TAS5719/TAS5721 stereo power amplifiers
++title: Texas Instruments TAS57xx stereo power amplifiers
+ 
+ maintainers:
+   - Neil Armstrong <neil.armstrong@linaro.org>
+@@ -18,6 +18,7 @@ properties:
+       - ti,tas5719
+       - ti,tas5721
+       - ti,tas5733
++      - ti,tas5751m
+       - ti,tas5753
+ 
+   reg:
+@@ -37,6 +38,14 @@ properties:
+   clock-names:
+     const: mclk
+ 
++  firmware-name:
++    maxItems: 1
++    description:
++      Register script loaded right after the oscillator trim, in the text
++      format written by TI PurePath Console ("w <addr> <reg> <data>..."
++      lines, ">" continuation lines, "#" comments). It holds the complete
++      board tuning (DAP, EQ, DRC, output mixers and PWM mux).
++
+   AVDD-supply: true
+   DVDD-supply: true
+   HPVDD-supply: true
+@@ -99,6 +108,7 @@ allOf:
+           contains:
+             enum:
+               - ti,tas5721
++              - ti,tas5751m
+               - ti,tas5753
+     then:
+       properties:

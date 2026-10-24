@@ -1,0 +1,470 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] cpufreq: add Allwinner A64 DVFS through the vendor ATF/SCP firmware
+
+On A64/R18 boards that keep the Allwinner BSP firmware (BL31 + AR100 SCP
+"arisc"), such as the Yandex Station, the SCP owns the PMIC bus and the
+kernel cannot change vdd-cpux itself. The firmware changes the CPU voltage
+and PLL_CPUX together on an SMC request, using the V-F table of the vendor
+device tree. Add a cpufreq driver for that interface. Boards with mainline
+TF-A and crust keep using cpufreq-dt.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
++++ b/drivers/cpufreq/Kconfig.arm
+@@ -15,6 +15,20 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called sun50i-cpufreq-nvmem.
+ 
++config ARM_SUN50I_A64_SCP_CPUFREQ
++	tristate "Allwinner A64 CPU DVFS through the vendor ATF/SCP firmware"
++	depends on ARM64 && HAVE_ARM_SMCCC
++	depends on ARCH_SUNXI || COMPILE_TEST
++	help
++	  CPU frequency and voltage scaling for Allwinner A64 boards that boot
++	  the vendor BSP firmware (BL31 + AR100 SCP "arisc"), such as the
++	  Yandex Station. The firmware changes vdd-cpux and PLL_CPUX together
++	  on an SMC request, using the V-F table of the vendor device tree.
++	  Do not enable on boards with mainline TF-A/crust: use cpufreq-dt.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called sun50i-a64-scp-cpufreq.
++
+ config ARM_AIROHA_SOC_CPUFREQ
+ 	tristate "Airoha EN7581 SoC CPUFreq support"
+ 	depends on ARCH_AIROHA || COMPILE_TEST
+--- a/drivers/cpufreq/Makefile
++++ b/drivers/cpufreq/Makefile
+@@ -83,6 +83,7 @@
+ obj-$(CONFIG_ARM_SPEAR_CPUFREQ)		+= spear-cpufreq.o
+ obj-$(CONFIG_ARM_STI_CPUFREQ)		+= sti-cpufreq.o
+ obj-$(CONFIG_ARM_ALLWINNER_SUN50I_CPUFREQ_NVMEM) += sun50i-cpufreq-nvmem.o
++obj-$(CONFIG_ARM_SUN50I_A64_SCP_CPUFREQ) += sun50i-a64-scp-cpufreq.o
+ obj-$(CONFIG_ARM_TEGRA20_CPUFREQ)	+= tegra20-cpufreq.o
+ obj-$(CONFIG_ARM_TEGRA124_CPUFREQ)	+= tegra124-cpufreq.o
+ obj-$(CONFIG_ARM_TEGRA186_CPUFREQ)	+= tegra186-cpufreq.o
+--- /dev/null
++++ b/drivers/cpufreq/sun50i-a64-scp-cpufreq.c
+@@ -0,0 +1,421 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * CPU DVFS for Allwinner A64 (R18) boards that run the vendor BSP firmware
++ * (BL31 "monitor" + AR100 SCP "arisc"), e.g. the Yandex Station.
++ *
++ * On these boards the SCP owns the PMIC bus, and the vendor firmware already
++ * implements DVFS: SMC ARISC_CPUX_DVFS_REQ (0xc0000030; x1 = kHz, x2 = PLL1,
++ * x3 = synchronous) makes BL31 post message 0x30 to the SCP, which looks the
++ * voltage up in the V-F table vendor U-Boot copied from the vendor DTB
++ * (/dvfs_table), raises vdd-cpux (AXP803 DCDC2) before a PLL_CPUX increase
++ * and lowers it after a decrease.  The vendor 3.10 sunxi-cpufreq driver does
++ * exactly this call (arisc_dvfs_set_cpufreq(freq, ARISC_DVFS_PLL1,
++ * ARISC_DVFS_SYN)).  Linux's CCU never touches PLL_CPUX in this mode.
++ *
++ * Safety rules of this driver:
++ *  - only the vendor frequency points (cpufreq_tbl of the vendor DTB, capped
++ *    at its dvfs_table max_freq of 1152 MHz) are offered; the SCP gives any
++ *    request above lv1 the lv1 voltage, so a higher request would overclock;
++ *  - before registering, the driver checks that DCDC2 is not below the
++ *    vendor voltage for the running frequency, then issues one request for
++ *    the lowest point so that the SCP's cached rail voltage is not above the
++ *    real one;
++ *  - after every request it reads PLL_CPUX (CCU, read only) and DCDC2 (SMC
++ *    0x8000ff12) back; if the rail is below the vendor voltage for the
++ *    frequency that is really running, it asks for the lowest point and
++ *    refuses all further changes.
++ */
++
++#include <linux/arm-smccc.h>
++#include <linux/cpufreq.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/sysfs.h>
++
++/* vendor BL31 runtime services (services/arm/arm_svc_setup.c) */
++#define ATF_SVC_CALL_COUNT	0x8000ff00	/* answered by BL31 itself */
++#define ATF_SVC_CALL_COUNT_VAL	6
++#define ATF_SVC_READ_PMU	0x8000ff12	/* x1 = reg -> x0[7:0], 0xff on error */
++#define ATF_SVC_CPUX_DVFS_REQ	0xc0000030	/* x1 = kHz, x2 = pll, x3 = mode */
++#define ARISC_DVFS_PLL1		1
++#define ARISC_DVFS_SYN		BIT(0)
++
++/* AXP803 DCDC2 voltage register: 0.50-1.20 V in 10 mV, 1.22-1.30 V in 20 mV */
++#define AXP803_DCDC2_V		0x21
++
++/* A64 CCU (user manual 3.3.5: PLL_CPUX_CTRL_REG, CPUX_AXI_CFG_REG) */
++#define CCU_PLL_CPUX		0x000
++#define CCU_CPUX_AXI_CFG	0x050
++#define CCU_MAP_SIZE		0x60
++
++#define SCP_LATENCY_NS		2000000	/* vendor DTB: clock-latency = 2 ms */
++#define SCP_DELAY_US		10000	/* do not let schedutil call more often */
++#define SCP_PLL_TOLERANCE_KHZ	12000
++
++struct scp_vf {
++	unsigned int khz;
++	unsigned int mv;	/* what the SCP applies for this point */
++};
++
++/*
++ * Vendor DTB: /cpus/cpu@0/cpufreq_tbl, limited to /dvfs_table max_freq;
++ * voltage = lvN_volt of the smallest lvN_freq >= khz (the SCP walks the
++ * table the same way): 1152/1300, 1104/1260, 1008/1200, 816/1100, 648/1040.
++ */
++static const struct scp_vf scp_vf_table[] = {
++	{  480000, 1040 },
++	{  600000, 1040 },
++	{  720000, 1100 },
++	{  816000, 1100 },
++	{ 1008000, 1200 },
++	{ 1104000, 1260 },
++	{ 1152000, 1300 },
++};
++
++#define SCP_MAX_KHZ	1152000
++/*
++ * Point left behind on shutdown/kexec (cpufreq_suspend() from
++ * device_shutdown()): the state vendor U-Boot hands over (1008 MHz with
++ * DCDC2 = 1.20 V, shim log), which is what every other kernel of this port
++ * assumes (cpufreq-dt stage 1 describes vdd-cpux as a fixed 1.20 V).
++ */
++#define SCP_HANDOVER_KHZ	1008000
++
++struct scp_cpufreq {
++	struct device *dev;
++	void __iomem *ccu;
++	struct mutex lock;		/* broken flag, SMC sequence */
++	bool broken;
++	unsigned int min_khz;
++	unsigned int handover_khz;
++	struct cpufreq_frequency_table table[ARRAY_SIZE(scp_vf_table) + 1];
++};
++
++static struct scp_cpufreq *scp;
++
++static unsigned int scp_vendor_mv(unsigned int khz)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(scp_vf_table); i++)
++		if (scp_vf_table[i].khz >= khz)
++			return scp_vf_table[i].mv;
++
++	return UINT_MAX;	/* above the vendor table: no voltage is enough */
++}
++
++static unsigned int scp_read_khz(void)
++{
++	u32 pll = readl(scp->ccu + CCU_PLL_CPUX);
++	u32 cfg = readl(scp->ccu + CCU_CPUX_AXI_CFG);
++	unsigned int n, k, m, p;
++
++	switch ((cfg >> 16) & 3) {
++	case 0:
++		return 32;
++	case 1:
++		return 24000;
++	}
++
++	if (!(pll & BIT(31)))
++		return 0;
++
++	n = ((pll >> 8) & 0x1f) + 1;
++	k = ((pll >> 4) & 0x3) + 1;
++	m = (pll & 0x3) + 1;
++	p = 1 << ((pll >> 16) & 0x3);
++
++	return 24000 * n * k / (m * p);
++}
++
++/* DCDC2 in mV, or 0 if it cannot be read or decoded */
++static unsigned int scp_read_dcdc2_mv(u32 *raw)
++{
++	struct arm_smccc_res res;
++	unsigned int v;
++	int try;
++
++	for (try = 0; try < 3; try++) {
++		arm_smccc_smc(ATF_SVC_READ_PMU, AXP803_DCDC2_V, 0, 0, 0, 0, 0, 0,
++			      &res);
++		if ((res.a0 & 0xff) != 0xff)
++			break;
++	}
++	if (raw)
++		*raw = res.a0;
++	if ((res.a0 & 0xff) == 0xff)
++		return 0;
++
++	v = res.a0 & 0x7f;
++	if (v <= 0x46)
++		return 500 + 10 * v;
++	if (v <= 0x4b)
++		return 1220 + 20 * (v - 0x47);
++
++	return 0;
++}
++
++static long scp_dvfs_request(unsigned int khz)
++{
++	struct arm_smccc_res res;
++
++	if (WARN_ON(khz > SCP_MAX_KHZ))
++		return -EINVAL;
++
++	arm_smccc_smc(ATF_SVC_CPUX_DVFS_REQ, khz, ARISC_DVFS_PLL1,
++		      ARISC_DVFS_SYN, 0, 0, 0, 0, &res);
++
++	return (long)res.a0;
++}
++
++/*
++ * Read the hardware back after a request. Returns 0 if the rail covers the
++ * frequency that is really running, -EIO otherwise (and then the caller
++ * must fall back to the lowest point).
++ */
++static int scp_check(unsigned int want_khz, unsigned int *got_khz)
++{
++	unsigned int khz = scp_read_khz();
++	unsigned int mv = scp_read_dcdc2_mv(NULL);
++	unsigned int need = scp_vendor_mv(khz);
++
++	if (got_khz)
++		*got_khz = khz;
++
++	if (!mv || mv < need) {
++		dev_crit(scp->dev, "vdd-cpux %u mV below %u mV needed at %u kHz\n",
++			 mv, need, khz);
++		return -EIO;
++	}
++
++	if (abs((int)khz - (int)want_khz) > SCP_PLL_TOLERANCE_KHZ)
++		dev_warn(scp->dev, "asked for %u kHz, running at %u kHz (%u mV)\n",
++			 want_khz, khz, mv);
++	else
++		dev_dbg(scp->dev, "%u kHz at %u mV\n", khz, mv);
++
++	return 0;
++}
++
++static void scp_fail_safe(void)
++{
++	long ret;
++
++	scp->broken = true;
++	ret = scp_dvfs_request(scp->min_khz);
++	dev_crit(scp->dev,
++		 "fell back to %u kHz (SCP result %ld, now %u kHz, %u mV); DVFS disabled\n",
++		 scp->min_khz, ret, scp_read_khz(), scp_read_dcdc2_mv(NULL));
++}
++
++static int scp_target_index(struct cpufreq_policy *policy, unsigned int index)
++{
++	unsigned int khz = policy->freq_table[index].frequency;
++	unsigned int got;
++	long ret;
++	int err = 0;
++
++	mutex_lock(&scp->lock);
++
++	if (scp->broken) {
++		err = -EIO;
++		goto out;
++	}
++
++	ret = scp_dvfs_request(khz);
++	if (ret)
++		dev_err(scp->dev, "SCP refused %u kHz: %ld\n", khz, ret);
++
++	if (scp_check(khz, &got)) {
++		scp_fail_safe();
++		err = -EIO;
++		goto out;
++	}
++
++	if (ret || abs((int)got - (int)khz) > SCP_PLL_TOLERANCE_KHZ)
++		err = -EIO;
++out:
++	mutex_unlock(&scp->lock);
++	return err;
++}
++
++static unsigned int scp_get(unsigned int cpu)
++{
++	return scp_read_khz();
++}
++
++static int scp_cpufreq_init(struct cpufreq_policy *policy)
++{
++	cpufreq_generic_init(policy, scp->table, SCP_LATENCY_NS);
++	policy->transition_delay_us = SCP_DELAY_US;
++	policy->suspend_freq = scp->handover_khz;
++
++	return 0;
++}
++
++/* read only: what is running now, as the hardware says (one SMC read) */
++static ssize_t state_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	unsigned int khz, mv;
++	u32 raw;
++
++	mutex_lock(&scp->lock);
++	khz = scp_read_khz();
++	mv = scp_read_dcdc2_mv(&raw);
++	mutex_unlock(&scp->lock);
++
++	return sysfs_emit(buf, "%u kHz, DCDC2 %#x = %u mV, vendor needs %u mV%s\n",
++			  khz, (u32)(raw & 0xff), mv, scp_vendor_mv(khz),
++			  scp->broken ? ", DVFS disabled" : "");
++}
++static DEVICE_ATTR_RO(state);
++
++static struct attribute *scp_attrs[] = {
++	&dev_attr_state.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(scp);
++
++static struct cpufreq_driver scp_cpufreq_driver = {
++	.name		= "sun50i-scp",
++	/*
++	 * No CPUFREQ_NEED_INITIAL_FREQ_CHECK: probe already moved to a table
++	 * point, and that check BUG()s if the fix-up transition fails
++	 * (cpufreq.c:1514-1529), while a failure here must only stop DVFS.
++	 */
++	.flags		= CPUFREQ_IS_COOLING_DEV,
++	.verify		= cpufreq_generic_frequency_table_verify,
++	.target_index	= scp_target_index,
++	.get		= scp_get,
++	.init		= scp_cpufreq_init,
++	/* also runs on kexec/reboot: device_shutdown() -> cpufreq_suspend() */
++	.suspend	= cpufreq_generic_suspend,
++};
++
++static int scp_cpufreq_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *ccu_np;
++	struct arm_smccc_res res;
++	unsigned int max_khz = SCP_MAX_KHZ, khz, mv, n = 0, i;
++	u32 raw;
++	int ret;
++
++	scp = devm_kzalloc(dev, sizeof(*scp), GFP_KERNEL);
++	if (!scp)
++		return -ENOMEM;
++	scp->dev = dev;
++	mutex_init(&scp->lock);
++
++	of_property_read_u32(dev->of_node, "allwinner,max-frequency-khz",
++			     &max_khz);
++	max_khz = min(max_khz, (unsigned int)SCP_MAX_KHZ);
++
++	for (i = 0; i < ARRAY_SIZE(scp_vf_table); i++) {
++		if (scp_vf_table[i].khz > max_khz)
++			break;
++		scp->table[n].driver_data = i;
++		scp->table[n++].frequency = scp_vf_table[i].khz;
++	}
++	if (!n)
++		return dev_err_probe(dev, -EINVAL, "no usable frequency\n");
++	scp->table[n].frequency = CPUFREQ_TABLE_END;
++	scp->min_khz = scp->table[0].frequency;
++	scp->handover_khz = scp->min_khz;
++	for (i = 0; i < n; i++)
++		if (scp->table[i].frequency <= SCP_HANDOVER_KHZ)
++			scp->handover_khz = scp->table[i].frequency;
++
++	/*
++	 * The probe below already asks the SCP for the lowest point. If
++	 * cpufreq-dt (an OPP table in the DT) owns PLL_CPUX at a fixed rail,
++	 * that request would leave DCDC2 at 1.04 V under it: refuse first.
++	 */
++	if (cpufreq_get_current_driver())
++		return dev_err_probe(dev, -EBUSY,
++				     "cpufreq driver %s already active, not touching the SCP\n",
++				     cpufreq_get_current_driver());
++
++	/* Only the vendor BL31 answers 6 here; anything else: touch nothing. */
++	arm_smccc_smc(ATF_SVC_CALL_COUNT, 0, 0, 0, 0, 0, 0, 0, &res);
++	if (res.a0 != ATF_SVC_CALL_COUNT_VAL)
++		return dev_err_probe(dev, -ENODEV,
++				     "unexpected firmware (call count %lu)\n",
++				     res.a0);
++
++	ccu_np = of_parse_phandle(dev->of_node, "allwinner,ccu", 0);
++	if (!ccu_np)
++		return dev_err_probe(dev, -EINVAL, "no allwinner,ccu\n");
++	/* of_iomap does not claim the region: the CCU driver owns it */
++	scp->ccu = of_iomap(ccu_np, 0);
++	of_node_put(ccu_np);
++	if (!scp->ccu)
++		return -ENOMEM;
++
++	khz = scp_read_khz();
++	mv = scp_read_dcdc2_mv(&raw);
++	dev_info(dev, "boot state: PLL_CPUX %#x, CPUX_AXI %#x -> %u kHz; DCDC2 raw %#x -> %u mV\n",
++		 readl(scp->ccu + CCU_PLL_CPUX),
++		 readl(scp->ccu + CCU_CPUX_AXI_CFG), khz, raw, mv);
++
++	if (!mv || mv < scp_vendor_mv(khz)) {
++		ret = dev_err_probe(dev, -ENODEV,
++				    "rail does not match the vendor table, not touching it\n");
++		goto err_unmap;
++	}
++
++	/* bring the SCP's cached rail voltage to a known value */
++	ret = scp_dvfs_request(scp->min_khz);
++	if (ret || scp_check(scp->min_khz, &khz) ||
++	    abs((int)khz - (int)scp->min_khz) > SCP_PLL_TOLERANCE_KHZ) {
++		dev_err(dev, "first DVFS request failed (%d), giving up\n", ret);
++		ret = -EIO;
++		goto err_unmap;
++	}
++	dev_info(dev, "SCP DVFS works: %u kHz at %u mV\n", khz,
++		 scp_read_dcdc2_mv(NULL));
++
++	ret = cpufreq_register_driver(&scp_cpufreq_driver);
++	if (ret) {
++		dev_err(dev, "cpufreq_register_driver: %d\n", ret);
++		goto err_unmap;
++	}
++
++	return 0;
++
++err_unmap:
++	iounmap(scp->ccu);
++	return ret;
++}
++
++static void scp_cpufreq_remove(struct platform_device *pdev)
++{
++	cpufreq_unregister_driver(&scp_cpufreq_driver);
++	iounmap(scp->ccu);
++}
++
++static const struct of_device_id scp_cpufreq_match[] = {
++	{ .compatible = "allwinner,sun50i-a64-scp-dvfs" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, scp_cpufreq_match);
++
++static struct platform_driver scp_cpufreq_platdrv = {
++	.probe	= scp_cpufreq_probe,
++	.remove	= scp_cpufreq_remove,
++	.driver	= {
++		.name		= "sun50i-a64-scp-cpufreq",
++		.of_match_table	= scp_cpufreq_match,
++		.dev_groups	= scp_groups,
++	},
++};
++module_platform_driver(scp_cpufreq_platdrv);
++
++MODULE_DESCRIPTION("Allwinner A64 CPU DVFS through the vendor ATF/SCP firmware");
++MODULE_LICENSE("GPL");
+
+--- a/drivers/mmc/host/sunxi-mmc.c

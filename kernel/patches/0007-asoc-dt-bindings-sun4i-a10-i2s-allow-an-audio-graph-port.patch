@@ -1,0 +1,24 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] ASoC: dt-bindings: sun4i-a10-i2s: allow an audio-graph port
+
+The controller can be used as the CPU side of an audio-graph-card2 link,
+which needs a "port" node; with unevaluatedProperties: false it is
+rejected by dtbs_check today.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+diff --git a/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-i2s.yaml b/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-i2s.yaml
+index 739114f..a873060 100644
+--- a/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-i2s.yaml
++++ b/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-i2s.yaml
+@@ -60,6 +60,10 @@ properties:
+   resets:
+     maxItems: 1
+ 
++  port:
++    $ref: audio-graph-port.yaml#
++    unevaluatedProperties: false
++
+ allOf:
+   - $ref: dai-common.yaml#
+   - if:

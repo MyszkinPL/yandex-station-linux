@@ -1,0 +1,527 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] ASoC: tlv320adc3xxx: BCLK clocking, TDM slots, shared reset
+
+Boards such as the Yandex Station put five TLV320ADC3101 on one 3-stated
+DOUT line (TDM), clock them from the bit clock only (no MCLK) and share a
+single RESET line between them. Support that:
+
+- no "clocks" property: CODEC_CLKIN = BCLK, PLL off; NADC/MADC/AOSR are
+  derived from the frame length (AOSR 128, MADC 2), clock consumer only;
+- .set_tdm_slot: Ch_Offset_1/2, time-slot mode, DOUT 3-state; the slot
+  width is the word length, so two 16-bit channels can share one 32-bit
+  CPU slot; registers are programmed in hw_params (after set_fmt);
+- the reset goes through the reset framework as a shared control when
+  possible (reset-gpio), else an optional private GPIO; a software reset
+  follows in either case so the chip matches the register cache;
+- optional ti,invert-bclk (P0 R29 D3) and ti,swap-channels (P0 R38 D4);
+- mixer controls for the processing block (P0 R61) and biquads A..E.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
+--- a/sound/soc/codecs/tlv320adc3xxx.c
++++ b/sound/soc/codecs/tlv320adc3xxx.c
+@@ -22,6 +22,7 @@
+ #include <linux/delay.h>
+ #include <linux/gpio/driver.h>
+ #include <linux/pm.h>
++#include <linux/reset.h>
+ #include <linux/i2c.h>
+ #include <linux/platform_device.h>
+ #include <linux/cdev.h>
+@@ -187,6 +188,11 @@
+ #define ADC3XXX_RIGHT_ADC_IIR_COEFF_D1_MSB	ADC3XXX_REG(4, 76)
+ #define ADC3XXX_RIGHT_ADC_IIR_COEFF_D1_LSB	ADC3XXX_REG(4, 77)
+ 
++/* Biquads A..E (PRB_R2/R5/R8/R11/R14/R17): N0 N1 N2 D1 D2 each, contiguous */
++#define ADC3XXX_LEFT_ADC_BIQUAD_A_N0_MSB	ADC3XXX_REG(4, 14)
++#define ADC3XXX_RIGHT_ADC_BIQUAD_A_N0_MSB	ADC3XXX_REG(4, 78)
++#define ADC3XXX_BIQUAD_COEFFS			25
++
+ /*
+  * Register bits.
+  */
+@@ -208,6 +214,15 @@
+ #define ADC3XXX_SOFT_RESET		0x01
+ #define ADC3XXX_BCLK_MASTER		0x08
+ #define ADC3XXX_WCLK_MASTER		0x04
++#define ADC3XXX_DOUT_3STATE		0x01	/* P0 R27 D0 */
++#define ADC3XXX_BCLK_INVERT		0x08	/* P0 R29 D3 */
++
++/* P0 R38: I2S TDM control */
++#define ADC3XXX_TDM_CH_SWAP		0x10
++#define ADC3XXX_TDM_CH_LEFT_ONLY	0x04
++#define ADC3XXX_TDM_CH_RIGHT_ONLY	0x08
++#define ADC3XXX_TDM_EARLY_3STATE	0x02
++#define ADC3XXX_TDM_SLOT_MODE		0x01
+ 
+ /* Interface register masks */
+ #define ADC3XXX_FORMAT_MASK		0xc0
+@@ -257,6 +272,9 @@
+ 			 (ADC3XXX_CODEC_CLKIN_PLL_CLK << ADC3XXX_CODEC_CLKIN_SHIFT))
+ #define ADC3XXX_NO_PLL	((ADC3XXX_PLL_CLKIN_ZERO << ADC3XXX_PLL_CLKIN_SHIFT) | \
+ 			 (ADC3XXX_CODEC_CLKIN_MCLK << ADC3XXX_CODEC_CLKIN_SHIFT))
++/* CODEC_CLKIN = BCLK, PLL off (its input select stays at the reset value) */
++#define ADC3XXX_BCLK_CLOCKED	((ADC3XXX_PLL_CLKIN_MCLK << ADC3XXX_PLL_CLKIN_SHIFT) | \
++				 (ADC3XXX_CODEC_CLKIN_BCLK << ADC3XXX_CODEC_CLKIN_SHIFT))
+ 
+ /*  Analog PGA control bits */
+ #define ADC3XXX_LPGA_MUTE		0x80
+@@ -328,6 +346,19 @@
+ 	u8 page_no;
+ 	int use_pll;
+ 	struct gpio_chip gpio_chip;
++	/* shared reset line (reset framework); NULL when a private GPIO is used */
++	struct reset_control *rst;
++	/* no MCLK: the converters run from the bit clock of the audio bus */
++	bool bclk_clocked;
++	/* invert BCLK (P0 R29 D3) on top of what the DAI format selects */
++	bool invert_bclk;
++	/* transmit the right channel first (P0 R38 D4) */
++	bool swap_channels;
++	unsigned int dai_fmt;
++	/* TDM: slot count and width on the bus, slots this device drives */
++	unsigned int tdm_slots;
++	unsigned int tdm_width;
++	unsigned int tdm_mask;
+ };
+ 
+ static const unsigned int adc3xxx_gpio_ctrl_reg[ADC3XXX_GPIO_PINS] = {
+@@ -781,6 +812,17 @@
+ 
+ 	TI_COEFFICIENTS("Right ADC IIR Coefficients N0 N1 D1",
+ 			ADC3XXX_RIGHT_ADC_IIR_COEFF_N0_MSB, 3),
++
++	/*
++	 * Processing block (P0 R61) and the biquads A..E of the blocks that
++	 * have them (N0 N1 N2 D1 D2 of A, then B, C, D, E). Only change
++	 * these while the ADCs are powered down (no capture running).
++	 */
++	SOC_SINGLE_RANGE("ADC Processing Block", ADC3XXX_PRB_SELECT, 0, 1, 18, 0),
++	TI_COEFFICIENTS("Left ADC Biquad Coefficients",
++			ADC3XXX_LEFT_ADC_BIQUAD_A_N0_MSB, ADC3XXX_BIQUAD_COEFFS),
++	TI_COEFFICIENTS("Right ADC Biquad Coefficients",
++			ADC3XXX_RIGHT_ADC_BIQUAD_A_N0_MSB, ADC3XXX_BIQUAD_COEFFS),
+ };
+ 
+ /* Left input selection, Single Ended inputs and Differential inputs */
+@@ -1188,6 +1230,134 @@
+ 				(adc3xxx_divs[i].pll_d >> 8) & ADC3XXX_PLLD_MSB_MASK);
+ }
+ 
++static int adc3xxx_word_length(unsigned int width, u8 *iface_len)
++{
++	switch (width) {
++	case 16:
++		*iface_len = ADC3XXX_IFACE_16BITS;
++		return 0;
++	case 20:
++		*iface_len = ADC3XXX_IFACE_20BITS;
++		return 0;
++	case 24:
++		*iface_len = ADC3XXX_IFACE_24BITS;
++		return 0;
++	case 32:
++		*iface_len = ADC3XXX_IFACE_32BITS;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++/*
++ * Place the two channels of this device on a shared (TDM) serial bus:
++ * Ch_Offset_1 is counted in BCLKs from the frame sync (plus the one-BCLK
++ * delay of DSP_A), Ch_Offset_2 from the end of the first channel. DOUT is
++ * 3-stated outside the device's own slots, so several ADCs can drive one
++ * data line. Without TDM the registers go back to their reset values.
++ */
++static int adc3xxx_setup_tdm(struct snd_soc_component *component,
++			     struct adc3xxx *adc3xxx)
++{
++	unsigned int mask = adc3xxx->tdm_mask;
++	unsigned int width = adc3xxx->tdm_width;
++	unsigned int first, second, off1, off2 = 0;
++	unsigned int tdm = ADC3XXX_TDM_EARLY_3STATE | ADC3XXX_TDM_SLOT_MODE;
++
++	if (!adc3xxx->tdm_slots) {
++		snd_soc_component_update_bits(component, ADC3XXX_INTERFACE_CTRL_1,
++					      ADC3XXX_DOUT_3STATE, 0);
++		snd_soc_component_write(component, ADC3XXX_CH_OFFSET_1, 0);
++		snd_soc_component_write(component, ADC3XXX_CH_OFFSET_2, 0);
++		snd_soc_component_write(component, ADC3XXX_I2S_TDM_CTRL,
++					ADC3XXX_TDM_EARLY_3STATE);
++		return 0;
++	}
++
++	switch (adc3xxx->dai_fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
++	case SND_SOC_DAIFMT_DSP_A:
++		off1 = 1;
++		break;
++	case SND_SOC_DAIFMT_DSP_B:
++		off1 = 0;
++		break;
++	default:
++		dev_err(component->dev, "TDM slots need the DSP_A or DSP_B format\n");
++		return -EINVAL;
++	}
++
++	first = __ffs(mask);
++	off1 += first * width;
++	mask &= ~BIT(first);
++	if (mask) {
++		second = __ffs(mask);
++		off2 = (second - first - 1) * width;
++	} else {
++		/* one slot: only the first channel is sent */
++		tdm |= adc3xxx->swap_channels ? ADC3XXX_TDM_CH_RIGHT_ONLY :
++					       ADC3XXX_TDM_CH_LEFT_ONLY;
++	}
++	if (off1 > 255 || off2 > 255) {
++		dev_err(component->dev, "TDM slot offset out of range (%u, %u)\n",
++			off1, off2);
++		return -EINVAL;
++	}
++	if (adc3xxx->swap_channels)
++		tdm |= ADC3XXX_TDM_CH_SWAP;
++
++	snd_soc_component_write(component, ADC3XXX_CH_OFFSET_1, off1);
++	snd_soc_component_write(component, ADC3XXX_CH_OFFSET_2, off2);
++	snd_soc_component_write(component, ADC3XXX_I2S_TDM_CTRL, tdm);
++	snd_soc_component_update_bits(component, ADC3XXX_INTERFACE_CTRL_1,
++				      ADC3XXX_DOUT_3STATE, ADC3XXX_DOUT_3STATE);
++	return 0;
++}
++
++/*
++ * No MCLK: CODEC_CLKIN is the bus bit clock itself, PLL off.
++ * BCLK = frame bits * fs = NADC * MADC * AOSR * fs with AOSR = 128 (filter A,
++ * needed by PRB_R1..R6) and MADC = 2, so that MADC * AOSR (256) exceeds the
++ * instruction count of PRB_R1 (188) and PRB_R2 (240), and ADC_MOD_CLK =
++ * 128 * fs stays below 6.5 MHz (SLAS553B, Table 6 and Figure 28).
++ */
++static int adc3xxx_setup_bclk_clocking(struct snd_soc_component *component,
++				       struct adc3xxx *adc3xxx,
++				       struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(component);
++	unsigned int rate = params_rate(params);
++	unsigned int frame, nadc;
++
++	if (adc3xxx->tdm_slots)
++		frame = adc3xxx->tdm_slots * adc3xxx->tdm_width;
++	else
++		frame = 2 * params_physical_width(params);
++
++	if (frame % 256 || frame / 256 > 128 || rate * 128 > 6500000) {
++		dev_err(component->dev,
++			"cannot run from BCLK: %u bits per frame at %u Hz\n",
++			frame, rate);
++		return -EINVAL;
++	}
++	nadc = frame / 256;
++
++	snd_soc_component_write(component, ADC3XXX_CLKGEN_MUX, ADC3XXX_BCLK_CLOCKED);
++	if (adc3xxx->use_pll) {
++		snd_soc_dapm_del_routes(dapm, adc3xxx_pll_intercon,
++					ARRAY_SIZE(adc3xxx_pll_intercon));
++		adc3xxx->use_pll = 0;
++	}
++	snd_soc_component_update_bits(component, ADC3XXX_ADC_NADC,
++				      ADC3XXX_NADC_MASK, nadc);
++	snd_soc_component_update_bits(component, ADC3XXX_ADC_MADC,
++				      ADC3XXX_MADC_MASK, 2);
++	snd_soc_component_update_bits(component, ADC3XXX_ADC_AOSR,
++				      ADC3XXX_AOSR_MASK, 128);
++	/* BDIV only matters when the device drives BCLK, which it cannot here */
++	return 0;
++}
++
+ static int adc3xxx_hw_params(struct snd_pcm_substream *substream,
+ 			     struct snd_pcm_hw_params *params,
+ 			     struct snd_soc_dai *dai)
+@@ -1195,39 +1365,31 @@
+ 	struct snd_soc_component *component = dai->component;
+ 	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(dai->component);
+ 	struct adc3xxx *adc3xxx = snd_soc_component_get_drvdata(component);
+-	int i, width = 16;
++	int i, ret, width;
+ 	u8 iface_len, bdiv;
+ 
++	/* select data word length: the slot width on a TDM bus */
++	width = adc3xxx->tdm_slots ? adc3xxx->tdm_width : params_width(params);
++	if (adc3xxx_word_length(width, &iface_len)) {
++		dev_err(component->dev, "Unsupported serial data format\n");
++		return -EINVAL;
++	}
++	snd_soc_component_update_bits(component, ADC3XXX_INTERFACE_CTRL_1,
++				      ADC3XXX_WLENGTH_MASK, iface_len);
++
++	ret = adc3xxx_setup_tdm(component, adc3xxx);
++	if (ret)
++		return ret;
++
++	if (adc3xxx->bclk_clocked)
++		return adc3xxx_setup_bclk_clocking(component, adc3xxx, params);
++
+ 	i = adc3xxx_get_divs(component->dev, adc3xxx->sysclk,
+ 			     params_rate(params), adc3xxx->pll_mode);
+ 
+ 	if (i < 0)
+ 		return i;
+ 
+-	/* select data word length */
+-	switch (params_width(params)) {
+-	case 16:
+-		iface_len = ADC3XXX_IFACE_16BITS;
+-		width = 16;
+-		break;
+-	case 20:
+-		iface_len = ADC3XXX_IFACE_20BITS;
+-		width = 20;
+-		break;
+-	case 24:
+-		iface_len = ADC3XXX_IFACE_24BITS;
+-		width = 24;
+-		break;
+-	case 32:
+-		iface_len = ADC3XXX_IFACE_32BITS;
+-		width = 32;
+-		break;
+-	default:
+-		dev_err(component->dev, "Unsupported serial data format\n");
+-		return -EINVAL;
+-	}
+-	snd_soc_component_update_bits(component, ADC3XXX_INTERFACE_CTRL_1,
+-				      ADC3XXX_WLENGTH_MASK, iface_len);
+ 	if (adc3xxx_divs[i].pll_p) { /* If PLL used for this mode */
+ 		adc3xxx_setup_pll(component, i);
+ 		snd_soc_component_write(component, ADC3XXX_CLKGEN_MUX, ADC3XXX_USE_PLL);
+@@ -1318,6 +1480,11 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (master && adc3xxx->bclk_clocked) {
++		dev_err(component->dev, "Cannot provide BCLK without MCLK\n");
++		return -EINVAL;
++	}
++
+ 	/*
+ 	 * match both interface format and signal polarities since they
+ 	 * are fixed
+@@ -1359,6 +1526,46 @@
+ 					    clkdir | format);
+ 	if (ret < 0)
+ 		return ret;
++
++	ret = snd_soc_component_update_bits(component, ADC3XXX_INTERFACE_CTRL_2,
++					    ADC3XXX_BCLK_INVERT,
++					    adc3xxx->invert_bclk ? ADC3XXX_BCLK_INVERT : 0);
++	if (ret < 0)
++		return ret;
++
++	adc3xxx->dai_fmt = fmt;
++	return 0;
++}
++
++/*
++ * The device transmits on capture, so its slots are in rx_mask (the mask
++ * ASoC applies to the capture stream). slot_width is the data word length
++ * of each channel; it may be smaller than the sample container the CPU DAI
++ * uses, e.g. two 16-bit ADC channels packed into one 32-bit CPU slot.
++ */
++static int adc3xxx_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
++				unsigned int rx_mask, int slots, int slot_width)
++{
++	struct snd_soc_component *component = dai->component;
++	struct adc3xxx *adc3xxx = snd_soc_component_get_drvdata(component);
++	u8 iface_len;
++
++	if (!slots) {
++		adc3xxx->tdm_slots = 0;
++		return 0;
++	}
++
++	if (slots > 32 || adc3xxx_word_length(slot_width, &iface_len) ||
++	    !rx_mask || hweight32(rx_mask) > 2 ||
++	    (slots < 32 && rx_mask >= BIT(slots))) {
++		dev_err(component->dev, "Invalid TDM setup: %d x %d bit, mask %#x\n",
++			slots, slot_width, rx_mask);
++		return -EINVAL;
++	}
++
++	adc3xxx->tdm_slots = slots;
++	adc3xxx->tdm_width = slot_width;
++	adc3xxx->tdm_mask = rx_mask;
+ 	return 0;
+ }
+ 
+@@ -1366,6 +1573,7 @@
+ 	.hw_params	= adc3xxx_hw_params,
+ 	.set_sysclk	= adc3xxx_set_dai_sysclk,
+ 	.set_fmt	= adc3xxx_set_dai_fmt,
++	.set_tdm_slot	= adc3xxx_set_tdm_slot,
+ };
+ 
+ static struct snd_soc_dai_driver adc3xxx_dai = {
+@@ -1397,6 +1605,11 @@
+ };
+ MODULE_DEVICE_TABLE(i2c, adc3xxx_i2c_id);
+ 
++static void adc3xxx_reset_assert(void *data)
++{
++	reset_control_assert(data);
++}
++
+ static int adc3xxx_i2c_probe(struct i2c_client *i2c)
+ {
+ 	struct device *dev = &i2c->dev;
+@@ -1408,21 +1621,31 @@
+ 		return -ENOMEM;
+ 	adc3xxx->dev = dev;
+ 
+-	adc3xxx->rst_pin = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
+-	if (IS_ERR(adc3xxx->rst_pin)) {
+-		return dev_err_probe(dev, PTR_ERR(adc3xxx->rst_pin),
+-				     "Failed to request rst_pin\n");
++	/*
++	 * Several ADCs on one board may share the RESET line. Through the
++	 * reset framework (reset-gpio, CONFIG_RESET_GPIO) the line is held
++	 * in reset from the moment the first of them asks for it, released
++	 * by the first deassert and asserted again only after the last one
++	 * is gone. Without it, fall back to a private GPIO, pulsed here.
++	 */
++	adc3xxx->rst = devm_reset_control_get_optional_shared(dev, NULL);
++	if (IS_ERR(adc3xxx->rst))
++		return dev_err_probe(dev, PTR_ERR(adc3xxx->rst),
++				     "Failed to get reset\n");
++	if (!adc3xxx->rst) {
++		adc3xxx->rst_pin = devm_gpiod_get_optional(dev, "reset",
++							   GPIOD_OUT_LOW);
++		if (IS_ERR(adc3xxx->rst_pin))
++			return dev_err_probe(dev, PTR_ERR(adc3xxx->rst_pin),
++					     "Failed to request rst_pin\n");
+ 	}
+ 
+-	adc3xxx->mclk = devm_clk_get(dev, NULL);
++	/*
++	 * Without a clocks property the converters are clocked from BCLK
++	 * (CODEC_CLKIN = BCLK); the device can then only be a clock consumer.
++	 */
++	adc3xxx->mclk = devm_clk_get_optional(dev, NULL);
+ 	if (IS_ERR(adc3xxx->mclk)) {
+-		/*
+-		 * The chip itself supports running off the BCLK either
+-		 * directly or via the PLL, but the driver does not (yet), so
+-		 * having a specified mclk is required. Otherwise, we could
+-		 * use the lack of a clocks property to indicate when BCLK is
+-		 * intended as the clock source.
+-		 */
+ 		return dev_err_probe(dev, PTR_ERR(adc3xxx->mclk),
+ 				     "Failed to acquire MCLK\n");
+ 	} else if (adc3xxx->mclk) {
+@@ -1430,8 +1653,14 @@
+ 		if (ret < 0)
+ 			return ret;
+ 		dev_dbg(dev, "Enabled MCLK, freq %lu Hz\n", clk_get_rate(adc3xxx->mclk));
++	} else {
++		adc3xxx->bclk_clocked = true;
++		dev_dbg(dev, "No MCLK, clocked from BCLK\n");
+ 	}
+ 
++	adc3xxx->invert_bclk = device_property_read_bool(dev, "ti,invert-bclk");
++	adc3xxx->swap_channels = device_property_read_bool(dev, "ti,swap-channels");
++
+ 	/* Configure mode for DMDIN/GPIO1 pin */
+ 	ret = adc3xxx_parse_dt_gpio(adc3xxx, "ti,dmdin-gpio1", &adc3xxx->gpio_cfg[0]);
+ 	if (ret < 0)
+@@ -1468,9 +1697,37 @@
+ 	adc3xxx->type = (uintptr_t)i2c_get_match_data(i2c);
+ 
+ 	/* Reset codec chip */
+-	gpiod_set_value_cansleep(adc3xxx->rst_pin, 1);
+-	usleep_range(2000, 100000); /* Requirement: > 10 ns (datasheet p13) */
+-	gpiod_set_value_cansleep(adc3xxx->rst_pin, 0);
++	if (adc3xxx->rst) {
++		usleep_range(1000, 2000); /* Requirement: > 10 ns (datasheet p13) */
++		ret = reset_control_deassert(adc3xxx->rst);
++		if (ret)
++			goto err_unprepare_mclk;
++		ret = devm_add_action_or_reset(dev, adc3xxx_reset_assert,
++					       adc3xxx->rst);
++		if (ret)
++			goto err_unprepare_mclk;
++		usleep_range(1000, 2000);
++	} else if (adc3xxx->rst_pin) {
++		gpiod_set_value_cansleep(adc3xxx->rst_pin, 1);
++		usleep_range(2000, 100000); /* Requirement: > 10 ns (datasheet p13) */
++		gpiod_set_value_cansleep(adc3xxx->rst_pin, 0);
++	}
++
++	/*
++	 * A shared reset line is not pulsed again when only this device is
++	 * re-probed, and there may be no reset line at all: also do a software
++	 * reset so that the chip matches the register defaults of the cache.
++	 * Select page 0 first (P0 R0 is in every page, regmap writes it
++	 * without a page switch); page 4 defaults settle within 100 us.
++	 */
++	ret = regmap_write(adc3xxx->regmap, ADC3XXX_PAGE_SELECT, 0);
++	if (!ret)
++		ret = regmap_write(adc3xxx->regmap, ADC3XXX_RESET, ADC3XXX_SOFT_RESET);
++	if (ret) {
++		dev_err(dev, "Failed to reset the codec: %d\n", ret);
++		goto err_unprepare_mclk;
++	}
++	usleep_range(10000, 20000);
+ 
+ 	/* Potentially set up pins used as GPIOs */
+ 	adc3xxx_init_gpio(adc3xxx);
+diff --git a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
+--- a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
++++ b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
+@@ -37,11 +37,35 @@
+ 
+   reset-gpios:
+     maxItems: 1
+-    description: GPIO pin used for codec reset (RESET pin)
++    description: |
++      GPIO pin used for codec reset (RESET pin). Several ADCs may share one
++      line; with the reset-gpio driver enabled the line is then released
++      once, when the first of them probes.
+ 
+   clocks:
+     maxItems: 1
+-    description: Master clock (MCLK)
++    description: |
++      Master clock (MCLK). When absent, the converters are clocked from the
++      bit clock of the audio serial bus (CODEC_CLKIN = BCLK) and the device
++      can only be a bit/frame clock consumer.
++
++  port:
++    $ref: audio-graph-port.yaml#
++    unevaluatedProperties: false
++
++  ti,invert-bclk:
++    type: boolean
++    description: |
++      Invert the bit clock polarity (page 0 / register 29, bit D3) on top of
++      what the DAI format of the link selects, for hosts that sample on the
++      other edge than the one the format implies.
++
++  ti,swap-channels:
++    type: boolean
++    description: |
++      Transmit the right channel first (page 0 / register 38, bit D4), e.g.
++      to put the right ADC into the upper half of a 32-bit host slot that
++      carries both 16-bit channels.
+ 
+   ti,dmdin-gpio1:
+     $ref: /schemas/types.yaml#/definitions/uint32
+@@ -131,7 +155,6 @@
+ required:
+   - compatible
+   - reg
+-  - clocks
+ 
+ unevaluatedProperties: false
+ 

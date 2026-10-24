@@ -1,0 +1,82 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] ASoC: soc-core: optional fixed ALSA card number
+
+Userspace built for the vendor kernel (Yandex Quasar) opens its PCMs by
+number (/dev/snd/pcmC2D0c, mic array). Two cards of the same machine
+driver cannot be told apart by snd.slots, so let the card device carry
+an optional "linux,snd-card-index"; a taken number falls back to the
+first free slot with a warning.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+diff --git a/sound/soc/soc-core.c b/sound/soc/soc-core.c
+--- a/sound/soc/soc-core.c
++++ b/sound/soc/soc-core.c
+@@ -32,6 +32,7 @@
+ #include <linux/of_graph.h>
+ #include <linux/dmi.h>
+ #include <linux/acpi.h>
++#include <linux/property.h>
+ #include <linux/string_choices.h>
+ #include <sound/core.h>
+ #include <sound/pcm.h>
+@@ -2157,6 +2158,32 @@
+ 	}
+ }
+ 
++/*
++ * A board may pin the ALSA card number of a card with the optional
++ * "linux,snd-card-index" property of the card device, for userspace that
++ * opens /dev/snd/pcmC<n>D<m> by number. Without it, or with a number that
++ * is already taken, the first free slot is used as before.
++ */
++static int snd_soc_card_new(struct snd_soc_card *card)
++{
++	u32 idx;
++	int ret;
++
++	if (card->dev &&
++	    !device_property_read_u32(card->dev, "linux,snd-card-index", &idx) &&
++	    idx < SNDRV_CARDS) {
++		ret = snd_card_new(card->dev, idx, SNDRV_DEFAULT_STR1,
++				   card->owner, 0, &card->snd_card);
++		if (ret != -EBUSY)
++			return ret;
++		dev_warn(card->dev, "ASoC: ALSA card %u is taken, using a free one\n",
++			 idx);
++	}
++
++	return snd_card_new(card->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
++			    card->owner, 0, &card->snd_card);
++}
++
+ static int snd_soc_bind_card(struct snd_soc_card *card)
+ {
+ 	struct snd_soc_pcm_runtime *rtd;
+@@ -2183,8 +2210,7 @@
+ 		goto probe_end;
+ 
+ 	/* card bind complete so register a sound card */
+-	ret = snd_card_new(card->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
+-			card->owner, 0, &card->snd_card);
++	ret = snd_soc_card_new(card);
+ 	if (ret < 0) {
+ 		dev_err(card->dev,
+ 			"ASoC: can't create sound card for card %s: %d\n",
+diff --git a/Documentation/devicetree/bindings/sound/audio-graph-card2.yaml b/Documentation/devicetree/bindings/sound/audio-graph-card2.yaml
+--- a/Documentation/devicetree/bindings/sound/audio-graph-card2.yaml
++++ b/Documentation/devicetree/bindings/sound/audio-graph-card2.yaml
+@@ -39,6 +39,13 @@
+     $ref: audio-graph.yaml#/properties/mic-det-gpios
+   widgets:
+     $ref: audio-graph.yaml#/properties/widgets
++  linux,snd-card-index:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 31
++    description: |
++      ALSA card number to register the card as, for userspace that opens
++      PCM devices by number. A number already in use falls back to the
++      first free one.
+ 
+ required:
+   - compatible

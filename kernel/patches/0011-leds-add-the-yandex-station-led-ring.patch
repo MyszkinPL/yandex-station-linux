@@ -1,0 +1,667 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] leds: add the Yandex Station LED ring
+
+The ring has 24 RGB LEDs on two write-only SN3236 / IS31FL3236 36-channel
+drivers on one I2C bus. Drive both chips as one device: 24 multicolor LED
+class devices plus /dev/ledring, which takes a whole frame per write() and
+latches it into both chips at once, so animations do not tear between the
+two halves.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+diff --git a/Documentation/devicetree/bindings/leds/yandex,station-led-ring.yaml b/Documentation/devicetree/bindings/leds/yandex,station-led-ring.yaml
+new file mode 100644
+index 0000000..7da10ad
+--- /dev/null
++++ b/Documentation/devicetree/bindings/leds/yandex,station-led-ring.yaml
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/leds/yandex,station-led-ring.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Yandex Station LED ring (two SN3236 / IS31FL3236 on one I2C bus)
++
++maintainers:
++  - MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
++
++description: |
++  24 RGB LEDs driven by two write-only 36-channel constant-current LED
++  drivers. LEDs 1-12 sit on the chip at the first address, 13-24 on the
++  second; LED k of a chip uses OUT(3k-2) = green, OUT(3k-1) = red,
++  OUT(3k) = blue. The whole ring is one device, so a frame can be latched
++  into both chips at once.
++
++properties:
++  compatible:
++    const: yandex,station-led-ring
++
++  reg:
++    items:
++      - description: chip with LEDs 1-12
++      - description: chip with LEDs 13-24
++
++  reg-names:
++    items:
++      - const: leds1-12
++      - const: leds13-24
++
++  enable-gpios:
++    maxItems: 1
++    description: switch of the chips' VCC (SN3236_VCC_ENABLE)
++
++  shutdown-gpios:
++    maxItems: 2
++    description: SDB pins of the chips (hardware shutdown, active low)
++
++required:
++  - compatible
++  - reg
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        led-ring@3f {
++            compatible = "yandex,station-led-ring";
++            reg = <0x3f>, <0x3c>;
++            reg-names = "leds1-12", "leds13-24";
++            enable-gpios = <&pio 3 10 GPIO_ACTIVE_HIGH>;
++            shutdown-gpios = <&pio 3 6 GPIO_ACTIVE_LOW>,
++                             <&pio 3 7 GPIO_ACTIVE_LOW>;
++        };
++    };
+diff --git a/drivers/leds/Kconfig b/drivers/leds/Kconfig
+index 06e6291..4c762c2 100644
+--- a/drivers/leds/Kconfig
++++ b/drivers/leds/Kconfig
+@@ -844,6 +844,19 @@ config LEDS_IS31FL32XX
+ 	  LED controllers. They are I2C devices with multiple constant-current
+ 	  channels, each with independent 256-level PWM control.
+ 
++config LEDS_YANDEX_RING
++	tristate "LED ring of the Yandex Station (2x SN3236 / IS31FL3236)"
++	depends on LEDS_CLASS_MULTICOLOR && I2C && OF
++	help
++	  Say Y or M here for the 24-LED RGB ring of the Yandex Station
++	  (YNDX-0001): two Si-En SN3236 / ISSI IS31FL3236 drivers on one
++	  I2C bus, driven as one device. Besides 24 multicolor LED class
++	  devices it offers /dev/ledring, which takes a whole frame per
++	  write() and latches it into both chips at once.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called leds-yandex-ring.
++
+ config LEDS_SC27XX_BLTC
+ 	tristate "LED support for the SC27xx breathing light controller"
+ 	depends on LEDS_CLASS && MFD_SC27XX_PMIC
+diff --git a/drivers/leds/Makefile b/drivers/leds/Makefile
+index 9a0333e..d7d0f7b 100644
+--- a/drivers/leds/Makefile
++++ b/drivers/leds/Makefile
+@@ -38,6 +38,7 @@ obj-$(CONFIG_LEDS_IP30)			+= leds-ip30.o
+ obj-$(CONFIG_LEDS_IPAQ_MICRO)		+= leds-ipaq-micro.o
+ obj-$(CONFIG_LEDS_IS31FL319X)		+= leds-is31fl319x.o
+ obj-$(CONFIG_LEDS_IS31FL32XX)		+= leds-is31fl32xx.o
++obj-$(CONFIG_LEDS_YANDEX_RING)		+= leds-yandex-ring.o
+ obj-$(CONFIG_LEDS_LM3530)		+= leds-lm3530.o
+ obj-$(CONFIG_LEDS_LM3532)		+= leds-lm3532.o
+ obj-$(CONFIG_LEDS_LM3533)		+= leds-lm3533.o
+diff --git a/drivers/leds/leds-yandex-ring.c b/drivers/leds/leds-yandex-ring.c
+new file mode 100644
+index 0000000..6a60fb7
+--- /dev/null
++++ b/drivers/leds/leds-yandex-ring.c
+@@ -0,0 +1,544 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * LED ring of the Yandex Station (YNDX-0001): 24 RGB LEDs on two Si-En SN3236
++ * (IS31FL3236 clone) constant-current drivers on one I2C bus.
++ *
++ * Chip register map (Lumissil IS31FL3236A datasheet rev. I, table 2): 00h
++ * shutdown (SSD), 01h-24h PWM, 25h update, 26h-49h LED control (OUT on/off,
++ * SL current Imax, /2, /3, /4), 4Ah global LED enable, 4Fh reset. The chips
++ * are write-only and auto-increment the register address on multi-byte
++ * writes. A write of 0 to 25h latches the PWM and LED control registers, so
++ * a frame (two 37-byte bursts and two update writes) changes the ring at once.
++ *
++ * Board wiring (vendor i2c_24led_* tools, checked on the hardware): LED 1-12
++ * on the chip at the first address (0x3f), LED 13-24 on the second (0x3c);
++ * LED k of a chip uses OUT(3k-2) = green, OUT(3k-1) = red, OUT(3k) = blue.
++ *
++ * Interfaces:
++ *  - /dev/ledring: write() of 72 bytes = R,G,B of LED 1..24 (PWM, 0-255),
++ *    or 144 bytes = those 72 plus 72 LED control bytes in the same order
++ *    (bit 0 = on, bits 2:1 = SL). Each write() is one frame; it returns
++ *    after the frame is on the bus. read() returns the current 144 bytes.
++ *  - 24 multicolor LED class devices rgb:indicator-1..24 (Imax, PWM only).
++ *
++ * Unbinding the driver leaves the chips powered, out of shutdown, dark, with
++ * every output on at Imax, which is also the state the vendor tools leave,
++ * and frees both addresses for i2c-dev users (the vendor Quasar software
++ * drives the chips itself through /dev/i2c-0).
++ */
++
++#include <linux/delay.h>
++#include <linux/fs.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/kref.h>
++#include <linux/led-class-multicolor.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#define RING_REG_SHUTDOWN	0x00
++#define RING_REG_PWM		0x01
++#define RING_REG_UPDATE		0x25
++#define RING_REG_CTRL		0x26
++#define RING_REG_GLOBAL		0x4a
++#define RING_REG_RESET		0x4f
++
++#define RING_SSD_NORMAL		BIT(0)
++#define RING_CTRL_ON		0x01	/* OUT = 1, SL = 00: Imax */
++#define RING_CTRL_MASK		0x07	/* SL bits 2:1, OUT bit 0 */
++
++#define RING_CHIPS		2
++#define RING_CH			36	/* outputs per chip */
++#define RING_LEDS_PER_CHIP	12
++#define RING_LEDS		(RING_CHIPS * RING_LEDS_PER_CHIP)
++#define RING_FRAME		(RING_LEDS * 3)	/* R, G, B per LED */
++
++/* R, G, B -> output offset from the first output of an LED (that is G) */
++static const u8 ring_rgb_out[3] = { 1, 0, 2 };
++
++struct ring;
++
++struct ring_led {
++	struct led_classdev_mc mc;
++	struct mc_subled sub[3];
++	struct ring *ring;
++	unsigned int index;		/* 0-based LED number */
++};
++
++struct ring {
++	struct kref ref;
++	struct mutex lock;		/* everything below, and the bus writes */
++	bool dead;			/* unbound: no more bus access */
++	struct device *dev;
++	struct i2c_client *chip[RING_CHIPS];
++	struct miscdevice misc;
++	u8 pwm[RING_CHIPS][RING_CH];
++	u8 ctrl[RING_CHIPS][RING_CH];
++	u8 ctrl_hw[RING_CHIPS][RING_CH];	/* what the chips hold */
++	bool ctrl_hw_valid;
++	unsigned long frames;
++	unsigned long errors;
++	struct ring_led leds[RING_LEDS];
++};
++
++static void ring_free(struct kref *ref)
++{
++	struct ring *r = container_of(ref, struct ring, ref);
++
++	mutex_destroy(&r->lock);
++	kfree(r);
++}
++
++static void ring_put(void *data)
++{
++	struct ring *r = data;
++
++	kref_put(&r->ref, ring_free);
++}
++
++/* one write message; the caller holds the bus (I2C_LOCK_SEGMENT) */
++static int ring_send(struct ring *r, int c, u8 reg, const u8 *val, int n)
++{
++	u8 buf[1 + RING_CH];
++	struct i2c_msg msg = {
++		.addr = r->chip[c]->addr,
++		.flags = 0,
++		.len = n + 1,
++		.buf = buf,
++	};
++	int ret;
++
++	buf[0] = reg;
++	memcpy(&buf[1], val, n);
++	ret = __i2c_transfer(r->chip[c]->adapter, &msg, 1);
++	if (ret == 1)
++		return 0;
++	if (ret >= 0)
++		ret = -EIO;
++	r->errors++;
++	r->ctrl_hw_valid = false;
++	dev_err_ratelimited(r->dev, "write to 0x%02x reg 0x%02x failed: %d\n",
++			    msg.addr, reg, ret);
++	return ret;
++}
++
++static int ring_send1(struct ring *r, int c, u8 reg, u8 val)
++{
++	return ring_send(r, c, reg, &val, 1);
++}
++
++static void ring_bus_lock(struct ring *r)
++{
++	i2c_lock_bus(r->chip[0]->adapter, I2C_LOCK_SEGMENT);
++}
++
++static void ring_bus_unlock(struct ring *r)
++{
++	i2c_unlock_bus(r->chip[0]->adapter, I2C_LOCK_SEGMENT);
++}
++
++/*
++ * Whole frame: LED control where it changed, PWM of both chips, then both
++ * update writes back to back with the bus held, so the two halves of the
++ * ring switch within one short message of each other. Caller holds r->lock.
++ */
++static int ring_commit_frame(struct ring *r)
++{
++	int c, ret = 0;
++
++	ring_bus_lock(r);
++	for (c = 0; c < RING_CHIPS && !ret; c++) {
++		if (r->ctrl_hw_valid &&
++		    !memcmp(r->ctrl_hw[c], r->ctrl[c], RING_CH))
++			continue;
++		ret = ring_send(r, c, RING_REG_CTRL, r->ctrl[c], RING_CH);
++		if (!ret)
++			memcpy(r->ctrl_hw[c], r->ctrl[c], RING_CH);
++	}
++	for (c = 0; c < RING_CHIPS && !ret; c++)
++		ret = ring_send(r, c, RING_REG_PWM, r->pwm[c], RING_CH);
++	for (c = 0; c < RING_CHIPS && !ret; c++)
++		ret = ring_send1(r, c, RING_REG_UPDATE, 0);
++	ring_bus_unlock(r);
++	if (!ret) {
++		r->ctrl_hw_valid = true;
++		r->frames++;
++	}
++	return ret;
++}
++
++/* one LED: three outputs of one chip. Caller holds r->lock. */
++static int ring_commit_led(struct ring *r, unsigned int index)
++{
++	int c = index / RING_LEDS_PER_CHIP;
++	int o = 3 * (index % RING_LEDS_PER_CHIP);
++	int ret = 0;
++
++	ring_bus_lock(r);
++	if (!r->ctrl_hw_valid || memcmp(&r->ctrl_hw[c][o], &r->ctrl[c][o], 3)) {
++		ret = ring_send(r, c, RING_REG_CTRL + o, &r->ctrl[c][o], 3);
++		if (!ret)
++			memcpy(&r->ctrl_hw[c][o], &r->ctrl[c][o], 3);
++	}
++	if (!ret)
++		ret = ring_send(r, c, RING_REG_PWM + o, &r->pwm[c][o], 3);
++	if (!ret)
++		ret = ring_send1(r, c, RING_REG_UPDATE, 0);
++	ring_bus_unlock(r);
++	return ret;
++}
++
++/*
++ * Reset both chips into a known dark state: PWM 0, every output on at Imax,
++ * normal operation. Used at probe and at unbind. Caller holds r->lock.
++ */
++static int ring_hw_init(struct ring *r)
++{
++	int c, ret = 0;
++
++	memset(r->pwm, 0, sizeof(r->pwm));
++	memset(r->ctrl, RING_CTRL_ON, sizeof(r->ctrl));
++	r->ctrl_hw_valid = false;
++
++	ring_bus_lock(r);
++	for (c = 0; c < RING_CHIPS && !ret; c++) {
++		/* 4Fh: all registers to default (PWM 0, outputs off, SSD) */
++		ret = ring_send1(r, c, RING_REG_RESET, 0);
++		if (ret == -ENXIO || ret == -EREMOTEIO)
++			dev_err(r->dev,
++				"no ACK from 0x%02x: chip unpowered (SN3236 VCC/SDB) or absent\n",
++				r->chip[c]->addr);
++		if (!ret)
++			ret = ring_send(r, c, RING_REG_CTRL, r->ctrl[c], RING_CH);
++		if (!ret)
++			ret = ring_send(r, c, RING_REG_PWM, r->pwm[c], RING_CH);
++		if (!ret)
++			ret = ring_send1(r, c, RING_REG_UPDATE, 0);
++		if (!ret)
++			ret = ring_send1(r, c, RING_REG_GLOBAL, 0);
++		if (!ret)
++			ret = ring_send1(r, c, RING_REG_SHUTDOWN, RING_SSD_NORMAL);
++	}
++	ring_bus_unlock(r);
++	if (!ret) {
++		memcpy(r->ctrl_hw, r->ctrl, sizeof(r->ctrl));
++		r->ctrl_hw_valid = true;
++	}
++	return ret;
++}
++
++/* ---- /dev/ledring ---- */
++
++static int ring_open(struct inode *inode, struct file *file)
++{
++	/* misc_open() has put our miscdevice into private_data */
++	struct ring *r = container_of(file->private_data, struct ring, misc);
++
++	kref_get(&r->ref);
++	file->private_data = r;
++	return 0;
++}
++
++static int ring_release(struct inode *inode, struct file *file)
++{
++	ring_put(file->private_data);
++	return 0;
++}
++
++static ssize_t ring_write(struct file *file, const char __user *ubuf,
++			  size_t len, loff_t *ppos)
++{
++	struct ring *r = file->private_data;
++	u8 buf[2 * RING_FRAME];
++	int i, ret;
++
++	if (len != RING_FRAME && len != 2 * RING_FRAME)
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++	if (len == 2 * RING_FRAME)
++		for (i = RING_FRAME; i < 2 * RING_FRAME; i++)
++			if (buf[i] & ~RING_CTRL_MASK)
++				return -EINVAL;
++
++	ret = mutex_lock_interruptible(&r->lock);
++	if (ret)
++		return ret;
++	if (r->dead) {
++		ret = -ENODEV;
++		goto out;
++	}
++	for (i = 0; i < RING_FRAME; i++) {
++		int led = i / 3;
++		int c = led / RING_LEDS_PER_CHIP;
++		int o = 3 * (led % RING_LEDS_PER_CHIP) + ring_rgb_out[i % 3];
++
++		r->pwm[c][o] = buf[i];
++		if (len == 2 * RING_FRAME)
++			r->ctrl[c][o] = buf[RING_FRAME + i];
++	}
++	ret = ring_commit_frame(r);
++out:
++	mutex_unlock(&r->lock);
++	return ret ? ret : len;
++}
++
++static ssize_t ring_read(struct file *file, char __user *ubuf, size_t len,
++			 loff_t *ppos)
++{
++	struct ring *r = file->private_data;
++	u8 buf[2 * RING_FRAME];
++	int i, ret;
++
++	ret = mutex_lock_interruptible(&r->lock);
++	if (ret)
++		return ret;
++	for (i = 0; i < RING_FRAME; i++) {
++		int led = i / 3;
++		int c = led / RING_LEDS_PER_CHIP;
++		int o = 3 * (led % RING_LEDS_PER_CHIP) + ring_rgb_out[i % 3];
++
++		buf[i] = r->pwm[c][o];
++		buf[RING_FRAME + i] = r->ctrl[c][o];
++	}
++	mutex_unlock(&r->lock);
++	return simple_read_from_buffer(ubuf, len, ppos, buf, sizeof(buf));
++}
++
++static loff_t ring_llseek(struct file *file, loff_t off, int whence)
++{
++	return fixed_size_llseek(file, off, whence, 2 * RING_FRAME);
++}
++
++static const struct file_operations ring_fops = {
++	.owner = THIS_MODULE,
++	.open = ring_open,
++	.release = ring_release,
++	.write = ring_write,
++	.read = ring_read,
++	.llseek = ring_llseek,
++};
++
++/* ---- LED class ---- */
++
++static int ring_led_set(struct led_classdev *cdev, enum led_brightness value)
++{
++	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
++	struct ring_led *l = container_of(mc, struct ring_led, mc);
++	struct ring *r = l->ring;
++	int c = l->index / RING_LEDS_PER_CHIP;
++	int o = 3 * (l->index % RING_LEDS_PER_CHIP);
++	int i, ret;
++
++	led_mc_calc_color_components(mc, value);
++
++	mutex_lock(&r->lock);
++	if (r->dead) {
++		/* unbind: the LED core turns each LED off; ring_hw_dark() does it */
++		ret = 0;
++		goto out;
++	}
++	for (i = 0; i < 3; i++) {
++		r->pwm[c][o + ring_rgb_out[i]] = mc->subled_info[i].brightness;
++		r->ctrl[c][o + ring_rgb_out[i]] = RING_CTRL_ON;
++	}
++	ret = ring_commit_led(r, l->index);
++out:
++	mutex_unlock(&r->lock);
++	return ret;
++}
++
++static int ring_register_leds(struct ring *r)
++{
++	static const unsigned int colors[3] = {
++		LED_COLOR_ID_RED, LED_COLOR_ID_GREEN, LED_COLOR_ID_BLUE,
++	};
++	int i, j, ret;
++
++	for (i = 0; i < RING_LEDS; i++) {
++		struct ring_led *l = &r->leds[i];
++		struct led_classdev *cdev = &l->mc.led_cdev;
++
++		l->ring = r;
++		l->index = i;
++		for (j = 0; j < 3; j++) {
++			l->sub[j].color_index = colors[j];
++			l->sub[j].channel = j;
++			l->sub[j].intensity = LED_FULL;	/* white by default */
++		}
++		l->mc.subled_info = l->sub;
++		l->mc.num_colors = 3;
++		cdev->name = devm_kasprintf(r->dev, GFP_KERNEL,
++					    "rgb:indicator-%d", i + 1);
++		if (!cdev->name)
++			return -ENOMEM;
++		cdev->max_brightness = LED_FULL;
++		cdev->brightness_set_blocking = ring_led_set;
++
++		ret = devm_led_classdev_multicolor_register(r->dev, &l->mc);
++		if (ret)
++			return dev_err_probe(r->dev, ret,
++					     "LED %d registration failed\n", i + 1);
++	}
++	return 0;
++}
++
++/* ---- sysfs: statistics on the I2C device ---- */
++
++static ssize_t frames_show(struct device *dev, struct device_attribute *attr,
++			   char *buf)
++{
++	struct ring *r = i2c_get_clientdata(to_i2c_client(dev));
++
++	return sysfs_emit(buf, "%lu\n", READ_ONCE(r->frames));
++}
++static DEVICE_ATTR_RO(frames);
++
++static ssize_t errors_show(struct device *dev, struct device_attribute *attr,
++			   char *buf)
++{
++	struct ring *r = i2c_get_clientdata(to_i2c_client(dev));
++
++	return sysfs_emit(buf, "%lu\n", READ_ONCE(r->errors));
++}
++static DEVICE_ATTR_RO(errors);
++
++static struct attribute *ring_attrs[] = {
++	&dev_attr_frames.attr,
++	&dev_attr_errors.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(ring);
++
++/* ---- probe / remove (all through devm actions, run in reverse) ---- */
++
++static void ring_unregister_client(void *data)
++{
++	i2c_unregister_device(data);
++}
++
++/* last bus access at unbind: leave the ring dark, chips on */
++static void ring_hw_dark(void *data)
++{
++	struct ring *r = data;
++
++	mutex_lock(&r->lock);
++	ring_hw_init(r);
++	r->dead = true;
++	mutex_unlock(&r->lock);
++}
++
++/* first step at unbind: no new frames, no new opens */
++static void ring_misc_gone(void *data)
++{
++	struct ring *r = data;
++
++	mutex_lock(&r->lock);
++	r->dead = true;
++	mutex_unlock(&r->lock);
++	misc_deregister(&r->misc);
++}
++
++static int ring_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct gpio_desc *enable;
++	struct gpio_descs *sdb;
++	struct i2c_client *second;
++	struct ring *r;
++	int ret;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return dev_err_probe(dev, -EOPNOTSUPP, "adapter lacks plain I2C\n");
++
++	r = kzalloc(sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return -ENOMEM;
++	kref_init(&r->ref);
++	mutex_init(&r->lock);
++	r->dev = dev;
++	ret = devm_add_action_or_reset(dev, ring_put, r);
++	if (ret)
++		return ret;
++
++	/* power: SN3236 VCC switch first, then release both SDB pins */
++	enable = devm_gpiod_get_optional(dev, "enable", GPIOD_OUT_HIGH);
++	if (IS_ERR(enable))
++		return dev_err_probe(dev, PTR_ERR(enable), "enable GPIO\n");
++	if (enable)
++		usleep_range(1000, 2000);
++	sdb = devm_gpiod_get_array_optional(dev, "shutdown", GPIOD_OUT_LOW);
++	if (IS_ERR(sdb))
++		return dev_err_probe(dev, PTR_ERR(sdb), "shutdown GPIOs\n");
++	if (sdb)
++		usleep_range(1000, 2000);
++
++	second = i2c_new_ancillary_device(client, "leds13-24", 0x3c);
++	if (IS_ERR(second))
++		return dev_err_probe(dev, PTR_ERR(second),
++				     "second chip address busy\n");
++	ret = devm_add_action_or_reset(dev, ring_unregister_client, second);
++	if (ret)
++		return ret;
++	r->chip[0] = client;
++	r->chip[1] = second;
++	i2c_set_clientdata(client, r);
++
++	mutex_lock(&r->lock);
++	ret = ring_hw_init(r);
++	mutex_unlock(&r->lock);
++	if (ret)
++		return dev_err_probe(dev, ret, "chip init failed\n");
++	ret = devm_add_action_or_reset(dev, ring_hw_dark, r);
++	if (ret)
++		return ret;
++
++	ret = ring_register_leds(r);
++	if (ret)
++		return ret;
++
++	r->misc.minor = MISC_DYNAMIC_MINOR;
++	r->misc.name = "ledring";
++	r->misc.fops = &ring_fops;
++	r->misc.parent = dev;
++	ret = misc_register(&r->misc);
++	if (ret)
++		return dev_err_probe(dev, ret, "misc device\n");
++	ret = devm_add_action_or_reset(dev, ring_misc_gone, r);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "%d RGB LEDs on 0x%02x + 0x%02x, /dev/%s\n", RING_LEDS,
++		 client->addr, second->addr, r->misc.name);
++	return 0;
++}
++
++static const struct of_device_id ring_of_match[] = {
++	{ .compatible = "yandex,station-led-ring" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, ring_of_match);
++
++static const struct i2c_device_id ring_id[] = {
++	{ "station-led-ring" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, ring_id);
++
++static struct i2c_driver ring_driver = {
++	.driver = {
++		.name = "yandex-led-ring",
++		.of_match_table = ring_of_match,
++		.dev_groups = ring_groups,
++	},
++	.probe = ring_probe,
++	.id_table = ring_id,
++};
++module_i2c_driver(ring_driver);
++
++MODULE_DESCRIPTION("Yandex Station LED ring (2x SN3236 / IS31FL3236)");
++MODULE_LICENSE("GPL");
+

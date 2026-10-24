@@ -1,0 +1,78 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths: ['kernel/**', 'boot/**', 'gpu/**', 'scripts/**', '.github/workflows/build.yml']
+  pull_request:
+  workflow_dispatch:
+
+# a newer push supersedes a running build of the same branch
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  PACKAGES: >-
+    git ca-certificates curl xz-utils bzip2 zstd patch file make bc bison flex
+    gcc gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross
+    libssl-dev libelf-dev cpio kmod python3 ccache
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    timeout-minutes: 120
+    steps:
+      - name: Tools
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends $PACKAGES > /dev/null
+      - uses: actions/checkout@v4
+      - name: Kernel tarball cache
+        uses: actions/cache@v4
+        with:
+          path: build/linux-*.tar.xz
+          key: linux-${{ hashFiles('kernel/linux.sha256') }}
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-kernel-${{ hashFiles('kernel/**') }}-${{ github.run_id }}
+          restore-keys: ccache-kernel-
+      - name: Build
+        run: |
+          export CCACHE_DIR=$PWD/.ccache CCACHE_BASEDIR=$PWD CCACHE_MAXSIZE=1500M CCACHE_COMPRESS=1
+          ccache -z
+          scripts/build-kernel.sh
+          ccache -s
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel
+          path: out/
+          retention-days: 30
+
+  userspace:
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    timeout-minutes: 30
+    steps:
+      - name: Tools
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends $PACKAGES > /dev/null
+      - uses: actions/checkout@v4
+      - name: Cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: out/userspace
+          key: userspace-${{ hashFiles('scripts/build-userspace.sh', 'scripts/userspace.sha256') }}
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: scripts/build-userspace.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userspace
+          path: out/userspace/
+          retention-days: 30

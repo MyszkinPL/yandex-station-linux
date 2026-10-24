@@ -1,0 +1,303 @@
+#!/bin/busybox sh
+# Stage B: bring up Wi-Fi and SSH on the mainline kernel, keep a log in the
+# unused tail of misc. Android's /data is mounted read-only; Debian tools
+# run from it through a RAM overlay.
+export PATH=/bin
+exec </dev/null >/dev/null 2>&1
+/bin/busybox --install -s /bin
+mkdir -p /proc /sys /dev /tmp /run
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /sys/kernel/debug
+mount -t devpts devpts /dev/pts
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+exec >/dev/kmsg 2>&1
+
+L=/tmp/b.log
+say() { echo "station-b: $*" > /dev/kmsg; echo "$*" >> $L; echo ">> $*" > /dev/tty0 2>/dev/null; }
+
+P=mmcblk0p9
+MISC_START=4464640          # sectors, from the vendor MBR/EBR chain
+MISC_SECTORS=32768          # 16 MiB
+LOG_SEEK=3072               # 4 KiB blocks -> 12 MiB into misc
+LOG_BLOCKS=1024             # 4 MiB, up to the end of misc
+MAGIC=STATION-MAINLINE
+# sha256 of 4 MiB of zeros; a literal, so a failing pipeline can never "match"
+ZERO4M_SHA=bb9f8df61474d25e71fa00722318cd387396ca1736605e1248821cc0de3d3af8
+DATA=mmcblk0p1              # Android /data (ext4), mounted read-only
+
+HOLD_OK=7200               # dev session; station-reboot ends it early
+HOLD_FAIL=15
+for a in $(cat /proc/cmdline); do
+	case "$a" in station.hold=*) HOLD_OK=${a#station.hold=}; HOLD_FAIL=$HOLD_OK ;; esac
+done
+
+say "init started, $(uname -r)"
+
+# --- misc log target checks (unchanged from stage A) ---
+i=0
+while [ ! -b /dev/$P ] && [ $i -lt 40 ]; do sleep 0.25; i=$((i+1)); done
+why=""
+[ -b /dev/$P ] || why="no /dev/$P"
+[ -z "$why" ] && [ "$(cat /sys/class/block/$P/start)" = "$MISC_START" ] || why="${why:-start mismatch $(cat /sys/class/block/$P/start 2>/dev/null)}"
+[ -z "$why" ] && [ "$(cat /sys/class/block/$P/size)" = "$MISC_SECTORS" ] || why="${why:-size mismatch $(cat /sys/class/block/$P/size 2>/dev/null)}"
+if [ -z "$why" ]; then
+	region_sha=$(dd if=/dev/$P bs=4096 skip=$LOG_SEEK count=$LOG_BLOCKS 2>/dev/null | sha256sum | cut -d' ' -f1)
+	head16=$(dd if=/dev/$P bs=4096 skip=$LOG_SEEK count=1 2>/dev/null | head -c 16)
+	if [ "$region_sha" != "$ZERO4M_SHA" ] && [ "$head16" != "$MAGIC" ]; then
+		why="target region not empty (sha $region_sha)"
+	fi
+fi
+
+# Hints from the previous boot's log, read before this boot overwrites it:
+# the AP's channel (from "iw dev wlan0 link" after "Connected to") lets
+# wpa_supplicant scan one channel instead of all, and the old address goes to
+# udhcpc as the requested IP. Both are only hints.
+HINT_FREQ=""; HINT_IP=""
+if [ -z "$why" ] && [ "$head16" = "$MAGIC" ]; then
+	dd if=/dev/$P bs=4096 skip=$LOG_SEEK count=16 2>/dev/null | tr -d '\000' > /tmp/prev.log
+	HINT_FREQ=$(awk '/^Connected to/ { c = 1 } c && $1 == "freq:" { print int($2); exit }' /tmp/prev.log)
+	HINT_IP=$(grep -m1 -oE 'IP [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ' /tmp/prev.log | cut -d' ' -f2)
+	case "$HINT_FREQ" in 2[0-9][0-9][0-9]|5[0-9][0-9][0-9]|6[0-9][0-9][0-9]) ;; *) HINT_FREQ="" ;; esac
+fi
+
+writelog() {
+	{
+		echo "$MAGIC-ALIVE-B1 ($1)"
+		echo "uname: $(uname -a)"
+		echo "cmdline: $(cat /proc/cmdline)"
+		echo "--- stage B"; cat $L
+		echo "--- devices_deferred"; cat /sys/kernel/debug/devices_deferred
+		echo "--- net"; ip addr; ip route
+		[ -f /run/wpa.log ] && { echo "--- wpa_supplicant"; tail -c 32768 /run/wpa.log; }
+		echo "--- dmesg"; dmesg
+		echo "--- END"
+	} > /tmp/log 2>&1
+	if [ -z "$why" ]; then
+		head -c 4190208 /tmp/log > /tmp/log.cut
+		dd if=/tmp/log.cut of=/dev/$P bs=4096 seek=$LOG_SEEK conv=notrunc 2>/dev/null
+		sync
+		blockdev --flushbufs /dev/$P
+	fi
+}
+
+# Keep the SoC alive while we work. SIGKILL (not TERM: that would do the
+# magic close and stop the watchdog) lets it reset the SoC within 16 s.
+watchdog -t 4 -T 16 /dev/watchdog
+say "watchdog feeder: $(pidof watchdog)"
+
+# --- read-only look at the RTC oscillator (decides whether the RTC driver is safe) ---
+for a in 0x01F00000 0x01F00004 0x01F00060 0x01000010; do
+	echo "devmem $a = $(devmem $a 32 2>&1)" >> $L
+done
+
+# --- what the shim did on the PMIC (AXP803 DLDO4 = Wi-Fi VDDIO) ---
+S=0x4E400000
+if [ "$(devmem $S 32)" = "0x324D4853" ]; then
+	for o in 08:ATF 10:ID 14:PWR2 18:DLDO4V 1C:DCDC2 20:DCDC5 24:WRITE 28:PWR2_NEW 2C:DCDC2_NEW 30:DCDC5_NEW 34:RESULT; do
+		echo "shim ${o#*:} = $(devmem $((S + 0x${o%%:*})) 32)" >> $L
+	done
+	case $(devmem $((S + 0x34)) 32) in
+	0x00000001) r="DLDO4 enabled" ;;
+	0x00000002) r="DLDO4 was already on" ;;
+	0x00000003) r="PMIC checks failed, nothing written" ;;
+	*) r="PMIC access through ATF failed, nothing written" ;;
+	esac
+	say "shim pmic: $r"
+else
+	say "shim pmic: no log"
+fi
+
+[ -n "$why" ] && say "misc log disabled: $why"
+writelog early
+
+result=fail
+# --- Wi-Fi ---
+i=0
+while [ ! -e /sys/class/net/wlan0 ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done
+if [ -e /sys/class/net/wlan0 ]; then
+	say "wlan0 present"
+	# the kernel takes the module's own address from its OTP; an
+	# explicit one can still be given in /etc/station/wifi-mac
+	[ -s /etc/station/wifi-mac ] && ip link set wlan0 address "$(cat /etc/station/wifi-mac)"
+	ip link set wlan0 up && say "wlan0 up"
+else
+	say "NO wlan0"
+	dmesg | grep -iE "brcm|mmc1|sdio|pwrseq" >> $L
+fi
+
+# --- Debian tools from Android /data, read-only, through a RAM overlay ---
+R=/newroot
+if [ -e /sys/class/net/wlan0 ]; then
+	blockdev --setro /dev/$DATA
+	mkdir -p /mnt/data /run/ovl $R
+	if mount -t ext4 -o ro,noload /dev/$DATA /mnt/data && [ -x /mnt/data/local/debian/usr/sbin/wpa_supplicant ]; then
+		mount -t tmpfs tmpfs /run/ovl
+		mkdir -p /run/ovl/u /run/ovl/w
+		mount -t overlay overlay -o lowerdir=/mnt/data/local/debian,upperdir=/run/ovl/u,workdir=/run/ovl/w $R
+		for m in proc sys dev dev/pts; do mount --bind /$m $R/$m; done
+		mount -t tmpfs tmpfs $R/run
+		mount -t tmpfs tmpfs $R/tmp
+		say "debian overlay ready"
+	else
+		say "cannot mount /data or no debian tools"
+	fi
+fi
+
+if [ -x $R/usr/sbin/wpa_supplicant ]; then
+	CH="chroot $R /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root"
+	say "hints: freq=${HINT_FREQ:-none} ip=${HINT_IP:-none}"
+
+	# Every network Android has saved, with only the fields a plain supplicant
+	# needs (Android adds fields upstream rejects). Whole lines are kept: a
+	# passphrase may contain spaces; a block ends only on a lone "}". EAP
+	# networks (no way to bring certificates over) and disabled ones are left out.
+	# "@FREQ@" is a placeholder for the channel hint.
+	awk '
+		/^[ \t]*network=\{[ \t]*$/ { inb = 1; blk = ""; ssid = 0; skip = 0; next }
+		inb && /^[ \t]*\}[ \t]*$/ {
+			if (ssid && !skip) printf "network={\n\tscan_ssid=1\n@FREQ@\n%s}\n", blk
+			inb = 0; next
+		}
+		inb && /^[ \t]*key_mgmt=.*(EAP|IEEE8021X)/ { skip = 1 }
+		inb && /^[ \t]*disabled=1/ { skip = 1 }
+		inb && /^[ \t]*(ssid|psk|key_mgmt|priority|auth_alg|wep_key[0-3]|wep_tx_keyidx)=/ {
+			l = $0; sub(/^[ \t]+/, "", l); blk = blk "\t" l "\n"
+			if (l ~ /^ssid=/) ssid = 1
+		}
+	' /mnt/data/misc/wifi/wpa_supplicant.conf > /tmp/net
+	if [ -s /tmp/net ]; then
+		# $1 = scan_freq (empty: scan everything)
+		start_wpa() {
+			{
+				echo "ctrl_interface=/run/wpa_supplicant"
+				if [ -n "$1" ]; then sed "s/^@FREQ@\$/	scan_freq=$1/" /tmp/net
+				else sed "/^@FREQ@\$/d" /tmp/net; fi
+			} > $R/etc/wpa-station.conf
+			chmod 600 $R/etc/wpa-station.conf
+			$CH wpa_supplicant -B -i wlan0 -D nl80211 -c /etc/wpa-station.conf -f /run/wpa.log -d
+		}
+		# up to $1 tenths of a second for the 4-way handshake to complete
+		wait_wpa() {
+			i=0
+			while [ $i -lt $1 ]; do
+				$CH wpa_cli -i wlan0 status 2>/dev/null | grep -q "^wpa_state=COMPLETED" && return 0
+				sleep 0.1; i=$((i+1))
+			done
+			return 1
+		}
+		if [ -n "$HINT_FREQ" ]; then
+			start_wpa $HINT_FREQ
+			if ! wait_wpa 40; then
+				say "not connected on hinted $HINT_FREQ MHz, scanning all channels"
+				killall wpa_supplicant; sleep 0.3
+				start_wpa ""
+				wait_wpa 450
+			fi
+		else
+			start_wpa ""
+			wait_wpa 450
+		fi
+		ln -sf $R/run/wpa.log /run/wpa.log
+		$CH iw dev wlan0 link >> $L 2>&1
+		if $CH iw dev wlan0 link 2>/dev/null | grep -q "^Connected"; then
+			say "associated with $($CH wpa_cli -i wlan0 status 2>/dev/null | sed -n 's/^ssid=//p')"
+			if udhcpc -i wlan0 -s /udhcpc.sh -n -q -t 8 -T 3 ${HINT_IP:+-r $HINT_IP}; then
+				cp /etc/resolv.conf $R/etc/resolv.conf 2>/dev/null
+				mkdir -p $R/root/.ssh && chmod 700 $R/root/.ssh
+				cp /etc/station/authorized_keys $R/root/.ssh/authorized_keys && chmod 600 $R/root/.ssh/authorized_keys
+				mkdir -p $R/etc/dropbear
+				$CH dropbear -R -E -p 22 >> $L 2>&1
+				mkdir -p $R/usr/local/sbin
+				cat > $R/usr/local/sbin/station-reboot <<'RB'
+#!/bin/sh
+# Leave mainline: stop feeding the watchdog; the SoC resets within 16 s.
+echo "station: resetting through the watchdog" > /dev/kmsg
+pkill -9 -x watchdog
+RB
+				chmod 755 $R/usr/local/sbin/station-reboot
+				cp /bin/kexec $R/usr/local/sbin/kexec
+				cat > $R/usr/local/sbin/station-kexec <<'KX'
+#!/bin/sh
+# Start another mainline kernel without U-Boot: station-kexec Image station.dtb
+# The kernel command line comes from the new DTB's bootargs. The SoC watchdog
+# keeps running across kexec (watchdog.stop_on_reboot=0), so a kernel that
+# does not come up resets the Station back to Android within 16 s.
+set -e
+img=${1:?usage: station-kexec Image station.dtb}
+dtb=${2:?usage: station-kexec Image station.dtb}
+grep -q 'watchdog.stop_on_reboot=0' /proc/cmdline ||
+	{ echo "refusing: this kernel would stop the watchdog on kexec"; exit 1; }
+grep -aq 'watchdog.stop_on_reboot=0' "$dtb" ||
+	{ echo "refusing: $dtb bootargs lack watchdog.stop_on_reboot=0"; exit 1; }
+/usr/local/sbin/kexec -l "$img" --dtb="$dtb"
+echo "station: kexec into $img" > /dev/kmsg
+sync
+/usr/local/sbin/kexec -e
+KX
+				chmod 755 $R/usr/local/sbin/station-kexec
+				i=0
+				while ! pidof dropbear >/dev/null && [ $i -lt 20 ]; do sleep 0.05; i=$((i+1)); done
+				pidof dropbear >/dev/null && result=ok
+				say "IP $(cat /tmp/ip 2>/dev/null)  ssh: $(pidof dropbear >/dev/null && echo up || echo DOWN)"
+				# Sound: the drivers are built in and probe on their own (the
+				# amplifiers asynchronously, ~0.5 s each); once both cards are
+				# there, set the mic ADCs up and give the speakers a quiet
+				# volume. In the background, so it never holds up the network.
+				(
+					i=0
+					while ! { [ -e /proc/asound/snddaudio0 ] && [ -e /proc/asound/snddaudio1 ]; } && [ $i -lt 150 ]; do
+						sleep 0.1; i=$((i+1))
+					done
+					if [ $i -ge 150 ]; then
+						say "sound: cards missing after 15 s"
+					elif cp /etc/station/station-audio-init.sh /etc/station/station-mics-init.sh $R/run/ &&
+					     $CH sh /run/station-audio-init.sh >> $L 2>&1; then
+						say "sound ready"
+					else
+						say "sound: setup failed"
+					fi
+				) &
+			else
+				say "DHCP failed"
+			fi
+		else
+			say "NOT associated with any of $(grep -c '^network=' /tmp/net) saved networks"
+		fi
+	else
+		say "no usable network in Android wpa_supplicant.conf"
+	fi
+fi
+
+writelog "$result"
+[ "$result" = ok ] && hold=$HOLD_OK || hold=$HOLD_FAIL
+say "result: $result, staying up ${hold}s, then watchdog reset to Android"
+
+# While up, a Station we cannot reach is useless: if Wi-Fi or SSH stays
+# down for NET_GRACE seconds, give up and let the watchdog take us back to
+# Android instead of feeding it for the rest of the hold. Only initramfs
+# tools here, so a broken Debian overlay cannot stop the check itself.
+NET_GRACE=60
+healthy() {
+	[ "$(cat /sys/class/net/wlan0/operstate 2>/dev/null)" = up ] &&
+		ip -4 addr show wlan0 2>/dev/null | grep -q "inet " &&
+		pidof dropbear >/dev/null
+}
+left=$hold; bad=0
+while [ $left -gt 0 ]; do
+	sleep 10; left=$((left - 10))
+	[ "$result" = ok ] || continue
+	if healthy; then
+		bad=0
+	else
+		bad=$((bad + 10))
+		say "health check failed (${bad}s of ${NET_GRACE}s)"
+		[ $bad -ge $NET_GRACE ] && { result="$result, net lost"; break; }
+	fi
+done
+writelog "$result, final"
+say "resetting through the watchdog"
+kill -9 $(pidof watchdog) 2>/dev/null
+sleep 30
+reboot -f

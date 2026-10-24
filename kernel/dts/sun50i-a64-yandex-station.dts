@@ -1,0 +1,1253 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Yandex Station (tulip-d1), Allwinner A64.
+ * Bring-up stage A: eMMC only. The PMIC is deliberately not described, so the
+ * kernel never touches the voltages vendor U-Boot has set up.
+ *
+ * wf2 integration: the track DTS pieces (rtc, cpufreq, wifi, bluetooth,
+ * leds-keys, audio, pmic, quasar-compat) merged on top of station-e1.dts.
+ * Every piece is behind a WF2_* switch so the lead can build the test
+ * batches of wf2/PLAN.md from this one file (wf2/integ/mkvariants.sh).
+ * Pieces that need the wf2 Image (rtc-sun6i built in) are marked.
+ */
+/dts-v1/;
+
+#include "sun50i-a64.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/sound/tlv320adc3xxx.h>
+
+/* ---- switches (defaults = PLAN.md batch "full") ---- */
+#ifndef WF2_SMP
+#define WF2_SMP		0	/* 0: maxcpus=1 in bootargs (first SCP-channel tests) */
+#endif
+#ifndef WF2_RTC
+#define WF2_RTC		1	/* needs the wf2 Image (RTC_DRV_SUN6I=y) */
+#endif
+#ifndef WF2_THERMAL
+#define WF2_THERMAL	1
+#endif
+#ifndef WF2_CPUFREQ
+#define WF2_CPUFREQ	1	/* 0 none, 1 cpufreq-dt at fixed 1.20 V, 2 SCP DVFS node */
+#endif
+#ifndef WF2_WIFI
+#define WF2_WIFI	0	/* 0 E1 (HS 50 MHz), 2 SDR50 100, 3 SDR104 100, 4 SDR104 150 */
+#endif
+#ifndef WF2_WIFI_PHASE
+#define WF2_WIFI_PHASE	0	/* 0 = driver default; 90/180/270 needs wifi patch 0001 */
+#endif
+#ifndef WF2_WIFI_ID
+#define WF2_WIFI_ID	1	/* MAC + RU/261 ccode-map */
+#endif
+#ifndef WF2_WIFI_OOB
+#define WF2_WIFI_OOB	0
+#endif
+#ifndef WF2_BT
+#define WF2_BT		2	/* 0 none, 1 tty + rfkill (Quasar), 2 serdev no LPM, 3 serdev LPM */
+#endif
+#ifndef WF2_BT_LPO
+#define WF2_BT_LPO	0	/* RTC LOSC_OUT as BT LPO, needs WF2_RTC */
+#endif
+#ifndef WF2_LEDS_KEYS
+#define WF2_LEDS_KEYS	1
+#endif
+#ifndef WF2_AUDIO
+#define WF2_AUDIO	1
+#endif
+#ifndef WF2_PMIC
+#define WF2_PMIC	1	/* 0 none, 1 node + always-on rails, no consumers (pmic1) */
+#endif
+#ifndef WF2_QUASAR
+#define WF2_QUASAR	0	/* 1: /firmware/android node (Quasar-mode DTB) */
+#endif
+
+#if WF2_BT_LPO && !WF2_RTC
+#error "WF2_BT_LPO needs WF2_RTC"
+#endif
+#if WF2_WIFI_OOB && !WF2_WIFI_ID
+#error "WF2_WIFI_OOB is written on top of WF2_WIFI_ID"
+#endif
+
+/ {
+	model = "Yandex Station (tulip-d1)";
+	compatible = "yandex,station-tulip-d1", "allwinner,sun50i-a64";
+
+	aliases {
+		mmc0 = &mmc2;
+		/* vendor bus numbers: Quasar maind opens /dev/i2c-0, monitord /dev/i2c-1 */
+		i2c0 = &i2c0;
+		i2c1 = &i2c1;
+#if WF2_BT
+		serial1 = &uart1;
+#endif
+	};
+
+	/*
+	 * Console goes to HDMI (fbcon); UART is not reachable and its pins may be
+	 * wired to something else. clk_ignore_unused keeps clocks the vendor
+	 * ATF/SCP rely on (bus-msgbox and bus-spinlock have no Linux consumer).
+	 * maxcpus=1 stays for the batches that call the synchronous SCP channel
+	 * for the first time: with one CPU a hang in EL3 stops every feeder of
+	 * the WDT (watchdogd feeds it before userspace, HANDLE_BOOT_ENABLED=y).
+	 * watchdog.stop_on_reboot=0 keeps the WDT running across kexec, so a
+	 * kexec'd kernel that hangs still falls back to Android.
+	 * hw_protection=reboot: a critical thermal trip resets through the WDT
+	 * instead of PSCI SYSTEM_OFF (unsafe on this board, E2).
+	 */
+	/*
+	 * selinux=0 for Debian: SELinux is built in only for the Quasar mode
+	 * (WF2_QUASAR), whose Android userspace loads its own policy. dtc does
+	 * not concatenate adjacent strings, so every combination is spelled out.
+	 */
+	chosen {
+#if WF2_SMP && WF2_QUASAR
+		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused hw_protection=reboot watchdog.stop_on_reboot=0 rdinit=/init";
+#elif WF2_SMP
+		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused hw_protection=reboot watchdog.stop_on_reboot=0 selinux=0 rdinit=/init";
+#elif WF2_QUASAR
+		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused maxcpus=1 hw_protection=reboot watchdog.stop_on_reboot=0 rdinit=/init";
+#else
+		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused maxcpus=1 hw_protection=reboot watchdog.stop_on_reboot=0 selinux=0 rdinit=/init";
+#endif
+	};
+
+#if WF2_QUASAR
+	/*
+	 * Android 6 init (Allwinner build of AOSP M) turns every property here
+	 * into ro.boot.<name>, like androidboot.<name>= on the cmdline. Our shim
+	 * replaces the vendor FDT (and with it U-Boot's androidboot.hardware=),
+	 * so the Quasar/Android ramdisk would not find init.sun50iw1p1.rc
+	 * without it. No kernel driver binds to this node. (quasar-compat)
+	 */
+	firmware {
+		android {
+			compatible = "android,firmware";
+			hardware = "sun50iw1p1";
+		};
+	};
+#endif
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x40000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* vendor ATF (BL31 "monitor", PSCI provider) lives below the kernel */
+		bl31@40000000 {
+			reg = <0x40000000 0x80000>;
+			no-map;
+		};
+
+		/* /memreserve/ in the vendor DTB: memory shared with ATF/SCP */
+		vendor@48000000 {
+			reg = <0x48000000 0x1000000>;
+			no-map;
+		};
+
+		/* the shim leaves its PMIC (RSB) results here; own 2 MiB block */
+		shimlog@4e400000 {
+			reg = <0x4e400000 0x1000>;
+			no-map;
+		};
+	};
+
+	hdmi-connector {
+		compatible = "hdmi-connector";
+		type = "a";
+
+		port {
+			hdmi_con_in: endpoint {
+				remote-endpoint = <&hdmi_out_con>;
+			};
+		};
+	};
+
+	/*
+	 * AP6356S WL_REG_ON, same wiring as the A64 Pinebook. With the RTC
+	 * driver the module's 32 kHz LPO (RTC LOSC output, vendor wlan
+	 * clocks = "losc_out", as on the BananaPi M64) is held here, so the gate
+	 * stays open while the card is powered. (rtc)
+	 */
+	wifi_pwrseq: wifi-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		reset-gpios = <&r_pio 0 2 GPIO_ACTIVE_LOW>; /* PL2 */
+#if WF2_RTC
+		clocks = <&rtc CLK_OSC32K_FANOUT>;
+		clock-names = "ext_clock";
+#endif
+		post-power-on-delay-ms = <200>;
+	};
+
+	/* placeholders only: no PMIC access */
+	reg_vcc3v3: vcc3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	/* AXP803 DLDO4: Wi-Fi VDDIO and port G, 3.0 V from the vendor boot */
+	reg_vcc3v0_wifi: vcc3v0-wifi {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc3v0-wifi";
+		regulator-min-microvolt = <3000000>;
+		regulator-max-microvolt = <3000000>;
+		regulator-always-on;
+	};
+
+	reg_vcc1v8: vcc1v8 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc1v8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+
+#if WF2_WIFI >= 2
+	/*
+	 * NOT a real rail: the SDIO "1.8 V signalling" level as seen by the
+	 * MMC core. Port G and the AP6356S VDDIO both stay on DLDO4 at 3.0 V,
+	 * exactly like the vendor kernel (no vqmmc for sdc1, its driver logs
+	 * "no vqmmc,Check if there is regulator" and lets UHS go on with
+	 * dldo4 = 3.0 V, sdmmc1_mod 300 MHz = 150 MHz SDR104). It only lets
+	 * the core finish CMD11 and select SDR50/SDR104. Never replace it with
+	 * the real DLDO4 regulator (pmic stage 3a): the core would then drop
+	 * port G (UART1 BT, I2S1, SDIO) and the module VDDIO to 1.8 V. (wifi)
+	 */
+	reg_vqmmc_wifi: vqmmc-wifi-virtual {
+		compatible = "regulator-fixed";
+		regulator-name = "vqmmc-wifi-virtual";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		vin-supply = <&reg_vcc3v0_wifi>;
+		regulator-always-on;
+	};
+#endif
+
+#if WF2_CPUFREQ == 1
+	/*
+	 * cpufreq stage 1: cpufreq-dt + mainline CCU (PLL_CPUX), no PMIC access.
+	 * vdd-cpux is AXP803 DCDC2, owned by the vendor SCP; vendor U-Boot leaves
+	 * it at 1.20 V (raw 0x21 = 0xc6, shim log). It is described as a fixed
+	 * 1.20 V placeholder, so nothing is ever written to the PMIC. Every OPP
+	 * carries <vendor-voltage vendor-voltage 1.30 V>: the OPP core disables
+	 * an OPP whose range does not contain the fixed 1.20 V
+	 * (drivers/opp/core.c:2093, drivers/regulator/core.c:3519-3523).
+	 * Only vendor frequency points (vendor DTB cpufreq_tbl). (cpufreq)
+	 * Never boot this after the SCP DVFS kernel (WF2_CPUFREQ 2) without a
+	 * WDT reset in between, unless that kernel left 1008 MHz / 1.20 V.
+	 */
+	reg_vdd_cpux: vdd-cpux {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd-cpux";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-always-on;
+	};
+
+	cpu_opp_table: opp-table-cpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-480000000 {
+			opp-hz = /bits/ 64 <480000000>;
+			opp-microvolt = <1040000 1040000 1300000>;
+			clock-latency-ns = <244144>; /* 8 32k periods */
+		};
+
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <1040000 1040000 1300000>;
+			clock-latency-ns = <244144>;
+		};
+
+		opp-720000000 {
+			opp-hz = /bits/ 64 <720000000>;
+			opp-microvolt = <1100000 1100000 1300000>;
+			clock-latency-ns = <244144>;
+		};
+
+		opp-816000000 {
+			opp-hz = /bits/ 64 <816000000>;
+			opp-microvolt = <1100000 1100000 1300000>;
+			clock-latency-ns = <244144>;
+		};
+
+		opp-1008000000 {
+			opp-hz = /bits/ 64 <1008000000>;
+			opp-microvolt = <1200000 1200000 1300000>;
+			clock-latency-ns = <244144>;
+		};
+	};
+#elif WF2_CPUFREQ == 2
+	/*
+	 * cpufreq stage 2: DVFS by the vendor SCP (sun50i-a64-scp-cpufreq
+	 * module), as the vendor 3.10 kernel does it (SMC 0xc0000030). No
+	 * operating-points-v2 here, so cpufreq-dt does not bind. (cpufreq)
+	 */
+	scp-dvfs {
+		compatible = "allwinner,sun50i-a64-scp-dvfs";
+		allwinner,ccu = <&ccu>;
+	};
+#endif
+
+#if WF2_BT == 1
+	/* BT_REG_ON as an rfkill switch for a userspace BT stack on /dev/ttyS1 */
+	rfkill-bt {
+		compatible = "rfkill-gpio";
+		label = "bt_reg_on";
+		radio-type = "bluetooth";
+		shutdown-gpios = <&r_pio 0 4 GPIO_ACTIVE_HIGH>; /* PL4 */
+		default-blocked;
+	};
+#endif
+
+#if WF2_LEDS_KEYS
+	/*
+	 * Alice button and mic mute state. Vendor Android reads these pins
+	 * through /sys/class/gpio (rc.local exports 235 and 34); while this
+	 * driver is bound that export fails with EBUSY. (leds-keys)
+	 * PB2 polarity measured under Android (HARDWARE.md): 1 = mics on,
+	 * 0 = muted, so SW_MUTE_DEVICE (1 = muted) is active low.
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		key-alice {
+			label = "Alice";
+			gpios = <&pio 7 11 GPIO_ACTIVE_LOW>; /* PH11 */
+			linux,code = <KEY_ASSISTANT>;
+			debounce-interval = <20>;
+		};
+
+		/* TLV_MIC_EN_DET: output of the hardware mute flip-flop */
+		switch-mic-mute {
+			label = "Mic mute";
+			gpios = <&pio 1 2 GPIO_ACTIVE_LOW>; /* PB2 */
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_MUTE_DEVICE>;
+			debounce-interval = <20>;
+		};
+	};
+
+	/* volume ring: INCREAS_CODE_KEY_1 (PB1) = A, INCREAS_CODE_KEY_2 (PB0) = B */
+	rotary-encoder {
+		compatible = "rotary-encoder";
+		gpios = <&pio 1 1 GPIO_ACTIVE_HIGH>, <&pio 1 0 GPIO_ACTIVE_HIGH>;
+		linux,axis = <REL_DIAL>;
+		rotary-encoder,relative-axis;
+		rotary-encoder,encoding = "gray";
+		rotary-encoder,steps-per-period = <4>;
+	};
+#endif
+
+#if WF2_PMIC
+	/*
+	 * AXP803 behind the vendor BL31: SMC 0x8000ff12/13 -> SCP -> R_RSB
+	 * (driver axp20x-atf, module). No interrupt: the PMIC IRQ belongs to the
+	 * SCP. The rails are described, consumers still use the fixed
+	 * placeholders above (pmic stage 1; stages 3a/3b are NOT merged: 3a
+	 * would put the real DLDO4 into the Wi-Fi vqmmc). (pmic)
+	 */
+	axp803: pmic {
+		compatible = "allwinner,sun50i-a64-atf-axp803";
+
+		/*
+		 * Every rail that is on after the vendor boot, pinned to the
+		 * voltage it already has and always-on: registering it reads the
+		 * enable bit and the selector and writes nothing. Check the values
+		 * against the axp803-atf-peek snapshot before loading the driver.
+		 */
+		regulators {
+			/* must match reg 0x3b[3:0]: 1800 + 150 * n kHz (n = 8) */
+			x-powers,dcdc-freq = <3000>;
+
+			/* vcc-io, eMMC VCC, port D (vendor regulator1) */
+			reg_dcdc1: dcdc1 {
+				regulator-name = "vcc-3v3";
+				regulator-always-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+			};
+
+			/*
+			 * CPU. The SCP firmware owns this one (SMC 0xc0000030 DVFS):
+			 * Linux never writes it, and it must not be cpu-supply.
+			 */
+			reg_dcdc2: dcdc2 {
+				regulator-name = "vdd-cpux";
+				regulator-always-on;
+				regulator-min-microvolt = <1040000>;
+				regulator-max-microvolt = <1300000>;
+			};
+
+			/* DRAM, 0x24 = 0xb3 */
+			reg_dcdc5: dcdc5 {
+				regulator-name = "vcc-dram";
+				regulator-always-on;
+				regulator-min-microvolt = <1500000>;
+				regulator-max-microvolt = <1500000>;
+			};
+
+			reg_dcdc6: dcdc6 {
+				regulator-name = "vdd-sys";
+				regulator-always-on;
+				regulator-min-microvolt = <1100000>;
+				regulator-max-microvolt = <1100000>;
+			};
+
+			/* port L: R_RSB pins, WL_REG_ON, BT control lines */
+			reg_aldo2: aldo2 {
+				regulator-name = "vcc-pl";
+				regulator-always-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+			};
+
+			reg_aldo3: aldo3 {
+				regulator-name = "vcc-pll-avcc";
+				regulator-always-on;
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+			};
+
+			/* HDMI, 0x12 bit 3 set after the vendor boot */
+			reg_dldo1: dldo1 {
+				regulator-name = "vcc-hdmi";
+				regulator-always-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+			};
+
+			/* Wi-Fi/BT VDDIO and port G, enabled by the shim, 0x18 = 0x17 */
+			reg_dldo4: dldo4 {
+				regulator-name = "vcc-wifi-io";
+				regulator-always-on;
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+			};
+
+			/* eMMC VCCQ and port C */
+			reg_eldo1: eldo1 {
+				regulator-name = "vcc-pc";
+				regulator-always-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			/* R domain and the AR100 (SCP) itself */
+			reg_fldo2: fldo2 {
+				regulator-name = "vdd-cpus";
+				regulator-always-on;
+				regulator-min-microvolt = <1100000>;
+				regulator-max-microvolt = <1100000>;
+			};
+
+			reg_rtc_ldo: rtc-ldo {
+				regulator-name = "vcc-rtc";
+				regulator-always-on;
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+			};
+		};
+	};
+#endif
+
+#if WF2_AUDIO
+	/*
+	 * Sound, laid out like the vendor kernel so that Yandex Quasar finds
+	 * its devices by number (quasar.cfg audiod: mics on card 2 device 0,
+	 * the echo reference on card 4 device 1 = snd-aloop index=4):
+	 *   card 1 "snddaudio1": I2S1 -> 2x TAS5751M (playback)
+	 *   card 2 "snddaudio0": I2S0 <- 5x TLV320ADC3101 (TDM capture)
+	 * Card numbers are pinned with linux,snd-card-index (soc-core patch);
+	 * keep this node order (speakers first) for kernels without it. (audio)
+	 * NOTE: regulator-fixed (built in) drives PD5 and PD4 low when it
+	 * registers, at every boot with this DTB, before any audio module.
+	 */
+
+	/* "TAS_DVDD_3V3" in the vendor DTB: no enable line */
+	reg_tas_dvdd: regulator-tas-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "tas-dvdd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	/*
+	 * "TAS_PVDD" 20 V power stage supply, PD5 high = on. Listed before
+	 * AVDD: regulator-fixed drives its line low when it registers, so
+	 * PVDD is dropped before AVDD (best effort, DT order).
+	 */
+	reg_tas_pvdd: regulator-tas-pvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "tas-pvdd";
+		regulator-min-microvolt = <20000000>;
+		regulator-max-microvolt = <20000000>;
+		gpio = <&pio 3 5 GPIO_ACTIVE_HIGH>; /* PD5 */
+		enable-active-high;
+	};
+
+	/* "TAS_AVDD_3V3", PD4 high = on; the vendor driver waits 100 ms */
+	reg_tas_avdd: regulator-tas-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "tas-avdd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&pio 3 4 GPIO_ACTIVE_HIGH>; /* PD4 */
+		enable-active-high;
+		startup-delay-us = <100000>;
+	};
+
+	/*
+	 * I2S1 -> both amplifiers on one data line (PG12), audio-graph-card2
+	 * "semi-multi" 1:2 link, SoC provides BCLK/LRCK, no MCLK pin.
+	 */
+	sound-speakers {
+		compatible = "audio-graph-card2";
+		label = "snddaudio1";
+		linux,snd-card-index = <1>;
+		links = <&i2s1_port>;
+
+		multi {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ports@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					amps_ep: endpoint {
+						remote-endpoint = <&i2s1_ep>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					amps_sub_ep: endpoint {
+						remote-endpoint = <&amp_sub_ep>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+					amps_tw_ep: endpoint {
+						remote-endpoint = <&amp_tw_ep>;
+					};
+				};
+			};
+		};
+	};
+
+	/*
+	 * I2S0 <- five ADCs on one 3-stated data line (PB7). Bus frame as the
+	 * vendor kernel: 8 slots x 32 bit, 16 kHz, BCLK 4.096 MHz = 256 fs,
+	 * PCM mode, RX offset 1, BCLK and LRCK polarity bits set (dsp_a +
+	 * bitclock-inversion on sun8i-i2s). Every 32-bit slot carries one ADC:
+	 * bits 31..16 its right channel, bits 15..0 its left one, so the
+	 * ADCs see 16 slots of 16 bit. Capture 5 x S32_LE (slots 0-4).
+	 */
+	sound-mics {
+		compatible = "audio-graph-card2";
+		label = "snddaudio0";
+		linux,snd-card-index = <2>;
+		links = <&i2s0_port>;
+
+		multi {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ports@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					mics_ep: endpoint {
+						remote-endpoint = <&i2s0_ep>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					mics_adc0_ep: endpoint {
+						remote-endpoint = <&adc0_ep>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+					mics_adc1_ep: endpoint {
+						remote-endpoint = <&adc1_ep>;
+					};
+				};
+
+				port@3 {
+					reg = <3>;
+					mics_adc2_ep: endpoint {
+						remote-endpoint = <&adc2_ep>;
+					};
+				};
+
+				port@4 {
+					reg = <4>;
+					mics_adc3_ep: endpoint {
+						remote-endpoint = <&adc3_ep>;
+					};
+				};
+
+				port@5 {
+					reg = <5>;
+					mics_adc4_ep: endpoint {
+						remote-endpoint = <&adc4_ep>;
+					};
+				};
+			};
+		};
+	};
+#endif
+};
+
+&de {
+	status = "okay";
+};
+
+#if WF2_RTC
+/* hvcc is AXP803 DLDO1 (3.3 V), already on from the vendor boot; CEC from the RTC osc32k (dtsi) */
+&hdmi {
+	hvcc-supply = <&reg_vcc3v3>;
+	status = "okay";
+};
+#else
+/*
+ * hvcc is AXP803 DLDO1 (3.3 V), already on from the vendor boot.
+ * The CEC clock normally comes from the RTC, whose driver is not enabled
+ * yet; without a provider dw-hdmi defers its bind forever. CEC is unused,
+ * so point it at the fixed 32 kHz placeholder instead.
+ */
+&hdmi {
+	clocks = <&ccu CLK_BUS_HDMI>, <&ccu CLK_HDMI_DDC>,
+		 <&ccu CLK_HDMI>, <&osc32k>;
+	hvcc-supply = <&reg_vcc3v3>;
+	status = "okay";
+};
+#endif
+
+&hdmi_out {
+	hdmi_out_con: endpoint {
+		remote-endpoint = <&hdmi_con_in>;
+	};
+};
+
+/* vendor: twi0 400 kHz (LED drivers, mic ADC 4), twi1 200 kHz (mic ADCs 0-3, amplifiers) */
+&i2c0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c0_pins>;
+	clock-frequency = <400000>;
+	status = "okay";
+
+#if WF2_LEDS_KEYS
+	/*
+	 * 2x SN3236 (IS31FL3236 clone, AD = VCC -> 0x3f, AD = GND -> 0x3c).
+	 * The driver owns PD10/PD6/PD7 while bound; unbind it before running
+	 * vendor software that drives the chips through /dev/i2c-0.
+	 * No light sensor node: 0x53 does not answer on this board
+	 * (HARDWARE.md, i2cdetect under Android 2026-10-23). (leds-keys)
+	 */
+	led-ring@3f {
+		compatible = "yandex,station-led-ring";
+		reg = <0x3f>, <0x3c>;
+		reg-names = "leds1-12", "leds13-24";
+		enable-gpios = <&pio 3 10 GPIO_ACTIVE_HIGH>;	/* PD10 SN3236_VCC_ENABLE */
+		shutdown-gpios = <&pio 3 6 GPIO_ACTIVE_LOW>,	/* PD6 SDB */
+				 <&pio 3 7 GPIO_ACTIVE_LOW>;	/* PD7 SDB */
+	};
+#endif
+
+#if WF2_AUDIO
+	/*
+	 * TLV320ADC3101 i2c0 0x18: TDM slot 4 (32-bit CPU slot), both inputs reference taps (PGA 0.5 dB).
+	 * Clocked from BCLK (no clocks property); reset line PH10 released by a hog in &pio.
+	 */
+	mic_adc4: audio-codec@18 {
+		compatible = "ti,tlv320adc3101";
+		reg = <0x18>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "ADC4";
+		/* vendor i2c_ma: P1 R51 = 0x50 */
+		ti,micbias1-vg = <ADC3XXX_MICBIAS_2_5V>;
+		ti,micbias2-vg = <ADC3XXX_MICBIAS_2_5V>;
+		/* vendor i2c_ma: P0 R29 D3 = 1 (BCLK inverted), P0 R38 D4 = 1. Needs
+		 * allwinner,edge-transfer on &i2s0 as the vendor: without it the MSB of
+		 * every word is read on its transition (-6 dBFS noise). */
+		ti,invert-bclk;
+		ti,swap-channels;
+
+		port {
+			adc4_ep: endpoint {
+				remote-endpoint = <&mics_adc4_ep>;
+				dai-tdm-slot-num = <16>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <0 0 0 0 0 0 0 0 1 1>;
+			};
+		};
+	};
+#endif
+};
+
+&i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c1_pins>;
+	clock-frequency = <200000>;
+	status = "okay";
+
+#if WF2_AUDIO
+	/*
+	 * TLV320ADC3101 i2c1 0x18: TDM slot 0 (32-bit CPU slot), two microphones (PGA 20 dB).
+	 * Clocked from BCLK (no clocks property); reset line PH10 released by a hog in &pio.
+	 */
+	mic_adc0: audio-codec@18 {
+		compatible = "ti,tlv320adc3101";
+		reg = <0x18>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "ADC0";
+		ti,micbias1-vg = <ADC3XXX_MICBIAS_2_5V>;
+		ti,micbias2-vg = <ADC3XXX_MICBIAS_2_5V>;
+		ti,invert-bclk;
+		ti,swap-channels;
+
+		port {
+			adc0_ep: endpoint {
+				remote-endpoint = <&mics_adc0_ep>;
+				dai-tdm-slot-num = <16>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <1 1>;
+			};
+		};
+	};
+
+	/* TLV320ADC3101 i2c1 0x19: TDM slot 1, two microphones */
+	mic_adc1: audio-codec@19 {
+		compatible = "ti,tlv320adc3101";
+		reg = <0x19>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "ADC1";
+		ti,micbias1-vg = <ADC3XXX_MICBIAS_2_5V>;
+		ti,micbias2-vg = <ADC3XXX_MICBIAS_2_5V>;
+		ti,invert-bclk;
+		ti,swap-channels;
+
+		port {
+			adc1_ep: endpoint {
+				remote-endpoint = <&mics_adc1_ep>;
+				dai-tdm-slot-num = <16>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <0 0 1 1>;
+			};
+		};
+	};
+
+	/* TLV320ADC3101 i2c1 0x1a: TDM slot 2, two microphones */
+	mic_adc2: audio-codec@1a {
+		compatible = "ti,tlv320adc3101";
+		reg = <0x1a>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "ADC2";
+		ti,micbias1-vg = <ADC3XXX_MICBIAS_2_5V>;
+		ti,micbias2-vg = <ADC3XXX_MICBIAS_2_5V>;
+		ti,invert-bclk;
+		ti,swap-channels;
+
+		port {
+			adc2_ep: endpoint {
+				remote-endpoint = <&mics_adc2_ep>;
+				dai-tdm-slot-num = <16>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <0 0 0 0 1 1>;
+			};
+		};
+	};
+
+	/* TLV320ADC3101 i2c1 0x1b: TDM slot 3, left microphone, right reference tap */
+	mic_adc3: audio-codec@1b {
+		compatible = "ti,tlv320adc3101";
+		reg = <0x1b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "ADC3";
+		ti,micbias1-vg = <ADC3XXX_MICBIAS_2_5V>;
+		ti,micbias2-vg = <ADC3XXX_MICBIAS_2_5V>;
+		ti,invert-bclk;
+		ti,swap-channels;
+
+		port {
+			adc3_ep: endpoint {
+				remote-endpoint = <&mics_adc3_ep>;
+				dai-tdm-slot-num = <16>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <0 0 0 0 0 0 1 1>;
+			};
+		};
+	};
+
+	/*
+	 * TAS5751M 0x2a "Subwoofer" (PBTL mono) and 0x2b "Tweeters" (stereo
+	 * BTL). Tuning from /lib/firmware/tas5751m-2{a,b}.txt (tas571x patch).
+	 * PDN (PH7) is wired to 0x2a only in the vendor DTB; nRST (PH8) is not
+	 * driven by the vendor, left alone.
+	 */
+	amp_sub: amplifier@2a {
+		compatible = "ti,tas5751m";
+		reg = <0x2a>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Subwoofer";
+		firmware-name = "tas5751m-2a.txt";
+		clocks = <&i2s0>;
+		clock-names = "mclk";
+		pdn-gpios = <&pio 7 7 GPIO_ACTIVE_LOW>; /* PH7 */
+		AVDD-supply = <&reg_tas_avdd>;
+		DVDD-supply = <&reg_tas_dvdd>;
+		PVDD-supply = <&reg_tas_pvdd>;
+
+		port {
+			amp_sub_ep: endpoint {
+				remote-endpoint = <&amps_sub_ep>;
+			};
+		};
+	};
+
+	amp_tw: amplifier@2b {
+		compatible = "ti,tas5751m";
+		reg = <0x2b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Tweeters";
+		firmware-name = "tas5751m-2b.txt";
+		clocks = <&i2s0>;
+		clock-names = "mclk";
+		AVDD-supply = <&reg_tas_avdd>;
+		DVDD-supply = <&reg_tas_dvdd>;
+		PVDD-supply = <&reg_tas_pvdd>;
+
+		port {
+			amp_tw_ep: endpoint {
+				remote-endpoint = <&amps_tw_ep>;
+			};
+		};
+	};
+#endif
+};
+
+#if WF2_AUDIO
+/*
+ * Mic capture: PB4 LRCK, PB5 BCLK, PB7 DIN. The ADCs run from BCLK.
+ * PB3 is the MCLK of both amplifiers (vendor: I2S0 MCLK = PLL_AUDIO,
+ * the TAS5751M reads 512 fs; without it they stay silent), so I2S0 also
+ * provides it as a clock that stays on without a capture stream.
+ * 256 fs at 48 kHz = 12.288 MHz works as well and is a standard mclk-fs
+ * (768) for the 16 kHz capture, which shares the divider. PB6 (DOUT)
+ * stays a GPIO input: the ADCs receive nothing.
+ * Bus timing as the vendor (FMT0 0x...ff): BCLK inverted, data on the
+ * other edge (EDGE_TRANSFER); without the latter the MSB of every word
+ * is read on its transition.
+ */
+&i2s0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2s0_rx_pins>, <&i2s0_mclk_pin>;
+	#clock-cells = <0>;
+	clock-output-names = "i2s0-mclk";
+	assigned-clocks = <&i2s0>;
+	assigned-clock-rates = <12288000>;
+	allwinner,edge-transfer;
+	status = "okay";
+
+	i2s0_port: port {
+		i2s0_ep: endpoint {
+			remote-endpoint = <&mics_ep>;
+			dai-format = "dsp_a";
+			bitclock-inversion;
+			bitclock-master;
+			frame-master;
+			/* MCLK 12.288 MHz, the amplifiers' MCLK, see above */
+			mclk-fs = <768>;
+			dai-tdm-slot-num = <8>;
+			dai-tdm-slot-width = <32>;
+		};
+	};
+};
+
+/*
+ * speakers: PG10 LRCK, PG11 BCLK, PG12 DOUT, PG13 DIN (vendor "daudio1").
+ * Data on the other BCLK edge as the vendor (FMT0 0x1f3f).
+ */
+&i2s1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2s1_pins>;
+	allwinner,edge-transfer;
+	status = "okay";
+
+	i2s1_port: port {
+		i2s1_ep: endpoint {
+			remote-endpoint = <&amps_ep>;
+			dai-format = "i2s";
+			bitclock-master;
+			frame-master;
+			mclk-fs = <256>;
+			/* vendor: 2 x 32-bit slots, BCLK = 64 fs */
+			dai-tdm-slot-num = <2>;
+			dai-tdm-slot-width = <32>;
+		};
+	};
+};
+#endif
+
+/*
+ * AP6356S (BCM4356) over SDIO. Port G is powered by AXP803 DLDO4 (3.0 V,
+ * already on from the vendor boot) and stays there. With WF2_WIFI >= 2 UHS
+ * runs with 3.0 V pads as on the vendor kernel (see reg_vqmmc_wifi). The
+ * card has no 3.2-3.4 V window (vendor settles on 2.8-2.9 V), so vmmc must
+ * be described as the real 3.0 V. (wifi)
+ */
+&mmc1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&mmc1_pins>;
+	vmmc-supply = <&reg_vcc3v0_wifi>;
+#if WF2_WIFI >= 2
+	vqmmc-supply = <&reg_vqmmc_wifi>;
+#else
+	vqmmc-supply = <&reg_vcc3v0_wifi>;
+#endif
+	mmc-pwrseq = <&wifi_pwrseq>;
+	bus-width = <4>;
+	non-removable;
+	/*
+	 * vendor sdc1: max-frequency 150 MHz, sd-uhs-sdr50/ddr50/sdr104.
+	 * No DDR50: sunxi-mmc does not handle UHS DDR50 clocking. No tuning:
+	 * the sample point is fixed (NTSR phase).
+	 */
+#if WF2_WIFI == 2
+	sd-uhs-sdr50;
+	max-frequency = <100000000>;
+#elif WF2_WIFI == 3
+	sd-uhs-sdr50;
+	sd-uhs-sdr104;
+	max-frequency = <100000000>;
+#elif WF2_WIFI == 4
+	sd-uhs-sdr50;
+	sd-uhs-sdr104;
+	max-frequency = <150000000>;
+#else
+	max-frequency = <50000000>;
+#endif
+#if WF2_WIFI_PHASE
+	allwinner,uhs-sample-phase = <WF2_WIFI_PHASE>;
+#endif
+	status = "okay";
+
+	brcmf: wifi@1 {
+		reg = <1>;
+		compatible = "brcm,bcm4329-fmac";
+#if WF2_WIFI_ID
+		/* vendor bcmdhd config.txt: ccode=RU regrev=261, DE/7, US/1 */
+		brcm,ccode-map = "RU-RU-261", "DE-DE-7", "US-US-1";
+		/*
+		 * No local-mac-address: every Station has its own, init sets the
+		 * one Android uses (/etc/station/wifi-mac). Without it the firmware
+		 * takes the AMPAK sample address 00:90:4c:1a:10:01 from nvram.txt.
+		 */
+#endif
+#if WF2_WIFI_OOB
+		/*
+		 * WL_HOST_WAKE on PL3 (vendor wlan_hostwake, idle low). brcmfmac
+		 * programs the polarity into the chip (SEPINT_ACT_HI for HIGH).
+		 * nvram has muxenab=0x10 (AMPAK: OOB on HOST_WAKE).
+		 */
+		interrupt-parent = <&r_pio>;
+		interrupts = <0 3 IRQ_TYPE_LEVEL_HIGH>;	/* PL3 */
+		interrupt-names = "host-wake";
+#endif
+	};
+};
+
+#if WF2_WIFI >= 2
+/* vendor sdc1@0: PG0-PG5 drive level 3 (40 mA), pull-up */
+&mmc1_pins {
+	drive-strength = <40>;
+};
+#endif
+
+&mmc2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&mmc2_pins>;
+	vmmc-supply = <&reg_vcc3v3>;
+	vqmmc-supply = <&reg_vcc1v8>;
+	bus-width = <8>;
+	max-frequency = <52000000>;
+	non-removable;
+	status = "okay";
+};
+
+#if WF2_BT
+/* vendor uart1@0: PG6-PG9, mux 2, allwinner,pull = <1> */
+&uart1_pins {
+	bias-pull-up;
+};
+
+&uart1_rts_cts_pins {
+	bias-pull-up;
+};
+
+/*
+ * Bluetooth half of the AP6356S (BCM4356, BT core "4354A2") on UART1.
+ * Vendor: bt_rst_n PL4 = module BT_REG_ON, btlpm bt_wake PL6 (active high),
+ * bt_hostwake PL5 (EINT, active high), uart_index 1, I/O from vcc-wifi-io.
+ * UART1 runs from APB2 = 24 MHz: 1.5 Mbaud is the highest exact rate.
+ * WF2_BT 1: plain /dev/ttyS1 + rfkill (vendor Bluedroid / Quasar mode).
+ * WF2_BT 2/3: serdev + hci_bcm (BlueZ); /dev/ttyS1 does not exist then.
+ * (bluetooth)
+ */
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1_pins>, <&uart1_rts_cts_pins>;
+	uart-has-rtscts;
+	status = "okay";
+
+#if WF2_BT >= 2
+	bluetooth {
+		compatible = "brcm,bcm43540-bt";
+		max-speed = <1500000>;
+		vddio-supply = <&reg_vcc3v0_wifi>;
+		shutdown-gpios = <&r_pio 0 4 GPIO_ACTIVE_HIGH>; /* PL4 */
+		device-wakeup-gpios = <&r_pio 0 6 GPIO_ACTIVE_HIGH>; /* PL6 */
+#if WF2_BT == 3
+		/*
+		 * With CONFIG_PM hci_bcm requests this IRQ, sends the sleep-mode
+		 * VSC (host_wake_active = 1 for a rising edge) and runtime-suspends
+		 * after 5 s idle (BT_WAKE low, RTS deasserted).
+		 */
+		interrupt-parent = <&r_pio>;
+		interrupts = <0 5 IRQ_TYPE_EDGE_RISING>; /* PL5 */
+		interrupt-names = "host-wakeup";
+#endif
+#if WF2_BT_LPO
+		/*
+		 * RTC LOSC_OUT, shared with the Wi-Fi LPO; wifi_pwrseq holds it
+		 * too, so powering BT down does not gate the Wi-Fi LPO.
+		 */
+		clocks = <&rtc CLK_OSC32K_FANOUT>;
+		clock-names = "lpo";
+#endif
+	};
+#endif
+};
+#endif
+
+&{/timer} {
+	clock-frequency = <24000000>;
+};
+
+/*
+ * The vendor ATF does PSCI (CPU_ON/OFF, SYSTEM_RESET/OFF) and its PMIC calls
+ * through the SCP over this mailbox; the mainline driver would reset its
+ * registers.
+ */
+&msgbox {
+	status = "disabled";
+};
+
+/*
+ * R_INTC is the interrupt controller of the AR100 (SCP). The vendor SCP
+ * firmware keeps its own IRQ enables in R_INTC IRQ_ENABLE0 (0x01f00c40;
+ * msgbox = bit 17, read-modify-write, no shadow copy), while irq-sun6i-r
+ * writes 0x00000001 there at init and other values on shutdown. That
+ * leaves the SCP deaf to the mailbox, so the ATF's CPU_ON request is never
+ * served (CPU1-3 "failed to come online") and SYSTEM_RESET never resets.
+ *
+ * For the GIC SPIs below R_INTC is only a pass-through (it adds wakeup
+ * support, which we do not use), so keep its driver away from the
+ * hardware and route them to the GIC directly.
+ */
+&r_intc {
+	status = "disabled";
+};
+
+&pio {
+	interrupt-parent = <&gic>;
+
+#if WF2_LEDS_KEYS
+	/*
+	 * Stop the STM32 boot animation from the first moment, as the vendor
+	 * rc.local does (gpio135 "STOP MCU LED animation", gpio133 "MCU halt"):
+	 * otherwise the MCU keeps drawing into the SN3236s and the ring flickers
+	 * between its frames and ours. Verified 2026-10-24: PE7 = 1 + PE5 = 0
+	 * freezes the animation, although the AXP803 ALDO1 bit for vcc-pe reads 0.
+	 */
+	stm32-sleep-hog {
+		gpio-hog;
+		gpios = <4 7 GPIO_ACTIVE_HIGH>;		/* PE7 */
+		output-high;
+		line-name = "stm32-sleep";
+	};
+
+	stm32-reset-hog {
+		gpio-hog;
+		gpios = <4 5 GPIO_ACTIVE_HIGH>;		/* PE5, NRST held low */
+		output-low;
+		line-name = "stm32-reset";
+	};
+#endif
+
+#if WF2_AUDIO
+	/*
+	 * PH10 resets all five TLV320ADC3101s at once. One hog releases it
+	 * (vendor rc.local pulses it low once at boot); the driver then
+	 * software-resets each chip (P0 R1). Per-node reset-gpios cannot
+	 * work: without CONFIG_RESET_GPIO (no #gpio-cells = 3 support) every
+	 * node would request the same GPIO and four would fail with -EBUSY.
+	 */
+	mic-adc-reset-hog {
+		gpio-hog;
+		gpios = <7 10 GPIO_ACTIVE_LOW>;		/* PH10, nRESET */
+		output-low;				/* deasserted: line high */
+		line-name = "mic-adc-reset";
+	};
+
+	i2s0_rx_pins: i2s0-rx-pins {
+		pins = "PB4", "PB5", "PB7";
+		function = "i2s0";
+	};
+
+	/* I2S0 MCLK, wired to the MCLK pins of both TAS5751M */
+	i2s0_mclk_pin: i2s0-mclk-pin {
+		pins = "PB3";
+		function = "i2s0";
+	};
+
+	i2s1_pins: i2s1-pins {
+		pins = "PG10", "PG11", "PG12", "PG13";
+		function = "i2s1";
+	};
+#endif
+};
+
+&r_pio {
+	interrupt-parent = <&gic>;
+};
+
+#if WF2_RTC
+/*
+ * The vendor kernel leaves LOSC_CTRL = 0x9 (external crystal, drive GSM = 2)
+ * and the LOSC output on (Wi-Fi/BT LPO). rtc-sun6i is patched to keep the
+ * GSM bits, so it writes nothing to LOSC_CTRL here. It must stay enabled
+ * together with its driver (RTC_DRV_SUN6I=y): the CCU, pio and r_ccu take
+ * osc32k/iosc from it, and a driverless node stalls them in fw_devlink.
+ * The vendor Android kernel (rtc-sunxi, "allwinner,sun50i-rtc") counts the
+ * YEAR field from 2010; use the same base so both see the same date. (rtc)
+ */
+&rtc {
+	interrupt-parent = <&gic>;
+	allwinner,rtc-year-base = <2010>;
+};
+#else
+/*
+ * No RTC driver: rtc-sun6i (unpatched) rewrites LOSC_CTRL without keeping
+ * the crystal drive bits; with the node enabled but driverless, fw_devlink
+ * holds the CCU until the 10 s deferred-probe timeout.
+ */
+&rtc {
+	interrupt-parent = <&gic>;
+	status = "disabled";
+};
+#endif
+
+&lradc {
+	interrupt-parent = <&gic>;
+};
+
+#if WF2_THERMAL
+/*
+ * Thermal. The vendor throttles on max(CPU, GPU0, GPU1) (vendor DTB
+ * thermal_sensor/combine0: combine_type "max"; trips 65/80/90/100 C
+ * passive, 110 C critical). sun50i-a64.dtsi maps CPU cooling to cpu_alert0
+ * (75 C, passive) and cpu_alert1 (90 C), but cpu_alert1 is type "hot" and
+ * step_wise skips hot trips (drivers/thermal/gov_step_wise.c:133-135): make
+ * it passive. The GPU sensors sit on the same die and the GPU is idle here;
+ * give them a passive trip on the CPU cooling device too. (cpufreq)
+ */
+&cpu_alert1 {
+	type = "passive";
+};
+
+&gpu0_thermal {
+	trips {
+		gpu0_alert: gpu0-alert {
+			temperature = <90000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+
+	cooling-maps {
+		map0 {
+			trip = <&gpu0_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&gpu1_thermal {
+	trips {
+		gpu1_alert: gpu1-alert {
+			temperature = <90000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+
+	cooling-maps {
+		map0 {
+			trip = <&gpu1_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+#endif
+
+#if WF2_CPUFREQ == 1
+&cpu0 {
+	operating-points-v2 = <&cpu_opp_table>;
+	cpu-supply = <&reg_vdd_cpux>;
+};
+
+&cpu1 {
+	operating-points-v2 = <&cpu_opp_table>;
+	cpu-supply = <&reg_vdd_cpux>;
+};
+
+&cpu2 {
+	operating-points-v2 = <&cpu_opp_table>;
+	cpu-supply = <&reg_vdd_cpux>;
+};
+
+&cpu3 {
+	operating-points-v2 = <&cpu_opp_table>;
+	cpu-supply = <&reg_vdd_cpux>;
+};
+#endif

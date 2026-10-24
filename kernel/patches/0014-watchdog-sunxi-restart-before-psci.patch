@@ -1,0 +1,31 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] watchdog: sunxi: restart through the SoC watchdog before PSCI
+
+On the Yandex Station 1 (A64, vendor ATF + AR100 SCP firmware) PSCI
+SYSTEM_RESET is forwarded to the SCP, and with the SCP alive the board
+can end up hung after it (STM32 boot animation, no U-Boot/Android, the
+SoC watchdog never fires) until power is removed. A reset through the
+SoC watchdog has always worked. PSCI registers its restart handler at
+priority 129 (drivers/firmware/psci/psci.c), above the 128 used here,
+so reboot and panic took the PSCI path. Use 192 so the watchdog goes
+first; PSCI stays as the fallback, which sunxi_wdt_restart() never
+returns to.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/drivers/watchdog/sunxi_wdt.c
++++ b/drivers/watchdog/sunxi_wdt.c
+@@ -315,7 +315,12 @@
+
+ 	watchdog_init_timeout(&sunxi_wdt->wdt_dev, timeout, dev);
+ 	watchdog_set_nowayout(&sunxi_wdt->wdt_dev, nowayout);
+-	watchdog_set_restart_priority(&sunxi_wdt->wdt_dev, 128);
++	/*
++	 * Above PSCI (129): on the Yandex Station 1 PSCI SYSTEM_RESET goes
++	 * to the vendor SCP firmware and can leave the board hung, while a
++	 * watchdog reset always reboots cleanly.
++	 */
++	watchdog_set_restart_priority(&sunxi_wdt->wdt_dev, 192);
+
+ 	watchdog_set_drvdata(&sunxi_wdt->wdt_dev, sunxi_wdt);
+

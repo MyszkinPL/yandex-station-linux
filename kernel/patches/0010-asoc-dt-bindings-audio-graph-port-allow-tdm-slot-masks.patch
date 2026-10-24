@@ -1,0 +1,26 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] ASoC: dt-bindings: audio-graph-port: allow TDM slot masks
+
+audio-graph-card2 parses dai-tdm-slot-tx-mask/rx-mask on endpoints
+(simple_util_parse_tdm -> snd_soc_of_parse_tdm_slot), the schema only
+lists the slot number and width.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+diff --git a/Documentation/devicetree/bindings/sound/audio-graph-port.yaml b/Documentation/devicetree/bindings/sound/audio-graph-port.yaml
+--- a/Documentation/devicetree/bindings/sound/audio-graph-port.yaml
++++ b/Documentation/devicetree/bindings/sound/audio-graph-port.yaml
+@@ -88,6 +88,12 @@
+       dai-tdm-slot-width:
+         description: Width in bits for each slot.
+         $ref: /schemas/types.yaml#/definitions/uint32
++      dai-tdm-slot-tx-mask:
++        description: Slots used for transmit (playback), one 0/1 cell per slot.
++        $ref: /schemas/types.yaml#/definitions/uint32-array
++      dai-tdm-slot-rx-mask:
++        description: Slots used for receive (capture), one 0/1 cell per slot.
++        $ref: /schemas/types.yaml#/definitions/uint32-array
+       dai-tdm-slot-width-map:
+         description: Mapping of sample widths to slot widths. For hardware
+           that cannot support a fixed slot width or a slot width always
+

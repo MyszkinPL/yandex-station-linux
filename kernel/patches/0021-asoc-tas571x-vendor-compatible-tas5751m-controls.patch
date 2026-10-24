@@ -1,0 +1,109 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] ASoC: tas571x: TAS5751M master volume and mute as the vendor driver has them
+
+The Yandex Station's Android audio HAL drives "<prefix> Master Playback
+Volume" with raw values on the vendor driver's scale: all 10 bits of the
+master volume register, 0.125 dB per step, 0 = mute, 1023 = +24 dB
+(hardvol_ti.xml). The TAS5733 table names it "Master Volume" and uses 9
+bits at 0.25 dB, so Android would neither find the control nor, renamed,
+set the right level. Give the TAS5751M its own small table with the vendor
+master control, the channel volumes and the soft mute, and leave out the
+biquad/mixer controls: the register script owns that tuning.
+
+The vendor scripts end soft-muted and the vendor driver unmutes on stream
+start; nothing on the Android side touches a mute control. Clear the soft
+mute after the script: at idle the power stage is in shutdown anyway.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/sound/soc/codecs/tas571x.c
++++ b/sound/soc/codecs/tas571x.c
+@@ -54,6 +54,8 @@
+ 	unsigned int			trim_settle_ms;
+ 	/* keep the serial data word length at 24 bits for any stream width */
+ 	bool				sdi_24bit;
++	/* clear the soft mute once the register script is loaded */
++	bool				unmute_after_script;
+ };
+ 
+ struct tas571x_private {
+@@ -878,6 +880,31 @@
+  * 13.5 ms, and exit-shutdown is not serviced for 240 ms + 1.3 * tstart
+  * after the first trim.
+  */
++/*
++ * TAS5751M: the master volume as the vendor driver exposes it (Yandex
++ * Station): all 10 bits, 0.125 dB per step, 0 = mute, 1023 = +24 dB, named
++ * "Master Playback Volume". Android's audio HAL there maps dB to raw values
++ * with exactly that scale (hardvol_ti.xml), so the 9-bit 0.25 dB "Master
++ * Volume" of the TAS5733 table would give it twice the attenuation.
++ */
++static const DECLARE_TLV_DB_RANGE(tas5751m_master_tlv,
++	0, 0, TLV_DB_SCALE_ITEM(-10375, 0, 1),
++	1, 0x3ff, TLV_DB_MINMAX_ITEM(-10375, 2400)
++);
++
++static const struct snd_kcontrol_new tas5751m_controls[] = {
++	SOC_SINGLE_TLV("Master Playback Volume",
++		       TAS571X_MVOL_REG, 0, 0x3ff, 1,
++		       tas5751m_master_tlv),
++	SOC_DOUBLE_R_TLV("Speaker Volume",
++			 TAS571X_CH1_VOL_REG, TAS571X_CH2_VOL_REG,
++			 1, 0x1ff, 1, tas5717_volume_tlv),
++	SOC_DOUBLE("Speaker Switch",
++		   TAS571X_SOFT_MUTE_REG,
++		   TAS571X_SOFT_MUTE_CH1_SHIFT, TAS571X_SOFT_MUTE_CH2_SHIFT,
++		   1, 1),
++};
++
+ static const char *const tas5751m_supply_names[] = {
+ 	"AVDD",
+ 	"DVDD",
+@@ -926,8 +953,8 @@
+ 	.supply_names                   = tas5751m_supply_names,
+ 	.num_supply_names               = ARRAY_SIZE(tas5751m_supply_names),
+ 	.late_supply_name               = "PVDD",
+-	.controls                       = tas5733_controls,
+-	.num_controls                   = ARRAY_SIZE(tas5733_controls),
++	.controls                       = tas5751m_controls,
++	.num_controls                   = ARRAY_SIZE(tas5751m_controls),
+ 	.regmap_config                  = &tas5751m_regmap_config,
+ 	.vol_reg_size                   = 2,
+ 	.trim_settle_ms                 = 500,
+@@ -938,6 +965,13 @@
+ 	 * edge.
+ 	 */
+ 	.sdi_24bit                      = true,
++	/*
++	 * The vendor scripts end soft-muted and the vendor driver unmutes
++	 * on stream start; Android's HAL never touches a mute control.
++	 * Unmuted at idle is still silent: the power stage stays in
++	 * shutdown until a stream starts (tas571x_mute()).
++	 */
++	.unmute_after_script            = true,
+ };
+ 
+ static const struct reg_default tas5753_reg_defaults[] = {
+@@ -1370,6 +1404,12 @@
+ 			goto disable_late;
+ 	}
+ 
++	if (priv->chip->unmute_after_script) {
++		ret = regmap_write(priv->regmap, TAS571X_SOFT_MUTE_REG, 0);
++		if (ret)
++			goto disable_late;
++	}
++
+ 	/* counted from here, as register scripts usually trim once more */
+ 	if (priv->chip->trim_settle_ms)
+ 		priv->sdn_exit_ready = ktime_add_ms(ktime_get(),
+@@ -1379,7 +1419,8 @@
+ 	priv->component_driver.controls = priv->chip->controls;
+ 	priv->component_driver.num_controls = priv->chip->num_controls;
+ 
+-	if (priv->chip->vol_reg_size == 2) {
++	if (priv->chip->vol_reg_size == 2 &&
++	    priv->chip->controls != tas5751m_controls) {
+ 		/*
+ 		 * The master volume defaults to 0x3ff (mute), but we ignore
+ 		 * (zero) the LSB because the hardware step size is 0.125 dB

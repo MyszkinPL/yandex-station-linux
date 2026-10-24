@@ -1,0 +1,156 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] rtc: sun6i: keep the LOSC crystal drive bits, optional year base
+
+sun6i_rtc_clk_init() wrote LOSC_CTRL from scratch, which clears
+EXT_LOSC_GSM (bits 3:2, external 32 kHz crystal drive) that the boot
+firmware set. On the Yandex Station the vendor kernel leaves 0x9
+(external crystal, GSM = 2) and the 32 kHz output feeds the Wi-Fi/BT LPO.
+Keep the GSM bits and skip the write when the register already holds the
+wanted setup.
+
+The 6-bit YEAR field has no defined epoch. Allwinner's A64 BSP kernel
+("allwinner,sun50i-rtc") counts it from 2010, this driver from 1970, so a
+board that dual-boots the BSP kernel sees the date 40 years off. Add an
+optional "allwinner,rtc-year-base" property (default 1970, unchanged
+behaviour) and derive range_min/range_max from it.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/drivers/rtc/rtc-sun6i.c
++++ b/drivers/rtc/rtc-sun6i.c
+@@ -37,6 +37,7 @@
+ #define SUN6I_LOSC_CTRL_RTC_HMS_ACC		BIT(8)
+ #define SUN6I_LOSC_CTRL_RTC_YMD_ACC		BIT(7)
+ #define SUN6I_LOSC_CTRL_EXT_LOSC_EN		BIT(4)
++#define SUN6I_LOSC_CTRL_EXT_LOSC_GSM		GENMASK(3, 2)
+ #define SUN6I_LOSC_CTRL_EXT_OSC			BIT(0)
+ #define SUN6I_LOSC_CTRL_ACC_MASK		GENMASK(9, 7)
+ 
+@@ -110,10 +111,11 @@
+  * relative to the minimum year allowed by the hardware.
+  *
+  * The year range is 1970 - 2033. This range is selected to match Allwinner's
+- * driver, even though it is somewhat limited.
++ * driver, even though it is somewhat limited. The base can be moved with the
++ * "allwinner,rtc-year-base" property (the A64 BSP kernel uses 2010 - 2073).
+  */
+ #define SUN6I_YEAR_MIN				1970
+-#define SUN6I_YEAR_OFF				(SUN6I_YEAR_MIN - 1900)
++#define SUN6I_YEAR_SPAN				64	/* 6-bit YEAR field */
+ 
+ #define SECS_PER_DAY				(24 * 3600ULL)
+ 
+@@ -148,6 +150,7 @@
+ 	int irq;
+ 	time64_t alarm;
+ 	unsigned long flags;
++	unsigned int year_min;
+ 
+ 	struct clk_hw hw;
+ 	struct clk_hw *int_osc;
+@@ -231,7 +234,7 @@
+ 	const char *iosc_name = "rtc-int-osc";
+ 	const char *clkout_name = "osc32k-out";
+ 	const char *parents[2];
+-	u32 reg;
++	u32 old, reg;
+ 
+ 	rtc = kzalloc(sizeof(*rtc), GFP_KERNEL);
+ 	if (!rtc)
+@@ -252,7 +255,13 @@
+ 		goto err;
+ 	}
+ 
+-	reg = SUN6I_LOSC_CTRL_KEY;
++	/*
++	 * Keep the crystal drive strength (EXT_LOSC_GSM) the boot firmware
++	 * chose: a weaker drive can stop a marginal 32 kHz crystal, and with
++	 * the auto switch off nothing falls back to the internal oscillator.
++	 */
++	old = readl(rtc->base + SUN6I_LOSC_CTRL);
++	reg = SUN6I_LOSC_CTRL_KEY | (old & SUN6I_LOSC_CTRL_EXT_LOSC_GSM);
+ 	if (rtc->data->has_auto_swt) {
+ 		/* Bypass auto-switch to int osc, on ext losc failure */
+ 		reg |= SUN6I_LOSC_CTRL_AUTO_SWT_BYPASS;
+@@ -265,7 +274,13 @@
+ 		if (rtc->data->has_losc_en)
+ 			reg |= SUN6I_LOSC_CTRL_EXT_LOSC_EN;
+ 	}
+-	writel(reg, rtc->base + SUN6I_LOSC_CTRL);
++	/* Nothing to do if the firmware left the same setup (access bits aside) */
++	if (rtc->data->has_auto_swt ||
++	    (old & GENMASK(15, 0) & ~SUN6I_LOSC_CTRL_ACC_MASK) !=
++	    (reg & GENMASK(15, 0)))
++		writel(reg, rtc->base + SUN6I_LOSC_CTRL);
++	pr_info("sun6i-rtc: LOSC_CTRL 0x%08x -> 0x%08x\n", old,
++		readl(rtc->base + SUN6I_LOSC_CTRL));
+ 
+ 	/* Yes, I know, this is ugly. */
+ 	sun6i_rtc = rtc;
+@@ -488,7 +503,7 @@
+ 		 * switch from (data_year->min)-relative offset to
+ 		 * a (1900)-relative one
+ 		 */
+-		rtc_tm->tm_year += SUN6I_YEAR_OFF;
++		rtc_tm->tm_year += chip->year_min - 1900;
+ 	}
+ 
+ 	rtc_tm->tm_sec  = SUN6I_TIME_GET_SEC_VALUE(time);
+@@ -609,14 +624,14 @@
+ 		/* The division will cut off the H:M:S part of rtc_tm. */
+ 		date = div_u64(rtc_tm_to_time64(rtc_tm), SECS_PER_DAY);
+ 	} else {
+-		rtc_tm->tm_year -= SUN6I_YEAR_OFF;
++		rtc_tm->tm_year -= chip->year_min - 1900;
+ 		rtc_tm->tm_mon += 1;
+ 
+ 		date = SUN6I_DATE_SET_DAY_VALUE(rtc_tm->tm_mday) |
+ 			SUN6I_DATE_SET_MON_VALUE(rtc_tm->tm_mon)  |
+ 			SUN6I_DATE_SET_YEAR_VALUE(rtc_tm->tm_year);
+ 
+-		if (is_leap_year(rtc_tm->tm_year + SUN6I_YEAR_MIN))
++		if (is_leap_year(rtc_tm->tm_year + chip->year_min))
+ 			date |= SUN6I_LEAP_SET_VALUE(1);
+ 	}
+ 
+@@ -787,6 +802,20 @@
+ 
+ 	chip->flags = (unsigned long)of_device_get_match_data(&pdev->dev);
+ 
++	/*
++	 * The YEAR field only counts 0..63 from a base the software picks.
++	 * Allwinner's BSP kernels for some SoCs (e.g. A64 "sun50i-rtc") count
++	 * from 2010, this driver from 1970; boards that dual-boot such a BSP
++	 * kernel can set the property so both agree on the date.
++	 */
++	chip->year_min = SUN6I_YEAR_MIN;
++	of_property_read_u32(dev->of_node, "allwinner,rtc-year-base",
++			     &chip->year_min);
++	if (chip->year_min < SUN6I_YEAR_MIN || chip->year_min > 2100) {
++		dev_err(dev, "bad allwinner,rtc-year-base %u\n", chip->year_min);
++		return -EINVAL;
++	}
++
+ 	chip->irq = platform_get_irq(pdev, 0);
+ 	if (chip->irq < 0)
+ 		return chip->irq;
+@@ -833,10 +862,14 @@
+ 		return PTR_ERR(chip->rtc);
+ 
+ 	chip->rtc->ops = &sun6i_rtc_ops;
+-	if (chip->flags & RTC_LINEAR_DAY)
++	if (chip->flags & RTC_LINEAR_DAY) {
+ 		chip->rtc->range_max = (65536 * SECS_PER_DAY) - 1;
+-	else
+-		chip->rtc->range_max = 2019686399LL; /* 2033-12-31 23:59:59 */
++	} else {
++		/* 1970: 0 .. 2019686399 (2033-12-31 23:59:59), as before */
++		chip->rtc->range_min = mktime64(chip->year_min, 1, 1, 0, 0, 0);
++		chip->rtc->range_max = mktime64(chip->year_min + SUN6I_YEAR_SPAN - 1,
++						12, 31, 23, 59, 59);
++	}
+ 
+ 	ret = devm_rtc_register_device(chip->rtc);
+ 	if (ret)
+
+--- a/drivers/cpufreq/Kconfig.arm

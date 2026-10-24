@@ -1,0 +1,683 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] mfd: axp20x: reach the AXP803 through the Allwinner BSP BL31
+
+On A64/R18 devices running the Allwinner BSP ATF together with the AR100
+SCP firmware, the AXP803 sits on the R_RSB bus owned by the SCP and the OS
+can reach it only through BL31 calls (0x8000ff12 read, 0x8000ff13 write).
+Add an axp20x regmap over those calls, so the regulators are visible to
+Linux. Writes are refused unless allow_writes is set, and even then only
+the DLDO1/DLDO4 enable bits may change. axp803-atf-peek is a read-only
+debugfs dump of the same registers.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+diff --git a/Documentation/devicetree/bindings/mfd/allwinner,sun50i-a64-atf-axp803.yaml b/Documentation/devicetree/bindings/mfd/allwinner,sun50i-a64-atf-axp803.yaml
+new file mode 100644
+index 0000000..f59bd62
+--- /dev/null
++++ b/Documentation/devicetree/bindings/mfd/allwinner,sun50i-a64-atf-axp803.yaml
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/mfd/allwinner,sun50i-a64-atf-axp803.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: X-Powers AXP803 PMIC behind the Allwinner BSP firmware
++
++maintainers:
++  - Chen-Yu Tsai <wens@csie.org>
++
++description: |
++  On A64/R18 devices that run the Allwinner BSP ARM Trusted Firmware
++  together with the AR100 (SCP) firmware, the AXP803 is attached to the
++  R_RSB bus owned by the SCP. The operating system reaches the PMIC only
++  through BL31 calls (0x8000ff12 read, 0x8000ff13 write), so the node sits
++  at the root of the tree instead of under the RSB controller, and has no
++  interrupt (the PMIC interrupt is handled by the SCP).
++
++  The regulators subnode follows x-powers,axp152.yaml.
++
++properties:
++  compatible:
++    const: allwinner,sun50i-a64-atf-axp803
++
++  regulators:
++    type: object
++    description: AXP803 regulators, as in x-powers,axp152.yaml.
++
++required:
++  - compatible
++
++additionalProperties: false
++
++examples:
++  - |
++    pmic {
++        compatible = "allwinner,sun50i-a64-atf-axp803";
++
++        regulators {
++            x-powers,dcdc-freq = <3000>;
++
++            dcdc1 {
++                regulator-name = "vcc-io";
++                regulator-always-on;
++                regulator-min-microvolt = <3300000>;
++                regulator-max-microvolt = <3300000>;
++            };
++        };
++    };
+diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+index 55a9fea..67f212f 100644
+--- a/drivers/mfd/Kconfig
++++ b/drivers/mfd/Kconfig
+@@ -237,6 +237,26 @@ config MFD_AXP20X_RSB
+ 	  components like regulators or the PEK (Power Enable Key) under the
+ 	  corresponding menus.
+ 
++config MFD_AXP20X_ATF
++	tristate "X-Powers AXP803 behind the Allwinner BSP ARM Trusted Firmware"
++	depends on ARM64 && OF && HAVE_ARM_SMCCC
++	select MFD_AXP20X
++	select REGMAP
++	help
++	  Say Y here to reach an AXP803 PMIC through the register access
++	  calls of the Allwinner BSP BL31, as found on A64/R18 devices whose
++	  R_RSB bus is owned by the AR100 (SCP) firmware, e.g. the Yandex
++	  Station. Writes are refused unless the allow_writes parameter is
++	  set, and even then only the DLDO1/DLDO4 enable bits may change.
++
++config AXP803_ATF_PEEK
++	tristate "Read-only AXP803 register dump through the Allwinner BSP BL31"
++	depends on ARM64 && OF && HAVE_ARM_SMCCC && DEBUG_FS
++	help
++	  Test module for the Yandex Station: logs a snapshot of the AXP803
++	  regulator and power control registers through the BL31 PMIC read
++	  call and repeats it from debugfs. It has no write path.
++
+ config MFD_CGBC
+ 	tristate "Congatec Board Controller"
+ 	select MFD_CORE
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index 865e9f1..89dcf11 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -152,6 +152,8 @@ obj-$(CONFIG_MFD_AC100)		+= ac100.o
+ obj-$(CONFIG_MFD_AXP20X)	+= axp20x.o
+ obj-$(CONFIG_MFD_AXP20X_I2C)	+= axp20x-i2c.o
+ obj-$(CONFIG_MFD_AXP20X_RSB)	+= axp20x-rsb.o
++obj-$(CONFIG_MFD_AXP20X_ATF)	+= axp20x-atf.o
++obj-$(CONFIG_AXP803_ATF_PEEK)	+= axp803-atf-peek.o
+ 
+ obj-$(CONFIG_MFD_LP3943)	+= lp3943.o
+ obj-$(CONFIG_MFD_LP8788)	+= lp8788.o lp8788-irq.o
+diff --git a/drivers/mfd/axp20x-atf.c b/drivers/mfd/axp20x-atf.c
+new file mode 100644
+index 0000000..73f9e97
+--- /dev/null
++++ b/drivers/mfd/axp20x-atf.c
+@@ -0,0 +1,394 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * AXP803 access through the Allwinner BSP ARM Trusted Firmware
++ *
++ * On A64/R18 devices that keep the Allwinner BSP firmware (BL31 at
++ * 0x48000000 plus the AR100 "arisc" SCP firmware), the AXP803 sits on the
++ * R_RSB bus, which belongs to the SCP. Linux must not drive R_RSB itself,
++ * but BL31 forwards single register accesses to the SCP:
++ *
++ *   0x8000ff12  read:  x1 = register              -> x0 = value
++ *   0x8000ff13  write: x1 = register, x2 = value  -> x0 = 0 on success
++ *
++ * Both are hard-sync messages: BL31 spins on the message box without a
++ * timeout until the SCP answers. A read returns (u8)-1 when the SCP reports
++ * a bus error, and a stale value (usually 0) when the hard-sync channel is
++ * out of step, because BL31 then still copies back the message it sent.
++ *
++ * This driver wraps the calls into a regmap and hands it to the common
++ * AXP20x MFD core, so the stock axp20x-regulator driver can describe the
++ * real rails. It is deliberately conservative:
++ *
++ *  - no interrupt support (the PMIC IRQ is routed to the SCP), so the core
++ *    only instantiates the regulator cell and never touches IRQ registers;
++ *  - no register cache, every access goes to the PMIC;
++ *  - a register value is accepted only when two consecutive reads agree;
++ *  - writes are refused unless the allow_writes parameter is set, and even
++ *    then only the bits listed in axp20x_atf_wr_bits[] may change; the
++ *    power-off register is refused before anything else;
++ *  - a write must come right after a read of the same register (the read
++ *    half of a regmap_update_bits() done under the regmap lock), the IC
++ *    type must still read back as AXP803 and the register must still hold
++ *    the value that read returned, and the value is read back afterwards.
++ */
++
++#include <linux/arm-smccc.h>
++#include <linux/bits.h>
++#include <linux/err.h>
++#include <linux/kernel.h>
++#include <linux/ktime.h>
++#include <linux/mfd/axp20x.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++
++#define AXP_ATF_FID_CALL_COUNT	0x8000ff00
++#define AXP_ATF_FID_READ_PMU	0x8000ff12
++#define AXP_ATF_FID_WRITE_PMU	0x8000ff13
++
++/* number of calls reported by the BSP BL31 "ARM architecture" service */
++#define AXP_ATF_NUM_CALLS	6
++
++/* calls spent on one register until two consecutive reads agree */
++#define AXP_ATF_READ_TRIES	4
++
++#define AXP803_IC_TYPE		0x03
++#define AXP803_IC_TYPE_VAL	0x51
++
++static bool allow_writes;
++module_param(allow_writes, bool, 0644);
++MODULE_PARM_DESC(allow_writes,
++		 "Pass whitelisted regulator enable bits to the PMIC (default: refuse every write)");
++
++struct axp20x_atf {
++	struct device *dev;
++	/*
++	 * Register and value of the immediately preceding access if it was a
++	 * read, last_reg = -1 otherwise. Serialized by the regmap lock.
++	 */
++	int last_reg;
++	u8 last_val;
++};
++
++/*
++ * The only bits a write may ever change: the enables of DLDO1 (HDMI hvcc)
++ * and DLDO4 (Wi-Fi VDDIO and port G), REG 12H bits 3 and 6 (AXP803
++ * datasheet rev 1.0, REG 12H). Every other bit of the register must keep
++ * its present value.
++ *
++ * Deliberately absent: every voltage register (the SCP firmware sets DCDC2
++ * for DVFS and caches it; DCDC1/5/6, ALDO2/3 and FLDO2 feed I/O, DRAM,
++ * the SoC core, port L with the RSB pins, the PLLs and the SCP itself),
++ * REG 10H and 13H (DCDC and ALDO/FLDO enables), 0x0f (one-shot boot flag
++ * used by the vendor U-Boot), 0x14 (polyphase), 0x27 (DVM), 0x30/0x8f
++ * (DRIVEVBUS), 0x31 (wakeup), 0x3b/0x80 (DCDC frequency/mode) and the IRQ
++ * registers. AXP20X_OFF_CTRL (0x32) is refused even before allow_writes
++ * is looked at: the AXP20x core registers axp20x_power_off() for every
++ * poweroff, ahead of PSCI SYSTEM_OFF.
++ */
++static const struct {
++	u8 reg;
++	u8 mask;
++} axp20x_atf_wr_bits[] = {
++	{ AXP22X_PWR_OUT_CTRL2, BIT(3) | BIT(6) },
++};
++
++/*
++ * Registers that may be read: status, data buffers, regulator and power
++ * control, interrupt enable/status, DCDC mode and GPIO/LDO_IO control.
++ * Keeps the regmap debugfs dump away from the fuel gauge/ADC area.
++ */
++static const struct regmap_range axp20x_atf_rd_ranges[] = {
++	regmap_reg_range(AXP20X_PWR_INPUT_STATUS, AXP22X_ALDO3_V_OUT),
++	regmap_reg_range(AXP20X_VBUS_IPSOUT_MGMT, AXP20X_V_HTF_DISCHRG),
++	regmap_reg_range(AXP20X_IRQ1_EN, AXP20X_IRQ6_EN),
++	regmap_reg_range(AXP20X_IRQ1_STATE, AXP20X_IRQ6_STATE),
++	regmap_reg_range(AXP20X_DCDC_MODE, AXP22X_GPIO_PULL_DOWN),
++};
++
++static const struct regmap_access_table axp20x_atf_rd_table = {
++	.yes_ranges	= axp20x_atf_rd_ranges,
++	.n_yes_ranges	= ARRAY_SIZE(axp20x_atf_rd_ranges),
++};
++
++/* Read-only snapshot logged at probe time. */
++static const u8 axp20x_atf_dump_regs[] = {
++	0x00, 0x01, 0x03, 0x0f, 0x10, 0x12, 0x13, 0x14,
++	0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
++	0x1d, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x27,
++	0x28, 0x29, 0x2a, 0x30, 0x31, 0x32, 0x36, 0x3b,
++	0x80, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94,
++};
++
++static u8 axp20x_atf_smc_read_once(unsigned int reg)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(AXP_ATF_FID_READ_PMU, reg, 0, 0, 0, 0, 0, 0, &res);
++
++	return res.a0 & 0xff;
++}
++
++/* A value counts only when two consecutive calls return it. */
++static int axp20x_atf_smc_read(unsigned int reg, u8 *val)
++{
++	u8 prev = 0, v;
++	int i;
++
++	for (i = 0; i < AXP_ATF_READ_TRIES; i++) {
++		v = axp20x_atf_smc_read_once(reg);
++		if (i && v == prev) {
++			*val = v;
++			return 0;
++		}
++		prev = v;
++	}
++
++	return -EIO;
++}
++
++static int axp20x_atf_reg_read(void *context, unsigned int reg,
++			       unsigned int *val)
++{
++	struct axp20x_atf *atf = context;
++	u8 v;
++	int ret;
++
++	atf->last_reg = -1;
++	if (reg > 0xff)
++		return -EINVAL;
++
++	ret = axp20x_atf_smc_read(reg, &v);
++	if (ret) {
++		dev_err_ratelimited(atf->dev, "reg 0x%02x: reads disagree\n",
++				    reg);
++		return ret;
++	}
++
++	atf->last_reg = reg;
++	atf->last_val = v;
++	*val = v;
++
++	return 0;
++}
++
++static int axp20x_atf_wr_mask(unsigned int reg)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(axp20x_atf_wr_bits); i++)
++		if (axp20x_atf_wr_bits[i].reg == reg)
++			return axp20x_atf_wr_bits[i].mask;
++
++	return -1;
++}
++
++static int axp20x_atf_reg_write(void *context, unsigned int reg,
++				unsigned int val)
++{
++	struct axp20x_atf *atf = context;
++	struct arm_smccc_res res;
++	int last_reg = atf->last_reg;
++	u8 last_val = atf->last_val;
++	u8 cur = 0, now = 0, id = 0;
++	int mask;
++
++	/* only the read immediately before this write may vouch for it */
++	atf->last_reg = -1;
++
++	if (reg > 0xff || val > 0xff)
++		return -EINVAL;
++
++	if (reg == AXP20X_OFF_CTRL) {
++		dev_warn(atf->dev, "refused write 0x%02x <- 0x%02x: power-off control\n",
++			 reg, val);
++		return -EPERM;
++	}
++
++	if (!READ_ONCE(allow_writes)) {
++		dev_warn(atf->dev, "refused write 0x%02x <- 0x%02x: writes disabled\n",
++			 reg, val);
++		return -EPERM;
++	}
++
++	mask = axp20x_atf_wr_mask(reg);
++	if (mask < 0) {
++		dev_warn(atf->dev, "refused write 0x%02x <- 0x%02x: register not writable\n",
++			 reg, val);
++		return -EPERM;
++	}
++
++	if (last_reg != reg) {
++		dev_err(atf->dev,
++			"refused write 0x%02x <- 0x%02x: not preceded by a read of it\n",
++			reg, val);
++		return -EIO;
++	}
++
++	/* a desynchronised channel reads back a stale value, not 0x51 */
++	if (axp20x_atf_smc_read(AXP803_IC_TYPE, &id) || id != AXP803_IC_TYPE_VAL) {
++		dev_err(atf->dev,
++			"refused write 0x%02x <- 0x%02x: IC type does not read back\n",
++			reg, val);
++		return -EIO;
++	}
++
++	if (axp20x_atf_smc_read(reg, &cur) || last_val != cur || cur == 0xff) {
++		dev_err(atf->dev,
++			"refused write 0x%02x <- 0x%02x: unreliable read (seen 0x%02x, now 0x%02x)\n",
++			reg, val, last_val, cur);
++		return -EIO;
++	}
++
++	if ((cur ^ val) & ~mask & 0xff) {
++		dev_warn(atf->dev,
++			 "refused write 0x%02x <- 0x%02x: changes bits 0x%02x outside 0x%02x\n",
++			 reg, val, (cur ^ val) & ~mask & 0xff, mask);
++		return -EPERM;
++	}
++
++	if (cur == val)
++		return 0;
++
++	arm_smccc_smc(AXP_ATF_FID_WRITE_PMU, reg, val, 0, 0, 0, 0, 0, &res);
++	if (res.a0) {
++		dev_err(atf->dev, "write 0x%02x <- 0x%02x failed: %ld\n",
++			reg, val, (long)res.a0);
++		return -EIO;
++	}
++
++	if (axp20x_atf_smc_read(reg, &now) || now != val) {
++		dev_err(atf->dev, "reg 0x%02x: wrote 0x%02x over 0x%02x, reads back 0x%02x\n",
++			reg, val, cur, now);
++		return -EIO;
++	}
++
++	dev_info(atf->dev, "reg 0x%02x: 0x%02x -> 0x%02x\n", reg, cur, val);
++
++	return 0;
++}
++
++static void axp20x_atf_dump(struct axp20x_atf *atf, struct regmap *regmap)
++{
++	char buf[8 * 6 + 1];
++	ktime_t start = ktime_get();
++	unsigned int val;
++	int i, len = 0;
++
++	for (i = 0; i < ARRAY_SIZE(axp20x_atf_dump_regs); i++) {
++		if (regmap_read(regmap, axp20x_atf_dump_regs[i], &val))
++			len += scnprintf(buf + len, sizeof(buf) - len, " %02x=--",
++					 axp20x_atf_dump_regs[i]);
++		else
++			len += scnprintf(buf + len, sizeof(buf) - len, " %02x=%02x",
++					 axp20x_atf_dump_regs[i], val);
++		if (i % 8 == 7 || i == ARRAY_SIZE(axp20x_atf_dump_regs) - 1) {
++			dev_info(atf->dev, "regs:%s\n", buf);
++			len = 0;
++		}
++	}
++
++	dev_info(atf->dev, "%zu registers in %lld us\n",
++		 ARRAY_SIZE(axp20x_atf_dump_regs),
++		 ktime_us_delta(ktime_get(), start));
++}
++
++static int axp20x_atf_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct regmap_config *cfg;
++	struct axp20x_dev *axp20x;
++	struct arm_smccc_res res;
++	struct axp20x_atf *atf;
++	unsigned int id;
++	int ret;
++
++	/*
++	 * Make sure this is the BSP BL31 before issuing its private calls.
++	 * This call is answered by BL31 itself and does not involve the SCP.
++	 */
++	arm_smccc_smc(AXP_ATF_FID_CALL_COUNT, 0, 0, 0, 0, 0, 0, 0, &res);
++	if (res.a0 != AXP_ATF_NUM_CALLS)
++		return dev_err_probe(dev, -ENODEV,
++				     "unexpected firmware (call count %ld)\n",
++				     (long)res.a0);
++
++	atf = devm_kzalloc(dev, sizeof(*atf), GFP_KERNEL);
++	if (!atf)
++		return -ENOMEM;
++	atf->dev = dev;
++	atf->last_reg = -1;
++
++	axp20x = devm_kzalloc(dev, sizeof(*axp20x), GFP_KERNEL);
++	if (!axp20x)
++		return -ENOMEM;
++
++	axp20x->dev = dev;
++	/* The PMIC interrupt is handled by the SCP firmware. */
++	axp20x->irq = 0;
++	platform_set_drvdata(pdev, axp20x);
++
++	ret = axp20x_match_device(axp20x);
++	if (ret)
++		return ret;
++
++	cfg = devm_kmemdup(dev, axp20x->regmap_cfg, sizeof(*cfg), GFP_KERNEL);
++	if (!cfg)
++		return -ENOMEM;
++
++	cfg->reg_read = axp20x_atf_reg_read;
++	cfg->reg_write = axp20x_atf_reg_write;
++	cfg->rd_table = &axp20x_atf_rd_table;
++	/* The SCP may change registers behind our back: never cache. */
++	cfg->cache_type = REGCACHE_NONE;
++	axp20x->regmap_cfg = cfg;
++
++	axp20x->regmap = devm_regmap_init(dev, NULL, atf, cfg);
++	if (IS_ERR(axp20x->regmap))
++		return dev_err_probe(dev, PTR_ERR(axp20x->regmap),
++				     "regmap init failed\n");
++
++	/* first call that goes through the SCP */
++	ret = regmap_read(axp20x->regmap, AXP803_IC_TYPE, &id);
++	if (ret)
++		return dev_err_probe(dev, -ENODEV, "IC type reads disagree\n");
++	if (id == 0xff)
++		return dev_err_probe(dev, -ENODEV, "PMIC does not answer\n");
++	if (id != AXP803_IC_TYPE_VAL)
++		return dev_err_probe(dev, -ENODEV,
++				     "unexpected IC type 0x%02x, not an AXP803\n",
++				     id);
++
++	axp20x_atf_dump(atf, axp20x->regmap);
++	dev_info(dev, "PMIC writes %s\n",
++		 allow_writes ? "allowed (DLDO1/DLDO4 enable bits only)" : "disabled");
++
++	return axp20x_device_probe(axp20x);
++}
++
++static void axp20x_atf_remove(struct platform_device *pdev)
++{
++	struct axp20x_dev *axp20x = platform_get_drvdata(pdev);
++
++	axp20x_device_remove(axp20x);
++}
++
++static const struct of_device_id axp20x_atf_of_match[] = {
++	{ .compatible = "allwinner,sun50i-a64-atf-axp803", .data = (void *)AXP803_ID },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, axp20x_atf_of_match);
++
++static struct platform_driver axp20x_atf_driver = {
++	.driver = {
++		.name		= "axp20x-atf",
++		.of_match_table	= axp20x_atf_of_match,
++	},
++	.probe	= axp20x_atf_probe,
++	.remove	= axp20x_atf_remove,
++};
++module_platform_driver(axp20x_atf_driver);
++
++MODULE_DESCRIPTION("AXP803 PMIC driver through Allwinner BSP ATF calls");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/mfd/axp803-atf-peek.c b/drivers/mfd/axp803-atf-peek.c
+new file mode 100644
+index 0000000..6402697
+--- /dev/null
++++ b/drivers/mfd/axp803-atf-peek.c
+@@ -0,0 +1,163 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Read-only AXP803 register peek through the Allwinner BSP BL31
++ *
++ * First live check of the SMC -> BL31 -> SCP -> R_RSB path from a running
++ * Linux kernel on the Yandex Station. The module contains no write call
++ * at all: the only firmware calls it can issue are 0x8000ff00 (answered by
++ * BL31 itself) and 0x8000ff12 (PMIC register read).
++ *
++ * On load it logs a snapshot of the regulator, power and GPIO control
++ * registers, every register read twice, plus the time the calls took.
++ * /sys/kernel/debug/axp803-atf-peek/regs repeats the snapshot on demand.
++ *
++ * BL31 waits for the SCP without a timeout (hard-sync message box channel),
++ * so if the SCP does not answer the calling CPU stays in EL3 with
++ * interrupts masked: only the SoC watchdog recovers from that.
++ */
++
++#define pr_fmt(fmt) "axp803-atf-peek: " fmt
++
++#include <linux/arm-smccc.h>
++#include <linux/debugfs.h>
++#include <linux/kernel.h>
++#include <linux/ktime.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/seq_file.h>
++
++#define PEEK_FID_CALL_COUNT	0x8000ff00
++#define PEEK_FID_READ_PMU	0x8000ff12
++
++#define PEEK_NUM_CALLS		6
++#define PEEK_IC_TYPE		0x03
++#define PEEK_AXP803_ID		0x51
++
++/*
++ * 0x00-0x03 status/IC type, 0x0f boot flag, 0x10-0x14 enables/polyphase,
++ * 0x15-0x1d LDO voltages, 0x20-0x25 DCDC voltages, 0x27 DVM, 0x28-0x2a
++ * ALDO voltages, 0x30 VBUS path/DRIVEVBUS level, 0x31/0x32 wakeup/off
++ * control, 0x36 PEK, 0x3b DCDC frequency, 0x80 DCDC mode, 0x8f N_VBUSEN
++ * function, 0x90-0x94 GPIO0/1 and LDO_IO.
++ */
++static const u8 peek_regs[] = {
++	0x00, 0x01, 0x02, 0x03, 0x0f, 0x10, 0x12, 0x13,
++	0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
++	0x1c, 0x1d, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
++	0x27, 0x28, 0x29, 0x2a, 0x30, 0x31, 0x32, 0x36,
++	0x3b, 0x80, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94,
++};
++
++static DEFINE_MUTEX(peek_lock);
++static struct dentry *peek_dir;
++
++static u8 peek_read(unsigned int reg, u64 *ns)
++{
++	struct arm_smccc_res res;
++	ktime_t t = ktime_get();
++
++	arm_smccc_smc(PEEK_FID_READ_PMU, reg, 0, 0, 0, 0, 0, 0, &res);
++	*ns = ktime_to_ns(ktime_sub(ktime_get(), t));
++
++	return res.a0 & 0xff;
++}
++
++/*
++ * One snapshot line per 8 registers: "RR=VV" when both reads agree,
++ * "RR=VV/WW" when they do not. A desynchronised hard-sync channel makes
++ * BL31 return a stale result, so disagreement is worth flagging.
++ */
++static void peek_snapshot(struct seq_file *s)
++{
++	char line[8 * 9 + 1];
++	u64 ns, max_ns = 0, total_ns = 0;
++	unsigned int i, len = 0, mismatches = 0, calls = 0;
++
++	mutex_lock(&peek_lock);
++	for (i = 0; i < ARRAY_SIZE(peek_regs); i++) {
++		u8 a, b;
++
++		a = peek_read(peek_regs[i], &ns);
++		total_ns += ns;
++		max_ns = max(max_ns, ns);
++		b = peek_read(peek_regs[i], &ns);
++		total_ns += ns;
++		max_ns = max(max_ns, ns);
++		calls += 2;
++
++		if (a == b) {
++			len += scnprintf(line + len, sizeof(line) - len,
++					 " %02x=%02x", peek_regs[i], a);
++		} else {
++			mismatches++;
++			len += scnprintf(line + len, sizeof(line) - len,
++					 " %02x=%02x/%02x", peek_regs[i], a, b);
++		}
++
++		if (i % 8 == 7 || i == ARRAY_SIZE(peek_regs) - 1) {
++			if (s)
++				seq_printf(s, "regs:%s\n", line);
++			else
++				pr_info("regs:%s\n", line);
++			len = 0;
++		}
++	}
++	mutex_unlock(&peek_lock);
++
++	if (s)
++		seq_printf(s, "%u reads, %u mismatches, total %llu us, max %llu us\n",
++			   calls, mismatches, total_ns / 1000, max_ns / 1000);
++	else
++		pr_info("%u reads, %u mismatches, total %llu us, max %llu us\n",
++			calls, mismatches, total_ns / 1000, max_ns / 1000);
++}
++
++static int peek_regs_show(struct seq_file *s, void *unused)
++{
++	peek_snapshot(s);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(peek_regs);
++
++static int __init peek_init(void)
++{
++	struct arm_smccc_res res;
++	u64 ns;
++	u8 id;
++
++	if (!of_machine_is_compatible("yandex,station-tulip-d1"))
++		return -ENODEV;
++
++	/* answered by BL31 itself, no SCP involved */
++	arm_smccc_smc(PEEK_FID_CALL_COUNT, 0, 0, 0, 0, 0, 0, 0, &res);
++	if (res.a0 != PEEK_NUM_CALLS) {
++		pr_err("unexpected firmware (call count %ld)\n", (long)res.a0);
++		return -ENODEV;
++	}
++	pr_info("BL31 call count %ld, first SCP call next\n", (long)res.a0);
++
++	id = peek_read(PEEK_IC_TYPE, &ns);
++	pr_info("IC type 0x%02x in %llu us\n", id, ns / 1000);
++	if (id != PEEK_AXP803_ID) {
++		pr_err("not an AXP803 or the SCP did not answer (0x%02x)\n", id);
++		return -ENODEV;
++	}
++
++	peek_snapshot(NULL);
++
++	peek_dir = debugfs_create_dir("axp803-atf-peek", NULL);
++	debugfs_create_file("regs", 0400, peek_dir, NULL, &peek_regs_fops);
++
++	return 0;
++}
++module_init(peek_init);
++
++static void __exit peek_exit(void)
++{
++	debugfs_remove_recursive(peek_dir);
++}
++module_exit(peek_exit);
++
++MODULE_DESCRIPTION("Read-only AXP803 register peek through Allwinner BSP BL31");
++MODULE_LICENSE("GPL");
+

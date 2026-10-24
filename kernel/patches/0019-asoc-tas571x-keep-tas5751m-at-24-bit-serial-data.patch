@@ -1,0 +1,66 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] ASoC: tas571x: keep the TAS5751M at 24-bit serial data, defer quietly on mclk
+
+The vendor register scripts and kernel leave the TAS5751M at I2S 24-bit
+for every stream. MSB-aligned 16-bit words read the same with 64 fs SCLK,
+and in 16-bit mode the Yandex Station amplifiers turned the signal into
+noise unless the I2S controller moved the data to the other BCLK edge.
+
+Use dev_err_probe() for the mclk lookup, which defers until the clock
+provider (an I2S controller module) is there.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/sound/soc/codecs/tas571x.c
++++ b/sound/soc/codecs/tas571x.c
+@@ -52,6 +52,8 @@
+ 	int				vol_reg_size;
+ 	/* exit-shutdown is ignored for this long after the oscillator trim */
+ 	unsigned int			trim_settle_ms;
++	/* keep the serial data word length at 24 bits for any stream width */
++	bool				sdi_24bit;
+ };
+ 
+ struct tas571x_private {
+@@ -307,7 +309,11 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (params_width(params) >= 24)
++	/*
++	 * MSB-aligned words of up to 24 bits read the same in 24-bit mode
++	 * when SCLK is 64 fs, so parts flagged sdi_24bit stay there.
++	 */
++	if (params_width(params) >= 24 || priv->chip->sdi_24bit)
+ 		val += 2;
+ 	else if (params_width(params) >= 20)
+ 		val += 1;
+@@ -925,6 +931,13 @@
+ 	.regmap_config                  = &tas5751m_regmap_config,
+ 	.vol_reg_size                   = 2,
+ 	.trim_settle_ms                 = 500,
++	/*
++	 * As the vendor register scripts and kernel leave it. On the
++	 * Yandex Station the 16-bit mode turns the signal into noise
++	 * unless the I2S controller moves its data to the other BCLK
++	 * edge.
++	 */
++	.sdi_24bit                      = true,
+ };
+ 
+ static const struct reg_default tas5753_reg_defaults[] = {
+@@ -1258,11 +1271,9 @@
+ 	priv->chip = i2c_get_match_data(client);
+ 
+ 	priv->mclk = devm_clk_get(dev, "mclk");
+-	if (IS_ERR(priv->mclk) && PTR_ERR(priv->mclk) != -ENOENT) {
+-		dev_err(dev, "Failed to request mclk: %ld\n",
+-			PTR_ERR(priv->mclk));
+-		return PTR_ERR(priv->mclk);
+-	}
++	if (IS_ERR(priv->mclk) && PTR_ERR(priv->mclk) != -ENOENT)
++		return dev_err_probe(dev, PTR_ERR(priv->mclk),
++				     "Failed to request mclk\n");
+ 
+ 	if (WARN_ON(priv->chip->num_supply_names > TAS571X_MAX_SUPPLIES))
+ 		return -EINVAL;

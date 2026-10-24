@@ -1,0 +1,33 @@
+# Stage B initramfs (boot/pack.py, gen_init_cpio format).
+#   ${BUILD}   CI output: busybox and kexec, built statically from source
+#   ${PRIVATE} what cannot be published, kept by whoever packs the image:
+#              authorized_keys           your SSH public key
+#              brcmfmac4356-sdio.bin/.txt the Wi-Fi firmware and nvram of the
+#                                        Station's own Android (/system/vendor/modules/
+#                                        fw_bcm4356a2_ag.bin, nvram.txt)
+#              tas5751m-2a.txt/-2b.txt   amplifier register scripts, extracted from the
+#                                        vendor snd-soc-tas5751m.ko (docs/audio.md)
+dir /dev 0755 0 0
+nod /dev/console 0600 0 0 c 5 1
+nod /dev/null 0666 0 0 c 1 3
+dir /bin 0755 0 0
+dir /proc 0755 0 0
+dir /sys 0755 0 0
+dir /tmp 1777 0 0
+dir /run 0755 0 0
+dir /etc 0755 0 0
+dir /etc/station 0755 0 0
+dir /lib 0755 0 0
+dir /lib/firmware 0755 0 0
+dir /lib/firmware/brcm 0755 0 0
+file /bin/busybox ${BUILD}/busybox 0755 0 0
+file /bin/kexec ${BUILD}/kexec 0755 0 0
+file /init init.sh 0755 0 0
+file /udhcpc.sh udhcpc.sh 0755 0 0
+file /etc/station/station-audio-init.sh station-audio-init.sh 0755 0 0
+file /etc/station/station-mics-init.sh station-mics-init.sh 0755 0 0
+file /etc/station/authorized_keys ${PRIVATE}/authorized_keys 0644 0 0
+file /lib/firmware/brcm/brcmfmac4356-sdio.bin ${PRIVATE}/brcmfmac4356-sdio.bin 0644 0 0
+file /lib/firmware/brcm/brcmfmac4356-sdio.txt ${PRIVATE}/brcmfmac4356-sdio.txt 0644 0 0
+file /lib/firmware/tas5751m-2a.txt ${PRIVATE}/tas5751m-2a.txt 0644 0 0
+file /lib/firmware/tas5751m-2b.txt ${PRIVATE}/tas5751m-2b.txt 0644 0 0

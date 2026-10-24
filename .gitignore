@@ -1,0 +1,5 @@
+/private/
+/out/
+/build/
+*.img
+__pycache__/
