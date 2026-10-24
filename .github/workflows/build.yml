@@ -3,7 +3,7 @@ name: build
 on:
   push:
     branches: [main]
-    paths: ['kernel/**', 'boot/**', 'gpu/**', 'scripts/**', '.github/workflows/build.yml']
+    paths: ['kernel/**', 'boot/**', 'gpu/**', 'android/**', 'scripts/**', '.github/workflows/build.yml']
   pull_request:
   workflow_dispatch:
 
@@ -85,4 +85,18 @@ jobs:
         with:
           name: userspace
           path: out/userspace/
+          retention-days: 30
+
+  android:
+    # the runner image carries the Android NDK ($ANDROID_NDK_LATEST_HOME)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: scripts/build-android.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: out/android/
           retention-days: 30
