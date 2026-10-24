@@ -38,11 +38,12 @@ jobs:
             build/linux-*.tar.xz
             build/DX910-SW-99002-*.tgz
           key: sources-${{ hashFiles('kernel/linux.sha256', 'gpu/mali/source.sha256') }}
-      - name: ccache
-        uses: actions/cache@v4
+      # restore + save as separate steps: a failed build still keeps what it compiled
+      - name: ccache restore
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-kernel-${{ hashFiles('kernel/**') }}-${{ github.run_id }}
+          key: ccache-kernel-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-kernel-
       - name: Build
         run: |
@@ -51,6 +52,12 @@ jobs:
           scripts/build-kernel.sh
           scripts/build-mali.sh
           ccache -s
+      - name: ccache save
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-kernel-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         with:
           name: kernel

@@ -25,7 +25,7 @@ Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
  #include <linux/interrupt.h>
  #include <linux/sched/signal.h>
  #include <linux/mmc/sdio.h>
-@@ -3947,6 +3948,38 @@
+@@ -3947,6 +3948,37 @@
  	.write32 = brcmf_sdio_buscore_write32,
  };
  
@@ -55,8 +55,7 @@ Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 +		if (!is_valid_ether_addr(&t->data[1]))
 +			break;
 +		ether_addr_copy(mac, &t->data[1]);
-+		brcmf_dbg(INFO, "MAC address from the SDIO CIS: %pM
-+", mac);
++		brcmf_dbg(INFO, "MAC address from the SDIO CIS: %pM\n", mac);
 +		return;
 +	}
 +}
