@@ -1,0 +1,31 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] Bluetooth: hci_bcm: let the controller settle after a baud rate change
+
+The controller answers the Update UART Baud Rate command at the old rate
+and only then switches. The BCM4354 of an AMPAK AP6356S (Yandex Station)
+takes 20 to 30 ms for that and drops whatever arrives at the new rate in
+the meantime, then reports a hardware error. The HCI Reset that
+btbcm_finalize() sends right after the host has followed is lost that
+way and setup fails with -110 at any rate above the initial one; at
+115200 nothing is ever switched, which is why it only shows with
+max-speed.
+
+Wait 50 ms after the command; this happens once or twice per setup.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/drivers/bluetooth/hci_bcm.c
++++ b/drivers/bluetooth/hci_bcm.c
+@@ -222,6 +222,12 @@
+ 
+ 	kfree_skb(skb);
+ 
++	/*
++	 * The controller switches some time after its Command Complete and
++	 * drops what arrives before: the BCM4354 of an AP6356S needs 20-30 ms.
++	 */
++	msleep(50);
++
+ 	return 0;
+ }
+ 
