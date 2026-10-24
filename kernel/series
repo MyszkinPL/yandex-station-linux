@@ -23,3 +23,4 @@
 0023-wifi-brcmfmac-sdio-take-the-mac-address-from-the-cis.patch
 0024-reset-gpio-support-gpio-controllers-with-more-than-two-cells.patch
 0025-bluetooth-hci_bcm-let-the-controller-settle-after-a-baud-rate-change.patch
+0026-dma-buf-sync_file-the-sync-interface-of-android-6.patch

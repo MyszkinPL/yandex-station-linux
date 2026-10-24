@@ -45,6 +45,9 @@ cmd="$cmd snd_aloop.index=4 rdinit=/station-init partitions=$parts"
 cmd="$cmd cma=128M"
 # station.debug: logcat goes into the kernel log too, so give that room
 [ -n "$STATION_DEBUG" ] && cmd="$cmd station.debug=1 log_buf_len=4M"
+# STATION_CMDLINE: more arguments for a test run, e.g. no speakers at night:
+# initcall_blacklist=tas571x_i2c_driver_init
+[ -n "$STATION_CMDLINE" ] && cmd="$cmd $STATION_CMDLINE"
 cmd="$cmd androidboot.selinux=permissive androidboot.serialno=$sn androidboot.hardware=sun50iw1p1"
 
 case "$cmd" in *watchdog.stop_on_reboot=0*) ;; *) echo "refusing: no watchdog.stop_on_reboot=0"; exit 1 ;; esac
