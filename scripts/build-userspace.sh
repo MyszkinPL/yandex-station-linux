@@ -17,8 +17,11 @@ sha256sum -c --quiet "$TOP/scripts/userspace.sha256"
 rm -rf "busybox-$BUSYBOX" && tar -xf "busybox-$BUSYBOX.tar.bz2"
 cd "busybox-$BUSYBOX"
 make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-# static; tc needs the CBQ uapi that newer kernel headers dropped
-sed -i -e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' -e 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+# static; tc needs the CBQ uapi that newer kernel headers dropped; the SHA
+# "hwaccel" code is x86 only
+sed -i -e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' -e 's/^CONFIG_TC=y/# CONFIG_TC is not set/' \
+	-e 's/^CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/' \
+	-e 's/^CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/' .config
 make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- oldconfig < /dev/null > /dev/null
 make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$J" busybox
 aarch64-linux-gnu-strip -o "$OUT/busybox" busybox
