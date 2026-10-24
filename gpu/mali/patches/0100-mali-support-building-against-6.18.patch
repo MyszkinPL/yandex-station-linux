@@ -1,5 +1,5 @@
 From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
-Subject: [PATCH] mali: support building against 6.18
+Subject: [PATCH] mali: support building against 6.18 and 7.x
 
 On top of the Bootlin sunxi-mali series (bootlin/, up to 5.10):
 
@@ -15,50 +15,15 @@ On top of the Bootlin sunxi-mali series (bootlin/, up to 5.10):
 - dma_fence_ops.fence_value_str is gone since 6.16;
 - sunxi.c includes <linux/platform_device.h> itself.
 
+Linux 7.x, in the same way:
+
+- shmem_file_setup() takes vma_flags_t since 7.0;
+- the dma_fence lock is behind dma_fence_spinlock() and zap_vma_ptes()
+  is zap_special_vma_range() since 7.1;
+- dma_fence_array_create() lost signal_on_any in 7.2.
+
 Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 ---
-diff --git a/src/devicedrv/mali/linux/mali_internal_sync.c b/src/devicedrv/mali/linux/mali_internal_sync.c
-index f608ba8..cadbf67 100644
---- a/src/devicedrv/mali/linux/mali_internal_sync.c
-+++ b/src/devicedrv/mali/linux/mali_internal_sync.c
-@@ -167,7 +167,11 @@ struct mali_internal_sync_timeline *mali_internal_sync_timeline_create(const str
- #else
- 	sync_timeline->fence_context = fence_context_alloc(1);
- #endif
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
-+	strscpy(sync_timeline->name, name, sizeof(sync_timeline->name));
-+#else
- 	strlcpy(sync_timeline->name, name, sizeof(sync_timeline->name));
-+#endif
- 
- 	INIT_LIST_HEAD(&sync_timeline->sync_pt_list_head);
- 	spin_lock_init(&sync_timeline->sync_pt_list_lock);
-@@ -760,6 +764,8 @@ static bool mali_internal_fence_enable_signaling(struct fence *fence)
- 	return true;
- }
- 
-+/* dma_fence_ops.fence_value_str is gone since 6.16 */
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
- #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
- static void mali_internal_fence_value_str(struct dma_fence *fence, char *str, int size)
- #else
-@@ -778,6 +784,7 @@ static void mali_internal_fence_value_str(struct fence *fence, char *str, int si
- 
- 	parent->ops->print_sync_pt(sync_pt);
- }
-+#endif
- 
- #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
- static const struct dma_fence_ops fence_ops = {
-@@ -794,6 +801,8 @@ static const struct fence_ops fence_ops = {
- 	.wait = fence_default_wait,
- #endif
- 	.release = mali_internal_fence_release,
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
- 	.fence_value_str = mali_internal_fence_value_str,
-+#endif
- };
- #endif
 diff --git a/src/devicedrv/mali/linux/mali_kernel_linux.c b/src/devicedrv/mali/linux/mali_kernel_linux.c
 index dfefad7..4adf1c7 100644
 --- a/src/devicedrv/mali/linux/mali_kernel_linux.c
@@ -121,6 +86,96 @@ index dfefad7..4adf1c7 100644
 +MODULE_IMPORT_NS(DMA_BUF);
 +#endif
 +#endif
+diff --git a/src/devicedrv/mali/linux/mali_internal_sync.c b/src/devicedrv/mali/linux/mali_internal_sync.c
+index f608ba8..252fe50 100644
+--- a/src/devicedrv/mali/linux/mali_internal_sync.c
++++ b/src/devicedrv/mali/linux/mali_internal_sync.c
+@@ -48,7 +48,12 @@ static struct mali_internal_sync_point *mali_internal_fence_to_sync_pt(struct fe
+ static inline struct mali_internal_sync_timeline *mali_internal_sync_pt_to_sync_timeline(struct mali_internal_sync_point *sync_pt)
+ {
+ 	MALI_DEBUG_ASSERT_POINTER(sync_pt);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
++	/* dma_fence keeps the lock behind dma_fence_spinlock() since 7.1 */
++	return container_of(dma_fence_spinlock(&sync_pt->base), struct mali_internal_sync_timeline, sync_pt_list_lock);
++#else
+ 	return container_of(sync_pt->base.lock, struct mali_internal_sync_timeline, sync_pt_list_lock);
++#endif
+ }
+ 
+ static void mali_internal_sync_timeline_free(struct kref *kref_count)
+@@ -167,7 +172,11 @@ struct mali_internal_sync_timeline *mali_internal_sync_timeline_create(const str
+ #else
+ 	sync_timeline->fence_context = fence_context_alloc(1);
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
++	strscpy(sync_timeline->name, name, sizeof(sync_timeline->name));
++#else
+ 	strlcpy(sync_timeline->name, name, sizeof(sync_timeline->name));
++#endif
+ 
+ 	INIT_LIST_HEAD(&sync_timeline->sync_pt_list_head);
+ 	spin_lock_init(&sync_timeline->sync_pt_list_lock);
+@@ -409,9 +418,15 @@ static int mali_internal_sync_fence_set_fence_array(struct mali_internal_sync_fe
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
+ 	array = fence_array_create(num_fences, fences,
+ 				   fence_context_alloc(1), 1, false);
++#else
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++	/* signal_on_any is gone since 7.2; false was "signal on all" */
++	array = dma_fence_array_create(num_fences, fences,
++				       dma_fence_context_alloc(1), 1);
+ #else
+ 	array = dma_fence_array_create(num_fences, fences,
+ 				       dma_fence_context_alloc(1), 1, false);
++#endif
+ #endif
+ 	if (!array)
+ 		return -ENOMEM;
+@@ -697,10 +712,18 @@ static void mali_internal_fence_release(struct fence *fence)
+ 	parent = mali_internal_sync_pt_to_sync_timeline(sync_pt);
+ 
+ 	if(!list_empty(&sync_pt->sync_pt_list)) {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
++	    dma_fence_lock_irqsave(fence, flags);
++#else
+ 	    spin_lock_irqsave(fence->lock, flags);
++#endif
+ 	    if (!list_empty(&sync_pt->sync_pt_list))
+ 		list_del_init(&sync_pt->sync_pt_list);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
++	    dma_fence_unlock_irqrestore(fence, flags);
++#else
+ 	    spin_unlock_irqrestore(fence->lock, flags);
++#endif
+ 	}
+ 	if (parent->ops->free_pt)
+ 		parent->ops->free_pt(sync_pt);
+@@ -760,6 +783,8 @@ static bool mali_internal_fence_enable_signaling(struct fence *fence)
+ 	return true;
+ }
+ 
++/* dma_fence_ops.fence_value_str is gone since 6.16 */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
+ static void mali_internal_fence_value_str(struct dma_fence *fence, char *str, int size)
+ #else
+@@ -778,6 +803,7 @@ static void mali_internal_fence_value_str(struct fence *fence, char *str, int si
+ 
+ 	parent->ops->print_sync_pt(sync_pt);
+ }
++#endif
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
+ static const struct dma_fence_ops fence_ops = {
+@@ -794,6 +820,8 @@ static const struct fence_ops fence_ops = {
+ 	.wait = fence_default_wait,
+ #endif
+ 	.release = mali_internal_fence_release,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+ 	.fence_value_str = mali_internal_fence_value_str,
++#endif
+ };
+ #endif
 diff --git a/src/devicedrv/mali/linux/mali_kernel_linux.h b/src/devicedrv/mali/linux/mali_kernel_linux.h
 index 7854d98..1daab66 100644
 --- a/src/devicedrv/mali/linux/mali_kernel_linux.h
@@ -168,6 +223,23 @@ index 55a5c3a..92366d1 100644
  		vma->vm_page_prot = PAGE_READONLY;
  		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
  		mem_bkend->flags |= MALI_MEM_BACKEND_FLAG_COW_CPU_NO_WRITE;
+diff --git a/src/devicedrv/mali/linux/mali_memory.h b/src/devicedrv/mali/linux/mali_memory.h
+index adf6255..788c024 100644
+--- a/src/devicedrv/mali/linux/mali_memory.h
++++ b/src/devicedrv/mali/linux/mali_memory.h
+@@ -16,6 +16,12 @@
+ 
+ #include <linux/list.h>
+ #include <linux/mm.h>
++#include <linux/version.h>
++
++/* zap_vma_ptes() became zap_special_vma_range() in 7.1 */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
++#define zap_vma_ptes(vma, address, size) zap_special_vma_range(vma, address, size)
++#endif
+ 
+ #include "mali_memory_types.h"
+ #include "mali_memory_os_alloc.h"
 diff --git a/src/devicedrv/mali/linux/mali_memory_cow.c b/src/devicedrv/mali/linux/mali_memory_cow.c
 index 7e3b7e5..b2ddae6 100644
 --- a/src/devicedrv/mali/linux/mali_memory_cow.c
@@ -242,6 +314,23 @@ index 202784d..274fd54 100644
  	cancel_delayed_work_sync(&mali_mem_os_allocator.timed_shrinker);
  
  	if (NULL != mali_mem_os_allocator.wq) {
+diff --git a/src/devicedrv/mali/linux/mali_memory_swap_alloc.c b/src/devicedrv/mali/linux/mali_memory_swap_alloc.c
+index e68ca2c..e03c9cc 100644
+--- a/src/devicedrv/mali/linux/mali_memory_swap_alloc.c
++++ b/src/devicedrv/mali/linux/mali_memory_swap_alloc.c
+@@ -77,7 +77,12 @@ _mali_osk_errcode_t mali_mem_swap_init(void)
+ 		return _MALI_OSK_ERR_NOMEM;
+ 	}
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++	global_swap_file = shmem_file_setup("mali_swap", MALI_SWAP_GLOBAL_SWAP_FILE_SIZE,
++					    mk_vma_flags(VMA_NORESERVE_BIT));
++#else
+ 	global_swap_file = shmem_file_setup("mali_swap", MALI_SWAP_GLOBAL_SWAP_FILE_SIZE, VM_NORESERVE);
++#endif
+ 	if (IS_ERR(global_swap_file)) {
+ 		_mali_osk_bitmap_term(&idx_mgr);
+ 		return _MALI_OSK_ERR_NOMEM;
 diff --git a/src/devicedrv/mali/linux/mali_memory_types.h b/src/devicedrv/mali/linux/mali_memory_types.h
 index 8202eaa..aec8995 100644
 --- a/src/devicedrv/mali/linux/mali_memory_types.h

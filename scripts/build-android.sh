@@ -18,9 +18,15 @@ mkdir -p "$OUT/lib64" "$OUT/lib"
 "$BIN/armv7a-linux-androideabi$API-clang" $CFLAGS -shared -Wl,-soname,libion.so \
 	-o "$OUT/lib/libion.so" "$TOP/android/libion/libion.c"
 
-for f in "$OUT/lib64/libion.so" "$OUT/lib/libion.so"; do
+# DRM/KMS hardware composer, in place of hwcomposer.tulip (SurfaceFlinger is 64-bit)
+mkdir -p "$OUT/lib64/hw"
+"$BIN/aarch64-linux-android$API-clang" $CFLAGS -Wno-unused-parameter -shared \
+	-I "$TOP/android/include" -o "$OUT/lib64/hw/hwcomposer.drm.so" \
+	"$TOP/android/hwcomposer/hwcomposer.c" -llog
+
+for f in "$OUT/lib64/libion.so" "$OUT/lib/libion.so" "$OUT/lib64/hw/hwcomposer.drm.so"; do
 	"$BIN/llvm-strip" --strip-unneeded "$f"
 	echo "$f: $("$BIN/llvm-readelf" -d "$f" | grep -c NEEDED) needed, exports:" \
 		"$("$BIN/llvm-nm" -D --defined-only "$f" | awk '$2 == "T" {print $3}' | sort | tr '\n' ' ')"
 done
-(cd "$OUT" && sha256sum lib64/libion.so lib/libion.so > SHA256SUMS)
+(cd "$OUT" && sha256sum lib64/libion.so lib/libion.so lib64/hw/hwcomposer.drm.so > SHA256SUMS)
