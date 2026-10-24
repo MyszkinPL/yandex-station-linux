@@ -3,3 +3,4 @@
 /build/
 *.img
 __pycache__/
+/os/target/

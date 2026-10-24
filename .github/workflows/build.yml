@@ -3,7 +3,7 @@ name: build
 on:
   push:
     branches: [main]
-    paths: ['kernel/**', 'boot/**', 'scripts/**', '.github/workflows/build.yml']
+    paths: ['kernel/**', 'boot/**', 'scripts/**', 'os/**', '.github/workflows/build.yml']
   pull_request:
   workflow_dispatch:
 
@@ -82,4 +82,31 @@ jobs:
         with:
           name: userspace
           path: out/userspace/
+          retention-days: 30
+
+  os:
+    # our userspace (os/): static aarch64 musl binaries, linked with rust-lld
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-musl
+      # crates and the build directory: a push rebuilds only what changed
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            os/target
+          key: cargo-${{ hashFiles('os/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: cargo-${{ hashFiles('os/Cargo.lock') }}-
+      - name: Build
+        run: scripts/build-os.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: os
+          path: out/os/
           retention-days: 30
