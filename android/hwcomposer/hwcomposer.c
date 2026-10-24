@@ -473,6 +473,20 @@ static int hwc_get_display_attributes(hwc_composer_device_1_t *dev, int disp, ui
 	return 0;
 }
 
+/*
+ * The vendor SurfaceFlinger (Allwinner) calls reserved_proc[0] as
+ * setParameter(dev, cmd, disp, para0, para1), without a NULL check: output
+ * mode, margins, 3D and picture enhancement of the Allwinner display driver.
+ * DRM has no such driver; accept them, as the vendor hwcomposer does with
+ * the commands it does not know.
+ */
+static int hwc_set_parameter(hwc_composer_device_1_t *dev, int cmd, int disp, int para0, int para1)
+{
+	(void)dev;
+	ALOGI("display parameter %d (%d, %d, %d) ignored", cmd, disp, para0, para1);
+	return 0;
+}
+
 static void hwc_dump(hwc_composer_device_1_t *dev, char *buff, int len)
 {
 	struct hwc_ctx *c = (struct hwc_ctx *)dev;
@@ -542,6 +556,7 @@ static int hwc_device_open(const hw_module_t *module, const char *name, hw_devic
 	c->device.dump = hwc_dump;
 	c->device.getDisplayConfigs = hwc_get_display_configs;
 	c->device.getDisplayAttributes = hwc_get_display_attributes;
+	c->device.reserved_proc[0] = (void *)hwc_set_parameter;
 	*device = &c->device.common;
 	return 0;
 }
