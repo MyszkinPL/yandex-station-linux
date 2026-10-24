@@ -1,0 +1,206 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] dma-buf: sync_file: the sync interface of Android 6
+
+Android up to 6 talks to fences through the interface the staging sync
+driver had before it became sync_file (Linux 4.9): SYNC_IOC_WAIT with a
+timeout in milliseconds, SYNC_IOC_MERGE and SYNC_IOC_FENCE_INFO in their
+old layouts. Its libsync does, and so do GPU userspace drivers of that
+time on their own: the Mali-400 libGLES_mali r6p0 issues SYNC_IOC_WAIT
+and the old SYNC_IOC_MERGE itself. With sync_file only, every merge of
+a fence fails with ENOTTY and SurfaceFlinger cannot latch a buffer.
+
+The objects are the same, only the copying in and out differs, so add
+those three ioctls next to the current ones under SYNC_FILE_ANDROID6.
+Their numbers (0, 1, 2) were never reused; nothing of the current
+interface changes.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+--- a/drivers/dma-buf/Kconfig
++++ b/drivers/dma-buf/Kconfig
+@@ -17,6 +17,15 @@
+ 	  Files fds, to the DRM driver for example. More details at
+ 	  Documentation/driver-api/sync_file.rst.
+ 
++config SYNC_FILE_ANDROID6
++	bool "Sync interface of Android 6 and older"
++	depends on SYNC_FILE
++	help
++	  The ioctls of the staging sync driver before Linux 4.9 on Sync File
++	  fds: SYNC_IOC_WAIT and the old SYNC_IOC_MERGE and SYNC_IOC_FENCE_INFO.
++	  The userspace of Android 6 and older (libsync, vendor GPU drivers)
++	  uses them. Say N unless you run such userspace.
++
+ config SW_SYNC
+ 	bool "Sync File Validation Framework"
+ 	default n
+--- a/drivers/dma-buf/sync_file.c
++++ b/drivers/dma-buf/sync_file.c
+@@ -379,6 +379,149 @@
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_SYNC_FILE_ANDROID6
++/*
++ * The interface of the staging sync driver before Linux 4.9, still used by
++ * the userspace of Android 6 and older: same fences, older layouts.
++ */
++struct sync_android6_merge_data {
++	__s32	fd2;
++	char	name[32];
++	__s32	fence;
++};
++
++struct sync_android6_pt_info {
++	__u32	len;
++	char	obj_name[32];
++	char	driver_name[32];
++	__s32	status;
++	__u64	timestamp_ns;
++};
++
++struct sync_android6_fence_info_data {
++	__u32	len;
++	char	name[32];
++	__s32	status;
++	/* followed by one sync_android6_pt_info per fence */
++};
++
++#define SYNC_IOC_ANDROID6_WAIT		_IOW(SYNC_IOC_MAGIC, 0, __s32)
++#define SYNC_IOC_ANDROID6_MERGE \
++	_IOWR(SYNC_IOC_MAGIC, 1, struct sync_android6_merge_data)
++#define SYNC_IOC_ANDROID6_FENCE_INFO \
++	_IOWR(SYNC_IOC_MAGIC, 2, struct sync_android6_fence_info_data)
++
++/* timeout in ms, < 0 for none; -ETIME when it ran out, the error of a fence */
++static long sync_file_ioctl_android6_wait(struct sync_file *sync_file,
++					  unsigned long arg)
++{
++	__s32 timeout;
++	long ret;
++
++	if (copy_from_user(&timeout, (void __user *)arg, sizeof(timeout)))
++		return -EFAULT;
++
++	ret = dma_fence_wait_timeout(sync_file->fence, true,
++				     timeout < 0 ? MAX_SCHEDULE_TIMEOUT :
++						   msecs_to_jiffies(timeout));
++	if (ret < 0)
++		return ret;
++	if (!ret)
++		return -ETIME;
++
++	ret = dma_fence_get_status(sync_file->fence);
++	return ret < 0 ? ret : 0;
++}
++
++static long sync_file_ioctl_android6_merge(struct sync_file *sync_file,
++					   unsigned long arg)
++{
++	struct sync_android6_merge_data data;
++	struct sync_file *fence2, *fence3;
++	int fd;
++
++	if (copy_from_user(&data, (void __user *)arg, sizeof(data)))
++		return -EFAULT;
++
++	fence2 = sync_file_fdget(data.fd2);
++	if (!fence2)
++		return -ENOENT;
++
++	data.name[sizeof(data.name) - 1] = '\0';
++	fence3 = sync_file_merge(data.name, sync_file, fence2);
++	fput(fence2->file);
++	if (!fence3)
++		return -ENOMEM;
++
++	fd = get_unused_fd_flags(O_CLOEXEC);
++	if (fd < 0) {
++		fput(fence3->file);
++		return fd;
++	}
++
++	data.fence = fd;
++	if (copy_to_user((void __user *)arg, &data, sizeof(data))) {
++		put_unused_fd(fd);
++		fput(fence3->file);
++		return -EFAULT;
++	}
++
++	fd_install(fd, fence3->file);
++	return 0;
++}
++
++/* len: size of the buffer in, of what was filled out (the old driver capped it at 4 KiB) */
++static long sync_file_ioctl_android6_fence_info(struct sync_file *sync_file,
++						unsigned long arg)
++{
++	struct sync_android6_fence_info_data *data;
++	struct sync_android6_pt_info *pt;
++	struct dma_fence_unwrap iter;
++	struct sync_fence_info info;
++	struct dma_fence *fence;
++	__u32 size, len;
++	long ret = 0;
++
++	if (copy_from_user(&size, (void __user *)arg, sizeof(size)))
++		return -EFAULT;
++	if (size < sizeof(*data))
++		return -EINVAL;
++	size = min_t(__u32, size, 4096);
++
++	data = kzalloc(size, GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	sync_file_get_name(sync_file, data->name, sizeof(data->name));
++	data->status = dma_fence_get_status(sync_file->fence);
++	len = sizeof(*data);
++
++	dma_fence_unwrap_for_each(fence, &iter, sync_file->fence) {
++		if (size - len < sizeof(*pt)) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		memset(&info, 0, sizeof(info));
++		sync_fill_fence_info(fence, &info);
++
++		pt = (void *)data + len;
++		pt->len = sizeof(*pt);
++		memcpy(pt->obj_name, info.obj_name, sizeof(pt->obj_name));
++		memcpy(pt->driver_name, info.driver_name, sizeof(pt->driver_name));
++		pt->status = info.status;
++		pt->timestamp_ns = info.timestamp_ns;
++		len += sizeof(*pt);
++	}
++
++	data->len = len;
++	if (copy_to_user((void __user *)arg, data, len))
++		ret = -EFAULT;
++out:
++	kfree(data);
++	return ret;
++}
++#endif /* CONFIG_SYNC_FILE_ANDROID6 */
++
+ static long sync_file_ioctl(struct file *file, unsigned int cmd,
+ 			    unsigned long arg)
+ {
+@@ -394,6 +537,17 @@
+ 	case SYNC_IOC_SET_DEADLINE:
+ 		return sync_file_ioctl_set_deadline(sync_file, arg);
+ 
++#ifdef CONFIG_SYNC_FILE_ANDROID6
++	case SYNC_IOC_ANDROID6_WAIT:
++		return sync_file_ioctl_android6_wait(sync_file, arg);
++
++	case SYNC_IOC_ANDROID6_MERGE:
++		return sync_file_ioctl_android6_merge(sync_file, arg);
++
++	case SYNC_IOC_ANDROID6_FENCE_INFO:
++		return sync_file_ioctl_android6_fence_info(sync_file, arg);
++#endif
++
+ 	default:
+ 		return -ENOTTY;
+ 	}

@@ -108,7 +108,11 @@ def main():
             text = patch_rc(data.decode())
         elif name == UEVENTD_RC:
             text = data.decode().rstrip("\n") + (
-                "\n# mainline kernel: ION is DMA-BUF heaps (android/libion)\n"
+                "\n# mainline kernel: ION is DMA-BUF heaps (android/libion); their nodes\n"
+                "# are dma_heap/<heap> (DEVNAME), not the /dev/<heap> ueventd would make\n"
+                "subsystem dma_heap\n"
+                "\tdevname uevent_devname\n"
+                "\tdirname /dev\n\n"
                 "/dev/dma_heap/*            0666    system      graphics\n")
         if a.strace and name.endswith(".rc"):
             t = strace_service(text if text is not None else data.decode(), a.strace[1])
