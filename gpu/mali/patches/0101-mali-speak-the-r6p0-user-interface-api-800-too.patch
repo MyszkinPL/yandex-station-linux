@@ -1,0 +1,595 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] mali: speak the r6p0 user interface (API 800) too
+
+User space built for r6p0, such as the libGLES_mali of the Yandex Station
+firmware, asks for API 800 and is refused by this API 900 driver. The
+two interfaces differ in three places only (mali_uk_r6p0.h):
+
+- the GP job arguments have heap_grow_size after the frame registers
+  (112 bytes instead of 104), and in r6p0 the kernel grows the PLBU heap:
+  on out-of-memory it adds heap_grow_size to the heap allocation,
+  resumes the job and reports heap_added_size in the stall notification
+  (where API 900 has padding);
+- the memory allocation arguments have no secure_shared_fd (32 bytes
+  instead of 40).
+
+A session now keeps the version it asked for and gets it reported back.
+Since ioctl numbers encode the argument size, the r6p0 GP start and
+memory allocation calls have their own numbers; each is refused (ENOTTY)
+by a session of the other version. GP job arguments are read in the
+session's layout in mali_gp_job_create(), which covers the combined PP
+and GP start too.
+
+The heap is grown on the Mali work queue (it allocates pages, which the
+executor spinlock does not allow). The job is only looked at under the
+lock, as it may time out meanwhile; the session stays valid because
+_mali_ukk_close() flushes that queue before it frees session memory.
+API 900 sessions behave exactly as before.
+
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+---
+diff --git a/src/devicedrv/mali/common/mali_executor.c b/src/devicedrv/mali/common/mali_executor.c
+index da581f8..bb5febf 100644
+--- a/src/devicedrv/mali/common/mali_executor.c
++++ b/src/devicedrv/mali/common/mali_executor.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "mali_executor.h"
++#include "mali_memory_manager.h"
+ #include "mali_scheduler.h"
+ #include "mali_kernel_common.h"
+ #include "mali_kernel_core.h"
+@@ -127,7 +128,7 @@ static mali_bool mali_executor_has_virtual_group(void);
+ static mali_bool mali_executor_virtual_group_is_usable(void);
+ static void mali_executor_schedule(void);
+ static void mali_executor_wq_schedule(void *arg);
+-static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job);
++static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job, u32 heap_added_size);
+ static void mali_executor_complete_group(struct mali_group *group,
+ 		mali_bool success,
+ 		struct mali_gp_job **gp_job_done,
+@@ -582,11 +583,23 @@ _mali_osk_errcode_t mali_executor_interrupt_gp(struct mali_group *group,
+ 		mali_group_oom(group);
+ #endif
+ 
++		if (mali_gp_job_kernel_grows_heap(job)) {
++			/*
++			 * r6p0 session: the kernel grows the heap, which may
++			 * sleep, so in mali_executor_group_oom()
++			 */
++			mali_gp_job_set_current_heap_addr(job,
++							  mali_gp_read_plbu_alloc_start_addr(group->gp_core));
++			_mali_osk_wq_schedule_work(group->oom_work_gp);
++			mali_executor_unlock();
++			return _MALI_OSK_ERR_OK;
++		}
++
+ 		/*
+ 		 * no need to hold interrupt raised while
+ 		 * waiting for more memory.
+ 		 */
+-		mali_executor_send_gp_oom_to_user(job);
++		mali_executor_send_gp_oom_to_user(job, 0);
+ 
+ 		mali_executor_unlock();
+ 
+@@ -1303,6 +1316,12 @@ _mali_osk_errcode_t _mali_ukk_gp_suspend_response(_mali_uk_gp_suspend_response_s
+ 								   args->arguments[0],
+ 								   args->arguments[1]);
+ 
++				/* r6p0: later growth extends the block user space gave */
++				if (mali_gp_job_kernel_grows_heap(job)) {
++					job->heap_base_addr = args->arguments[0];
++					job->heap_current_addr = args->arguments[0];
++				}
++
+ 				mali_executor_unlock();
+ 				return _MALI_OSK_ERR_OK;
+ 			} else {
+@@ -1891,7 +1910,66 @@ static void mali_executor_wq_schedule(void *arg)
+ 	mali_executor_unlock();
+ }
+ 
+-static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job)
++/*
++ * PLBU out of heap memory in an r6p0 session (API 800): grow the heap
++ * allocation by the job's heap_grow_size and resume the job on the new
++ * block, as the r6p0 driver did, then tell user space how much was added.
++ * If the heap cannot grow, user space gets heap_added_size 0 and answers
++ * with _mali_ukk_gp_suspend_response() as in API 900.
++ *
++ * Runs on the Mali work queue: growing allocates pages, which the executor
++ * spinlock does not allow. The job may end meanwhile (timeout, abort), so
++ * it is only looked at under the lock; the session stays valid because
++ * _mali_ukk_close() flushes this queue before it frees session memory.
++ */
++void mali_executor_group_oom(struct mali_group *group)
++{
++	struct mali_session_data *session;
++	struct mali_gp_job *job;
++	u32 id, heap_base, heap_current, grow;
++	_mali_osk_notification_t *new_notification = NULL;
++	mali_bool grown;
++
++	mali_executor_lock();
++	job = mali_group_get_running_gp_job(group);
++	if (NULL == job || !mali_gp_job_kernel_grows_heap(job)) {
++		mali_executor_unlock();
++		return;
++	}
++	session = mali_gp_job_get_session(job);
++	id = mali_gp_job_get_id(job);
++	heap_base = job->heap_base_addr;
++	heap_current = mali_gp_job_get_current_heap_addr(job);
++	grow = job->heap_grow_size;
++	mali_executor_unlock();
++
++	grown = _MALI_OSK_ERR_OK == mali_mem_add_mem_size(session, heap_base, grow);
++	if (grown)
++		new_notification = _mali_osk_notification_create(_MALI_NOTIFICATION_GP_STALLED,
++								 sizeof(_mali_uk_gp_job_suspended_s));
++
++	mali_executor_lock();
++	job = mali_group_get_running_gp_job(group);
++	if (NULL == job || id != mali_gp_job_get_id(job)) {
++		mali_executor_unlock();
++		if (NULL != new_notification)
++			_mali_osk_notification_delete(new_notification);
++		return;
++	}
++
++	if (grown && NULL != new_notification) {
++		MALI_DEBUG_PRINT(3, ("Executor: grew the heap of GP job %u by %u bytes\n", id, grow));
++		mali_executor_send_gp_oom_to_user(job, grow);
++		mali_gp_job_set_oom_notification(job, new_notification);
++		/* This will also re-enable interrupts */
++		mali_group_resume_gp_with_new_heap(group, id, heap_current, heap_current + grow);
++	} else {
++		mali_executor_send_gp_oom_to_user(job, 0);
++	}
++	mali_executor_unlock();
++}
++
++static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job, u32 heap_added_size)
+ {
+ 	_mali_uk_gp_job_suspended_s *jobres;
+ 	_mali_osk_notification_t *notification;
+@@ -1907,6 +1985,9 @@ static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job)
+ 	jobres = (_mali_uk_gp_job_suspended_s *)notification->result_buffer;
+ 	jobres->user_job_ptr = mali_gp_job_get_user_id(job);
+ 	jobres->cookie = gp_returned_cookie;
++	/* r6p0 sessions read it; in API 900 this is padding */
++	BUILD_BUG_ON(sizeof(_mali_uk_gp_job_suspended_r6p0_s) != sizeof(_mali_uk_gp_job_suspended_s));
++	((_mali_uk_gp_job_suspended_r6p0_s *)jobres)->heap_added_size = heap_added_size;
+ 
+ 	mali_session_send_notification(mali_gp_job_get_session(job),
+ 				       notification);
+diff --git a/src/devicedrv/mali/common/mali_executor.h b/src/devicedrv/mali/common/mali_executor.h
+index c8cbe3c..9677bcd 100644
+--- a/src/devicedrv/mali/common/mali_executor.h
++++ b/src/devicedrv/mali/common/mali_executor.h
+@@ -56,6 +56,7 @@ void mali_executor_zap_all_active(struct mali_session_data *session);
+ void mali_executor_schedule_from_mask(mali_scheduler_mask mask, mali_bool deferred_schedule);
+ 
+ _mali_osk_errcode_t mali_executor_interrupt_gp(struct mali_group *group, mali_bool in_upper_half);
++void mali_executor_group_oom(struct mali_group *group);
+ _mali_osk_errcode_t mali_executor_interrupt_pp(struct mali_group *group, mali_bool in_upper_half);
+ _mali_osk_errcode_t mali_executor_interrupt_mmu(struct mali_group *group, mali_bool in_upper_half);
+ void mali_executor_group_power_up(struct mali_group *groups[], u32 num_groups);
+diff --git a/src/devicedrv/mali/common/mali_gp_job.c b/src/devicedrv/mali/common/mali_gp_job.c
+index 1d3c531..087c51f 100644
+--- a/src/devicedrv/mali/common/mali_gp_job.c
++++ b/src/devicedrv/mali/common/mali_gp_job.c
+@@ -19,6 +19,38 @@ static u32 gp_counter_src0 = MALI_HW_CORE_NO_COUNTER;      /**< Performance coun
+ static u32 gp_counter_src1 = MALI_HW_CORE_NO_COUNTER;           /**< Performance counter 1, MALI_HW_CORE_NO_COUNTER for disabled */
+ static void _mali_gp_del_varying_allocations(struct mali_gp_job *job);
+ 
++/* Read GP job arguments in the r6p0 layout (API 800), see mali_uk_r6p0.h */
++static int mali_gp_job_copy_r6p0_args(struct mali_gp_job *job, void __user *uargs)
++{
++	_mali_uk_gp_start_job_r6p0_s r6;
++	_mali_uk_gp_start_job_s *a = &job->uargs;
++
++	BUILD_BUG_ON(sizeof(_mali_uk_gp_start_job_r6p0_s) != 112);
++	if (0 != _mali_osk_copy_from_user(&r6, uargs, sizeof(r6)))
++		return -EFAULT;
++
++	a->ctx = r6.ctx;
++	a->user_job_ptr = r6.user_job_ptr;
++	a->priority = r6.priority;
++	memcpy(a->frame_registers, r6.frame_registers, sizeof(a->frame_registers));
++	a->perf_counter_flag = r6.perf_counter_flag;
++	a->perf_counter_src0 = r6.perf_counter_src0;
++	a->perf_counter_src1 = r6.perf_counter_src1;
++	a->frame_builder_id = r6.frame_builder_id;
++	a->flush_id = r6.flush_id;
++	a->fence = r6.fence;
++	a->timeline_point_ptr = r6.timeline_point_ptr;
++	a->varying_memsize = r6.varying_memsize;
++	a->deferred_mem_num = r6.deferred_mem_num;
++	a->deferred_mem_list = r6.deferred_mem_list;
++
++	/* the kernel grows the heap on OOM in whole MMU pages (mali_mem_add_mem_size()) */
++	if (0 != r6.heap_grow_size && 0 == r6.heap_grow_size % _MALI_OSK_MALI_PAGE_SIZE)
++		job->heap_grow_size = r6.heap_grow_size;
++	job->heap_base_addr = r6.frame_registers[4];
++	return 0;
++}
++
+ 
+ static int _mali_gp_add_varying_allocations(struct mali_session_data *session,
+ 		struct mali_gp_job *job,
+@@ -91,7 +123,10 @@ struct mali_gp_job *mali_gp_job_create(struct mali_session_data *session, _mali_
+ 			goto fail2;
+ 		}
+ 
+-		if (0 != _mali_osk_copy_from_user(&job->uargs, uargs, sizeof(_mali_uk_gp_start_job_s))) {
++		if (mali_session_uses_r6p0_api(session)) {
++			if (0 != mali_gp_job_copy_r6p0_args(job, (void __user *)uargs))
++				goto fail1;
++		} else if (0 != _mali_osk_copy_from_user(&job->uargs, uargs, sizeof(_mali_uk_gp_start_job_s))) {
+ 			goto fail1;
+ 		}
+ 
+diff --git a/src/devicedrv/mali/common/mali_gp_job.h b/src/devicedrv/mali/common/mali_gp_job.h
+index d5ff5de..4af9a55 100644
+--- a/src/devicedrv/mali/common/mali_gp_job.h
++++ b/src/devicedrv/mali/common/mali_gp_job.h
+@@ -75,6 +75,8 @@ struct mali_gp_job {
+ 	struct list_head vary_todo;                        /**< list of backend list need to do defer bind*/
+ 	u32 required_varying_memsize;                      /** < size of varying memory to reallocate*/
+ 	u32 big_job;                                       /** < if the gp job have large varying output and may take long time*/
++	u32 heap_base_addr;                                /**< r6p0 sessions: Mali address of the PLBU heap allocation */
++	u32 heap_grow_size;                                /**< r6p0 sessions: bytes the kernel adds to the heap on OOM, 0: user space grows it */
+ };
+ 
+ #define MALI_DEFER_BIND_MEMORY_PREPARED (0x1 << 0)
+@@ -167,6 +169,12 @@ MALI_STATIC_INLINE mali_bool mali_gp_job_has_plbu_job(struct mali_gp_job *job)
+ 	return (job->uargs.frame_registers[2] != job->uargs.frame_registers[3]) ? MALI_TRUE : MALI_FALSE;
+ }
+ 
++/* r6p0 sessions (API 800): the kernel grows the PLBU heap on OOM itself */
++MALI_STATIC_INLINE mali_bool mali_gp_job_kernel_grows_heap(struct mali_gp_job *job)
++{
++	return 0 != job->heap_grow_size;
++}
++
+ MALI_STATIC_INLINE u32 mali_gp_job_get_current_heap_addr(struct mali_gp_job *job)
+ {
+ 	MALI_DEBUG_ASSERT_POINTER(job);
+diff --git a/src/devicedrv/mali/common/mali_group.c b/src/devicedrv/mali/common/mali_group.c
+index eb9f0c5..9ad81ad 100644
+--- a/src/devicedrv/mali/common/mali_group.c
++++ b/src/devicedrv/mali/common/mali_group.c
+@@ -43,6 +43,7 @@ int mali_max_job_runtime = MALI_MAX_JOB_RUNTIME_DEFAULT;
+ /* local helper functions */
+ static void mali_group_bottom_half_mmu(void *data);
+ static void mali_group_bottom_half_gp(void *data);
++static void mali_group_oom_gp(void *data);
+ static void mali_group_bottom_half_pp(void *data);
+ static void mali_group_timeout(void *callback_data);
+ static void mali_group_reset_pp(struct mali_group *group);
+@@ -203,6 +204,13 @@ _mali_osk_errcode_t mali_group_add_gp_core(struct mali_group *group, struct mali
+ 		return _MALI_OSK_ERR_FAULT;
+ 	}
+ 
++	group->oom_work_gp = _mali_osk_wq_create_work(mali_group_oom_gp, group);
++	if (NULL == group->oom_work_gp) {
++		_mali_osk_wq_delete_work(group->bottom_half_work_gp);
++		group->bottom_half_work_gp = NULL;
++		return _MALI_OSK_ERR_FAULT;
++	}
++
+ 	return _MALI_OSK_ERR_OK;
+ }
+ 
+@@ -213,6 +221,10 @@ void mali_group_remove_gp_core(struct mali_group *group)
+ 	if (NULL != group->bottom_half_work_gp) {
+ 		_mali_osk_wq_delete_work(group->bottom_half_work_gp);
+ 	}
++	if (NULL != group->oom_work_gp) {
++		_mali_osk_wq_delete_work(group->oom_work_gp);
++		group->oom_work_gp = NULL;
++	}
+ }
+ 
+ _mali_osk_errcode_t mali_group_add_pp_core(struct mali_group *group, struct mali_pp_core *pp_core)
+@@ -1649,6 +1661,11 @@ _mali_osk_errcode_t mali_group_upper_half_gp(void *data)
+ 	return ret;
+ }
+ 
++static void mali_group_oom_gp(void *data)
++{
++	mali_executor_group_oom((struct mali_group *)data);
++}
++
+ static void mali_group_bottom_half_gp(void *data)
+ {
+ 	struct mali_group *group = (struct mali_group *)data;
+diff --git a/src/devicedrv/mali/common/mali_group.h b/src/devicedrv/mali/common/mali_group.h
+index 2d25562..68624a7 100644
+--- a/src/devicedrv/mali/common/mali_group.h
++++ b/src/devicedrv/mali/common/mali_group.h
+@@ -82,6 +82,7 @@ struct mali_group {
+ 
+ 	_mali_osk_wq_work_t         *bottom_half_work_mmu;
+ 	_mali_osk_wq_work_t         *bottom_half_work_gp;
++	_mali_osk_wq_work_t         *oom_work_gp;          /**< grows the PLBU heap of r6p0 sessions, see mali_executor_group_oom() */
+ 	_mali_osk_wq_work_t         *bottom_half_work_pp;
+ 
+ 	_mali_osk_timer_t           *timeout_timer;
+diff --git a/src/devicedrv/mali/common/mali_kernel_core.c b/src/devicedrv/mali/common/mali_kernel_core.c
+index bc1c9c1..043db7f 100644
+--- a/src/devicedrv/mali/common/mali_kernel_core.c
++++ b/src/devicedrv/mali/common/mali_kernel_core.c
+@@ -985,15 +985,19 @@ _mali_osk_errcode_t _mali_ukk_get_api_version(_mali_uk_get_api_version_s *args)
+ 	MALI_DEBUG_ASSERT_POINTER(args);
+ 	MALI_DEBUG_ASSERT(NULL != (void *)(uintptr_t)args->ctx);
+ 
+-	/* check compatability */
+-	if (args->version == _MALI_UK_API_VERSION) {
++	/*
++	 * Check compatibility. Besides our own version, the r6p0 one
++	 * (API 800) is spoken too, see mali_uk_r6p0.h: it is reported
++	 * back, and the ioctl wrapper keeps it in the session.
++	 */
++	if (args->version == _MALI_UK_API_VERSION ||
++	    args->version == _MALI_UK_API_VERSION_R6P0) {
+ 		args->compatible = 1;
+ 	} else {
+ 		args->compatible = 0;
++		args->version = _MALI_UK_API_VERSION; /* report our version */
+ 	}
+ 
+-	args->version = _MALI_UK_API_VERSION; /* report our version */
+-
+ 	/* success regardless of being compatible or not */
+ 	MALI_SUCCESS;
+ }
+@@ -1003,15 +1007,19 @@ _mali_osk_errcode_t _mali_ukk_get_api_version_v2(_mali_uk_get_api_version_v2_s *
+ 	MALI_DEBUG_ASSERT_POINTER(args);
+ 	MALI_DEBUG_ASSERT(NULL != (void *)(uintptr_t)args->ctx);
+ 
+-	/* check compatability */
+-	if (args->version == _MALI_UK_API_VERSION) {
++	/*
++	 * Check compatibility. Besides our own version, the r6p0 one
++	 * (API 800) is spoken too, see mali_uk_r6p0.h: it is reported
++	 * back, and the ioctl wrapper keeps it in the session.
++	 */
++	if (args->version == _MALI_UK_API_VERSION ||
++	    args->version == _MALI_UK_API_VERSION_R6P0) {
+ 		args->compatible = 1;
+ 	} else {
+ 		args->compatible = 0;
++		args->version = _MALI_UK_API_VERSION; /* report our version */
+ 	}
+ 
+-	args->version = _MALI_UK_API_VERSION; /* report our version */
+-
+ 	/* success regardless of being compatible or not */
+ 	return _MALI_OSK_ERR_OK;
+ }
+diff --git a/src/devicedrv/mali/common/mali_session.h b/src/devicedrv/mali/common/mali_session.h
+index e339c90..7a54bcf 100644
+--- a/src/devicedrv/mali/common/mali_session.h
++++ b/src/devicedrv/mali/common/mali_session.h
+@@ -14,6 +14,7 @@
+ #include "mali_mmu_page_directory.h"
+ #include "mali_osk.h"
+ #include "mali_osk_list.h"
++#include "mali_uk_r6p0.h"
+ #include "mali_memory_types.h"
+ #include "mali_memory_manager.h"
+ 
+@@ -52,6 +53,7 @@ struct mali_session_data {
+ 
+ 	mali_bool is_aborting; /**< MALI_TRUE if the session is aborting, MALI_FALSE if not. */
+ 	mali_bool use_high_priority_job_queue; /**< If MALI_TRUE, jobs added from this session will use the high priority job queues. */
++	u32 api_version; /**< Version asked for by user space; _MALI_UK_API_VERSION_R6P0 selects the r6p0 interface (mali_uk_r6p0.h) */
+ 	u32 pid;
+ 	char *comm;
+ 	atomic_t mali_mem_array[MALI_MEM_TYPE_MAX]; /**< The array to record mem types' usage for this session. */
+@@ -133,4 +135,10 @@ u32 mali_session_max_window_num(void);
+ 
+ void mali_session_memory_tracking(_mali_osk_print_ctx *print_ctx);
+ 
++/* Whether the session speaks the r6p0 user interface (API 800), see mali_uk_r6p0.h */
++MALI_STATIC_INLINE mali_bool mali_session_uses_r6p0_api(struct mali_session_data *session)
++{
++	return _MALI_UK_API_VERSION_R6P0 == session->api_version;
++}
++
+ #endif /* __MALI_SESSION_H__ */
+diff --git a/src/devicedrv/mali/common/mali_uk_r6p0.h b/src/devicedrv/mali/common/mali_uk_r6p0.h
+new file mode 100644
+index 0000000..9cb9bf8
+--- /dev/null
++++ b/src/devicedrv/mali/common/mali_uk_r6p0.h
+@@ -0,0 +1,62 @@
++/*
++ * User/kernel interface of the r6p0 releases (API 800), next to the native
++ * r10p0 one (API 900), so that user space built for r6p0 runs unmodified
++ * on this driver; the Yandex Station ships such a libGLES_mali.
++ *
++ * API 800 differs from 900 in three places only:
++ *  - _mali_uk_gp_start_job_s has heap_grow_size after the frame registers
++ *    (112 bytes instead of 104), and the PLBU heap is grown by the kernel:
++ *    on out-of-memory it adds heap_grow_size to the heap allocation,
++ *    resumes the job itself and tells user space how much it added;
++ *  - _mali_uk_gp_job_suspended_s carries that heap_added_size (in what is
++ *    padding in API 900, so the notification has the same size);
++ *  - _mali_uk_alloc_mem_s has no secure_shared_fd (32 bytes instead of 40).
++ * The ioctl numbers encode the argument size, so the two GP start and
++ * memory allocation calls have numbers of their own. A session speaks the
++ * version it asked for in _mali_ukk_get_api_version(_v2)().
++ */
++#ifndef __MALI_UK_R6P0_H__
++#define __MALI_UK_R6P0_H__
++
++#include <linux/mali/mali_utgard_uk_types.h>
++#include <linux/mali/mali_utgard_ioctl.h>
++
++#define _MALI_UK_API_VERSION_R6P0 _MAKE_VERSION_ID(800)
++
++typedef struct {
++	u64 ctx;
++	u64 user_job_ptr;
++	u32 priority;
++	u32 frame_registers[MALIGP2_NUM_REGS_FRAME];
++	u32 heap_grow_size;
++	u32 perf_counter_flag;
++	u32 perf_counter_src0;
++	u32 perf_counter_src1;
++	u32 frame_builder_id;
++	u32 flush_id;
++	_mali_uk_fence_t fence;
++	u64 timeline_point_ptr;
++	u32 varying_memsize;
++	u32 deferred_mem_num;
++	u64 deferred_mem_list;
++} _mali_uk_gp_start_job_r6p0_s;
++
++typedef struct {
++	u64 user_job_ptr;
++	u32 cookie;
++	u32 heap_added_size;
++} _mali_uk_gp_job_suspended_r6p0_s;
++
++typedef struct {
++	u64 ctx;
++	u32 gpu_vaddr;
++	u32 vsize;
++	u32 psize;
++	u32 flags;
++	u64 backend_handle;
++} _mali_uk_alloc_mem_r6p0_s;
++
++#define MALI_IOC_GP2_START_JOB_R6P0 _IOWR(MALI_IOC_GP_BASE, _MALI_UK_GP_START_JOB, _mali_uk_gp_start_job_r6p0_s)
++#define MALI_IOC_MEM_ALLOC_R6P0     _IOWR(MALI_IOC_MEMORY_BASE, _MALI_UK_ALLOC_MEM, _mali_uk_alloc_mem_r6p0_s)
++
++#endif /* __MALI_UK_R6P0_H__ */
+diff --git a/src/devicedrv/mali/linux/mali_kernel_linux.c b/src/devicedrv/mali/linux/mali_kernel_linux.c
+index 4adf1c7..3865486 100644
+--- a/src/devicedrv/mali/linux/mali_kernel_linux.c
++++ b/src/devicedrv/mali/linux/mali_kernel_linux.c
+@@ -1007,6 +1007,10 @@ static int mali_ioctl(struct inode *inode, struct file *filp, unsigned int cmd,
+ 		err = mem_usage_get_wrapper(session_data, (_mali_uk_profiling_memory_usage_get_s __user *)arg);
+ 		break;
+ 
++	case MALI_IOC_MEM_ALLOC_R6P0:
++		err = mem_alloc_r6p0_wrapper(session_data, (_mali_uk_alloc_mem_r6p0_s __user *)arg);
++		break;
++
+ 	case MALI_IOC_MEM_ALLOC:
+ 		BUILD_BUG_ON(!IS_ALIGNED(sizeof(_mali_uk_alloc_mem_s), sizeof(u64)));
+ 		err = mem_alloc_wrapper(session_data, (_mali_uk_alloc_mem_s __user *)arg);
+@@ -1092,7 +1096,19 @@ static int mali_ioctl(struct inode *inode, struct file *filp, unsigned int cmd,
+ 		err = pp_disable_wb_wrapper(session_data, (_mali_uk_pp_disable_wb_s __user *)arg);
+ 		break;
+ 
++	case MALI_IOC_GP2_START_JOB_R6P0:
++		if (!mali_session_uses_r6p0_api(session_data)) {
++			err = -ENOTTY;
++			break;
++		}
++		err = gp_start_job_wrapper(session_data, (_mali_uk_gp_start_job_s __user *)arg);
++		break;
++
+ 	case MALI_IOC_GP2_START_JOB:
++		if (mali_session_uses_r6p0_api(session_data)) {
++			err = -ENOTTY;
++			break;
++		}
+ 		BUILD_BUG_ON(!IS_ALIGNED(sizeof(_mali_uk_gp_start_job_s), sizeof(u64)));
+ 		err = gp_start_job_wrapper(session_data, (_mali_uk_gp_start_job_s __user *)arg);
+ 		break;
+diff --git a/src/devicedrv/mali/linux/mali_ukk_core.c b/src/devicedrv/mali/linux/mali_ukk_core.c
+index 42fd544..d6c11ed 100644
+--- a/src/devicedrv/mali/linux/mali_ukk_core.c
++++ b/src/devicedrv/mali/linux/mali_ukk_core.c
+@@ -34,6 +34,8 @@ int get_api_version_wrapper(struct mali_session_data *session_data, _mali_uk_get
+ 	kargs.ctx = (uintptr_t)session_data;
+ 	err = _mali_ukk_get_api_version(&kargs);
+ 	if (_MALI_OSK_ERR_OK != err) return map_errcode(err);
++	if (kargs.compatible)
++		session_data->api_version = kargs.version;
+ 
+ 	if (0 != put_user(kargs.version, &uargs->version)) return -EFAULT;
+ 	if (0 != put_user(kargs.compatible, &uargs->compatible)) return -EFAULT;
+@@ -53,6 +55,8 @@ int get_api_version_v2_wrapper(struct mali_session_data *session_data, _mali_uk_
+ 	kargs.ctx = (uintptr_t)session_data;
+ 	err = _mali_ukk_get_api_version_v2(&kargs);
+ 	if (_MALI_OSK_ERR_OK != err) return map_errcode(err);
++	if (kargs.compatible)
++		session_data->api_version = kargs.version;
+ 
+ 	if (0 != put_user(kargs.version, &uargs->version)) return -EFAULT;
+ 	if (0 != put_user(kargs.compatible, &uargs->compatible)) return -EFAULT;
+diff --git a/src/devicedrv/mali/linux/mali_ukk_mem.c b/src/devicedrv/mali/linux/mali_ukk_mem.c
+index 1412cfc..3df15b9 100644
+--- a/src/devicedrv/mali/linux/mali_ukk_mem.c
++++ b/src/devicedrv/mali/linux/mali_ukk_mem.c
+@@ -47,6 +47,41 @@ int mem_alloc_wrapper(struct mali_session_data *session_data, _mali_uk_alloc_mem
+ 	return 0;
+ }
+ 
++/* The r6p0 layout (API 800): no secure memory, see mali_uk_r6p0.h */
++int mem_alloc_r6p0_wrapper(struct mali_session_data *session_data, _mali_uk_alloc_mem_r6p0_s __user *uargs)
++{
++	_mali_uk_alloc_mem_r6p0_s r6;
++	_mali_uk_alloc_mem_s kargs = { 0 };
++	_mali_osk_errcode_t err;
++
++	BUILD_BUG_ON(sizeof(_mali_uk_alloc_mem_r6p0_s) != 32);
++	MALI_CHECK_NON_NULL(uargs, -EINVAL);
++	MALI_CHECK_NON_NULL(session_data, -EINVAL);
++
++	if (!mali_session_uses_r6p0_api(session_data))
++		return -ENOTTY;
++	if (0 != copy_from_user(&r6, uargs, sizeof(r6)))
++		return -EFAULT;
++	if (r6.flags & _MALI_MEMORY_ALLOCATE_SECURE)
++		return -EINVAL;
++
++	kargs.ctx = (uintptr_t)session_data;
++	kargs.gpu_vaddr = r6.gpu_vaddr;
++	kargs.vsize = r6.vsize;
++	kargs.psize = r6.psize;
++	kargs.flags = r6.flags;
++	kargs.secure_shared_fd = -1;
++
++	err = _mali_ukk_mem_allocate(&kargs);
++	if (_MALI_OSK_ERR_OK != err)
++		return map_errcode(err);
++
++	if (0 != put_user(kargs.backend_handle, &uargs->backend_handle))
++		return -EFAULT;
++
++	return 0;
++}
++
+ int mem_free_wrapper(struct mali_session_data *session_data, _mali_uk_free_mem_s __user *uargs)
+ {
+ 	_mali_uk_free_mem_s kargs;
+diff --git a/src/devicedrv/mali/linux/mali_ukk_wrappers.h b/src/devicedrv/mali/linux/mali_ukk_wrappers.h
+index 3fd4529..102ec76 100644
+--- a/src/devicedrv/mali/linux/mali_ukk_wrappers.h
++++ b/src/devicedrv/mali/linux/mali_ukk_wrappers.h
+@@ -17,6 +17,7 @@
+ #define __MALI_UKK_WRAPPERS_H__
+ 
+ #include "mali_uk_types.h"
++#include "mali_uk_r6p0.h"
+ #include "mali_osk.h"
+ 
+ #ifdef __cplusplus
+@@ -32,6 +33,7 @@ int request_high_priority_wrapper(struct mali_session_data *session_data, _mali_
+ int pending_submit_wrapper(struct mali_session_data *session_data, _mali_uk_pending_submit_s __user *uargs);
+ 
+ int mem_alloc_wrapper(struct mali_session_data *session_data, _mali_uk_alloc_mem_s __user *uargs);
++int mem_alloc_r6p0_wrapper(struct mali_session_data *session_data, _mali_uk_alloc_mem_r6p0_s __user *uargs);
+ int mem_free_wrapper(struct mali_session_data *session_data, _mali_uk_free_mem_s __user *uargs);
+ int mem_bind_wrapper(struct mali_session_data *session_data, _mali_uk_bind_mem_s __user *uargs);
+ int mem_unbind_wrapper(struct mali_session_data *session_data, _mali_uk_unbind_mem_s __user *uargs);
