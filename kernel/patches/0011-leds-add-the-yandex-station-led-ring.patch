@@ -14,7 +14,7 @@ new file mode 100644
 index 0000000..7da10ad
 --- /dev/null
 +++ b/Documentation/devicetree/bindings/leds/yandex,station-led-ring.yaml
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,73 @@
 +# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 +%YAML 1.2
 +---
@@ -54,6 +54,16 @@ index 0000000..7da10ad
 +  shutdown-gpios:
 +    maxItems: 2
 +    description: SDB pins of the chips (hardware shutdown, active low)
++
++  mcu-sleep-gpios:
++    maxItems: 1
++    description: |
++      Puts the board's STM32 MCU to sleep. It draws its own boot animation
++      into the same chips, so it is stopped before Linux drives the ring.
++
++  mcu-reset-gpios:
++    maxItems: 1
++    description: Reset of that MCU, held asserted while Linux drives the ring.
 +
 +required:
 +  - compatible
@@ -119,7 +129,7 @@ new file mode 100644
 index 0000000..6a60fb7
 --- /dev/null
 +++ b/drivers/leds/leds-yandex-ring.c
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,555 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * LED ring of the Yandex Station (YNDX-0001): 24 RGB LEDs on two Si-En SN3236
@@ -568,7 +578,7 @@ index 0000000..6a60fb7
 +static int ring_probe(struct i2c_client *client)
 +{
 +	struct device *dev = &client->dev;
-+	struct gpio_desc *enable;
++	struct gpio_desc *enable, *mcu;
 +	struct gpio_descs *sdb;
 +	struct i2c_client *second;
 +	struct ring *r;
@@ -586,6 +596,17 @@ index 0000000..6a60fb7
 +	ret = devm_add_action_or_reset(dev, ring_put, r);
 +	if (ret)
 +		return ret;
++
++	/*
++	 * The board's STM32 MCU draws its boot animation into the same
++	 * chips: put it to sleep and hold it in reset before taking over.
++	 */
++	mcu = devm_gpiod_get_optional(dev, "mcu-sleep", GPIOD_OUT_HIGH);
++	if (IS_ERR(mcu))
++		return dev_err_probe(dev, PTR_ERR(mcu), "MCU sleep GPIO\n");
++	mcu = devm_gpiod_get_optional(dev, "mcu-reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(mcu))
++		return dev_err_probe(dev, PTR_ERR(mcu), "MCU reset GPIO\n");
 +
 +	/* power: SN3236 VCC switch first, then release both SDB pins */
 +	enable = devm_gpiod_get_optional(dev, "enable", GPIOD_OUT_HIGH);
