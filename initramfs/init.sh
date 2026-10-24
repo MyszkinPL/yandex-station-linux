@@ -17,15 +17,27 @@ exec >/dev/kmsg 2>&1
 L=/tmp/b.log
 say() { echo "station-b: $*" > /dev/kmsg; echo "$*" >> $L; echo ">> $*" > /dev/tty0 2>/dev/null; }
 
-P=mmcblk0p9
-MISC_START=4464640          # sectors, from the vendor MBR/EBR chain
+# Partitions are found by where they are on the eMMC (vendor MBR/EBR chain),
+# not by number: a kernel may number the logical ones differently.
+MISC_START=4464640          # sectors
 MISC_SECTORS=32768          # 16 MiB
+DATA_START=12559356         # Android /data (ext4), mounted read-only
+DATA_SECTORS=2710532
 LOG_SEEK=3072               # 4 KiB blocks -> 12 MiB into misc
 LOG_BLOCKS=1024             # 4 MiB, up to the end of misc
 MAGIC=STATION-MAINLINE
 # sha256 of 4 MiB of zeros; a literal, so a failing pipeline can never "match"
 ZERO4M_SHA=bb9f8df61474d25e71fa00722318cd387396ca1736605e1248821cc0de3d3af8
-DATA=mmcblk0p1              # Android /data (ext4), mounted read-only
+
+# name of the mmcblk partition with this start and size, if exactly one
+part_at() {
+	n=""; c=0
+	for d in /sys/class/block/mmcblk*p*; do
+		[ "$(cat $d/start 2>/dev/null)" = "$1" ] && [ "$(cat $d/size 2>/dev/null)" = "$2" ] &&
+			{ n=${d##*/}; c=$((c+1)); }
+	done
+	[ $c = 1 ] && echo $n
+}
 
 HOLD_OK=7200               # dev session; station-reboot ends it early
 HOLD_FAIL=15
@@ -37,9 +49,13 @@ say "init started, $(uname -r)"
 
 # --- misc log target checks (unchanged from stage A) ---
 i=0
-while [ ! -b /dev/$P ] && [ $i -lt 40 ]; do sleep 0.25; i=$((i+1)); done
+while [ -z "$(part_at $MISC_START $MISC_SECTORS)" ] && [ $i -lt 40 ]; do sleep 0.25; i=$((i+1)); done
+P=$(part_at $MISC_START $MISC_SECTORS)
+DATA=$(part_at $DATA_START $DATA_SECTORS)
+say "misc: ${P:-not found}, data: ${DATA:-not found}"
+for d in /sys/class/block/mmcblk*p*; do echo "  ${d##*/} $(cat $d/start) $(cat $d/size)"; done >> $L
 why=""
-[ -b /dev/$P ] || why="no /dev/$P"
+[ -n "$P" ] && [ -b /dev/$P ] || why="no misc partition"
 [ -z "$why" ] && [ "$(cat /sys/class/block/$P/start)" = "$MISC_START" ] || why="${why:-start mismatch $(cat /sys/class/block/$P/start 2>/dev/null)}"
 [ -z "$why" ] && [ "$(cat /sys/class/block/$P/size)" = "$MISC_SECTORS" ] || why="${why:-size mismatch $(cat /sys/class/block/$P/size 2>/dev/null)}"
 if [ -z "$why" ]; then
