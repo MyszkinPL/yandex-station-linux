@@ -48,7 +48,7 @@ done < <(grep '^CONFIG_.*=[ym]$' "$TOP/kernel/station.config")
 [ -z "$lost" ] || { echo "options lost by olddefconfig:"; printf '%s' "$lost"; exit 1; }
 
 # --- build ---
-make -s -C "$S" O="$O" CC="$CC" -j"$J" Image modules scripts_dtc
+make -s -k -C "$S" O="$O" CC="$CC" -j"$J" Image modules scripts_dtc
 rm -rf "$B/modroot"
 make -s -C "$S" O="$O" INSTALL_MOD_PATH="$B/modroot" INSTALL_MOD_STRIP=1 modules_install
 tar -C "$B/modroot" --owner=0 --group=0 --sort=name --mtime=@0 -czf "$OUT/modules.tar.gz" lib
