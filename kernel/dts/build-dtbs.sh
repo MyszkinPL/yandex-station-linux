@@ -13,7 +13,22 @@ variants=(
 	# to Quasar, PMIC node off, /firmware/android
 	"station-android|$COMMON -DWF2_BT=1 -DWF2_LEDS_KEYS=0 -DWF2_AUDIO=1 -DWF2_PMIC=0 -DWF2_QUASAR=1"
 )
+# Bring-up of a new kernel version: the board with every optional block off
+# (eMMC, Wi-Fi, watchdog: enough for stage B and SSH), then one block at a
+# time, to find a block that keeps the kernel from booting.
+MIN="-DWF2_SMP=1 -DWF2_RTC=0 -DWF2_THERMAL=0 -DWF2_CPUFREQ=0 -DWF2_WIFI=0 -DWF2_WIFI_ID=1 -DWF2_BT=0 -DWF2_LEDS_KEYS=0 -DWF2_AUDIO=0 -DWF2_PMIC=0"
+variants+=(
+	"debug/minimal|$MIN"
+	"debug/rtc|$MIN -DWF2_RTC=1"
+	"debug/thermal|$MIN -DWF2_THERMAL=1"
+	"debug/cpufreq|$MIN -DWF2_CPUFREQ=1"
+	"debug/pmic|$MIN -DWF2_PMIC=1"
+	"debug/audio|$MIN -DWF2_AUDIO=1"
+	"debug/leds-keys|$MIN -DWF2_LEDS_KEYS=1"
+	"debug/bt|$MIN -DWF2_BT=2"
+)
 cd "$OUT"
+mkdir -p debug
 for v in "${variants[@]}"; do
 	n=${v%%|*}
 	# shellcheck disable=SC2086
