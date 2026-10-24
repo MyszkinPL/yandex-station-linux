@@ -107,7 +107,8 @@ def main():
         if raw[:6] == b"070701" or raw[:2] == b"\x1f\x8b" or raw[:6] == b"\xfd7zXZ\0":
             initrd = raw
         else:
-            defs = dict(d.split("=", 1) for d in a.D)
+            # -D paths are relative to where pack.py is run, list paths to the list
+            defs = {k: os.path.abspath(v) for k, v in (d.split("=", 1) for d in a.D)}
             initrd = gzip.compress(cpio_from_list(a.initramfs, defs), 9, mtime=0)
 
     initrd_off = align(IMAGE_OFF + max(isz, len(img)), 1 << 16)
