@@ -4,7 +4,7 @@ Subject: [PATCH] android: forward-port ashmem
 Android releases before 10 cannot work without /dev/ashmem (libcutils
 ashmem_create_region() knows nothing else), and the Yandex Station ships
 Android 6. Forward-port drivers/staging/android/ashmem.c (removed in 5.18)
-to 6.18 as drivers/android/ashmem.c; the changes against 5.15 are listed
+to 7.3 as drivers/android/ashmem.c; the changes against 5.15 are listed
 at the top of the file.
 
 Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
@@ -52,7 +52,7 @@ index 0000000..305bb9b
 + * Anonymous Shared Memory Subsystem, ashmem
 + *
 + * Forward port of drivers/staging/android/ashmem.c (v5.15.170; ashmem was
-+ * removed upstream in 5.18) to Linux 6.18 for the Yandex Station mainline
++ * removed upstream in 5.18) to Linux 7.3 for the Yandex Station mainline
 + * port, so that unmodified Android 6 userspace (libcutils
 + * ashmem_create_region, MemoryHeapBase, MemoryFile) keeps working.
 + * Changes against 5.15:

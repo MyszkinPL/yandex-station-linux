@@ -7,7 +7,8 @@
   скачивается при сборке с developer.arm.com и сверяется по `source.sha256`;
 - `patches/bootlin/`: серия Bootlin sunxi-mali (платформа sunxi, сборка до 5.10),
   без 0013 (r10p0 уже на timer_setup); в 0022 убраны CRLF, в r10p0 файлы с LF;
-- `patches/0100-*`: наш перенос на 6.18.
+- `patches/0100-*`: наш перенос на современные ядра (7.x);
+- `patches/0102-*`: состояние fence через `dma_fence_get_status()` (`ops->signaled` необязателен).
 
 - `patches/0101-*`: интерфейс r6p0 (API 800) рядом с родным API 900, для вендорского
   `libGLES_mali` r6p0-01rel0. Отличия описаны в `common/mali_uk_r6p0.h` (после патчей):
