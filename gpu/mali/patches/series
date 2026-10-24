@@ -15,3 +15,4 @@ bootlin/0024-mali-support-building-against-5.9.patch
 bootlin/0025-mali-support-building-against-5.10.patch
 0100-mali-support-building-against-6.18.patch
 0101-mali-speak-the-r6p0-user-interface-api-800-too.patch
+0102-mali-ask-fences-for-their-status-the-dma-fence-way.patch

@@ -69,6 +69,9 @@ def patch_rc(rc):
             "    symlink /dev/binderfs/binder /dev/binder\n"
             "    # debug traces (mkramdisk.py --strace), read by station-init\n"
             "    mkdir /dev/station 0777 root root\n"
+            "    # EventHub of Android 6 aborts without it; vendor ueventd made it\n"
+            "    # for the PMIC power key, which this kernel does not have\n"
+            "    mkdir /dev/input 0755 root root\n"
             "    # GPU driver for the vendor libGLES_mali\n"
             "    insmod /sbin/station/mali.ko\n"
             "    # watchdog, boot deadline and logs (replaces watchdogd)\n"
@@ -90,15 +93,11 @@ def patch_rc(rc):
 
 def patch_init_rc(rc):
     """init.rc: never let Android rewrite the recovery partition"""
-    old = "service flash_recovery /system/bin/install-recovery.sh
-    class main
-    oneshot
-"
+    old = "service flash_recovery /system/bin/install-recovery.sh\n    class main\n    oneshot\n"
     assert rc.count(old) == 1, old
     # install-recovery.sh puts the stock recovery back when its hash differs,
     # and the mainline image lives there
-    return rc.replace(old, old + "    disabled
-")
+    return rc.replace(old, old + "    disabled\n")
 
 
 def main():
