@@ -7,7 +7,8 @@
                  --hwcomposer lib64/hw/hwcomposer.drm.so -o android-ramdisk.cpio.gz
 
 It is the vendor boot.img ramdisk with the smallest changes this kernel needs,
-in init.sun50iw1p1.rc and ueventd.sun50iw1p1.rc plus files under /sbin/station;
+in init.rc, init.sun50iw1p1.rc and ueventd.sun50iw1p1.rc plus files under
+/sbin/station;
 /system is used as it is on the Station (some files are bind-mounted over,
 nothing is written):
   - binder from binderfs (/dev/binder is a link; ueventd of Android 6 only
@@ -22,6 +23,8 @@ nothing is written):
   - display: hwcomposer over DRM/KMS (android/hwcomposer) in place of
     hwcomposer.tulip, which drives the Allwinner display driver (/dev/disp);
     the vendor gralloc has no framebuffer HAL to fall back to.
+  - flash_recovery is disabled: install-recovery.sh would put the stock
+    recovery back over the mainline image there.
 rdinit=/station-init mirrors the kernel log into misc, then runs /init.
 """
 import argparse
@@ -85,6 +88,19 @@ def patch_rc(rc):
     return rc
 
 
+def patch_init_rc(rc):
+    """init.rc: never let Android rewrite the recovery partition"""
+    old = "service flash_recovery /system/bin/install-recovery.sh
+    class main
+    oneshot
+"
+    assert rc.count(old) == 1, old
+    # install-recovery.sh puts the stock recovery back when its hash differs,
+    # and the mainline image lives there
+    return rc.replace(old, old + "    disabled
+")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for name in ("boot-img", "busybox", "mali", "libion64", "libion32", "hwcomposer"):
@@ -106,6 +122,8 @@ def main():
         text = None
         if name == RC:
             text = patch_rc(data.decode())
+        elif name == "init.rc":
+            text = patch_init_rc(data.decode())
         elif name == UEVENTD_RC:
             text = data.decode().rstrip("\n") + (
                 "\n# mainline kernel: ION is DMA-BUF heaps (android/libion); their nodes\n"
