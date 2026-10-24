@@ -39,11 +39,11 @@ missing=$(grep '^CONFIG_.*=[ym]$' "$TOP/kernel/station.config" | while IFS= read
 [ -z "$missing" ] || { echo "options lost by olddefconfig:"; echo "$missing"; exit 1; }
 
 # --- build ---
-make -s -C "$S" O="$O" CC="$CC" -j"$J" Image modules
+make -s -C "$S" O="$O" CC="$CC" -j"$J" Image modules scripts_dtc
 rm -rf "$B/modroot"
 make -s -C "$S" O="$O" INSTALL_MOD_PATH="$B/modroot" INSTALL_MOD_STRIP=1 modules_install
 tar -C "$B/modroot" --owner=0 --group=0 --sort=name --mtime=@0 -czf "$OUT/modules.tar.gz" lib
-"$TOP/kernel/dts/build-dtbs.sh" "$S" "$OUT/dtb"
+"$TOP/kernel/dts/build-dtbs.sh" "$S" "$OUT/dtb" "$O/scripts/dtc/dtc"
 
 # --- boot shim (boot/pack.py puts DTB, Image and initramfs behind it) ---
 aarch64-linux-gnu-gcc -c -o "$B/shim.o" "$TOP/boot/shim.S"
