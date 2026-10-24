@@ -37,8 +37,14 @@ if [ "$debug" = 1 ] && [ -n "$dev" ]; then
 	$B unshare -p -f /init
 	rc=$?
 	$B sleep 1
-	{ echo "STATION-KLOG final: Android init (PID namespace) ended, rc=$rc"; $B dmesg; } 2>/dev/null |
-		$B tail -c 1048000 > /.slog/k
+	{
+		echo "STATION-KLOG final: Android init (PID namespace) ended, rc=$rc"
+		# traces of mkramdisk.py --strace first, so the kernel log tail survives the cut
+		for t in /dev/station/*.strace; do
+			[ -f "$t" ] && { echo "--- $t"; $B tail -c 400000 "$t"; echo "--- end of $t"; }
+		done
+		$B dmesg | $B tail -c 600000
+	} 2>/dev/null | $B head -c 1048000 > /.slog/k
 	$B dd if=/.slog/k of=/.slog/misc bs=4096 seek=3584 conv=notrunc,fsync 2>/dev/null
 	$B sync
 	$B reboot -f

@@ -35,6 +35,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RC = "init.sun50iw1p1.rc"
 
 
+def strace_service(rc, name):
+    """debug builds: run one service under strace, the trace into /dev/station"""
+    head = f"service {name} "
+    i = rc.find(head)
+    if i < 0:
+        return None
+    j = rc.index("\n", i)
+    cmd = rc[i + len(head):j]
+    return (rc[:i] + head + "/sbin/station/strace -f -tt -s 96 -e trace=%file,%desc,%memory "
+            f"-o /dev/station/{name}.strace " + cmd + rc[j:])
+
+
 def patch_rc(rc):
     def replace(old, new):
         nonlocal rc
@@ -48,6 +60,8 @@ def patch_rc(rc):
             "    mount binder binder /dev/binderfs\n"
             "    chmod 0666 /dev/binderfs/binder\n"
             "    symlink /dev/binderfs/binder /dev/binder\n"
+            "    # debug traces (mkramdisk.py --strace), read by station-init\n"
+            "    mkdir /dev/station 0777 root root\n"
             "    # GPU driver for the vendor libGLES_mali\n"
             "    insmod /sbin/station/mali.ko\n"
             "    # watchdog, boot deadline and logs (replaces watchdogd)\n"
@@ -72,6 +86,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for name in ("boot-img", "busybox", "mali", "libion64", "libion32"):
         ap.add_argument("--" + name, required=True)
+    ap.add_argument("--strace", nargs=2, metavar=("STRACE", "SERVICE"),
+                    help="debug: run SERVICE under this static strace")
     ap.add_argument("-o", "--output", required=True, help=".cpio.gz or .cpio.xz")
     a = ap.parse_args()
 
@@ -82,9 +98,18 @@ def main():
 
     lf = lambda p: open(p, "rb").read().replace(b"\r\n", b"\n")
     body, ino = bytearray(), 9000
+    traced = False
     for name, mode, data, raw in ents:
-        body += cpio.entry(name, mode, patch_rc(data.decode()).encode(), ino) if name == RC else raw
+        text = None
+        if name == RC:
+            text = patch_rc(data.decode())
+        if a.strace and name.endswith(".rc"):
+            t = strace_service(text if text is not None else data.decode(), a.strace[1])
+            if t is not None:
+                text, traced = t, True
+        body += cpio.entry(name, mode, text.encode(), ino) if text is not None else raw
         ino += 1
+    assert not a.strace or traced, f"service {a.strace[1]} not found"
     add = [
         ("sbin/station", 0o040750, b""),
         # it must be called "busybox" to accept "busybox sh"
@@ -96,6 +121,8 @@ def main():
         ("sbin/station-android.sh", 0o100750, lf(os.path.join(HERE, "station-android.sh"))),
         ("station-init", 0o100750, lf(os.path.join(HERE, "station-init.sh"))),
     ]
+    if a.strace:
+        add.append(("sbin/station/strace", 0o100755, open(a.strace[0], "rb").read()))
     for name, mode, data in add:
         ino += 1
         body += cpio.entry(name, mode, data, ino)

@@ -28,6 +28,18 @@ if $B grep -q station.debug /proc/cmdline; then
 		# Station resets right after a crash
 		/system/bin/logcat -v brief -b main -b system -b crash -f /dev/kmsg '*:I' 2>/dev/null
 	) &
+	# what the framebuffer HAL finds once ueventd has made the nodes
+	(
+		while [ ! -e /dev/graphics/fb0 ] && [ ! -e /dev/socket/logdr ]; do $B sleep 0.2; done
+		{
+			echo "station-diag: $($B ls -l /dev/graphics/ /dev/fb0 2>&1 | $B tr '\n' ' ')"
+			for f in dev name virtual_size bits_per_pixel stride; do
+				echo "station-diag: fb0/$f = $(cat /sys/class/graphics/fb0/$f 2>&1)"
+			done
+			echo "station-diag: fbset: $($B fbset -fb /dev/graphics/fb0 2>&1 | $B tr '\n' ' ')"
+			echo "station-diag: read: $($B dd if=/dev/graphics/fb0 of=/dev/null bs=4096 count=1 2>&1 | $B tr '\n' ' ')"
+		} > /dev/kmsg
+	) &
 fi
 
 savelog() {
