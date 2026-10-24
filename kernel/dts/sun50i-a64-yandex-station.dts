@@ -696,10 +696,11 @@
 #if WF2_AUDIO
 	/*
 	 * TLV320ADC3101 i2c0 0x18: TDM slot 4 (32-bit CPU slot), both inputs reference taps (PGA 0.5 dB).
-	 * Clocked from BCLK (no clocks property); reset line PH10 released by a hog in &pio.
+	 * Clocked from BCLK (no clocks property); one reset line (PH10) for all five, through reset-gpio.
 	 */
 	mic_adc4: audio-codec@18 {
 		compatible = "ti,tlv320adc3101";
+		reset-gpios = <&pio 7 10 GPIO_ACTIVE_LOW>;	/* PH10, shared by all five */
 		reg = <0x18>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "ADC4";
@@ -733,10 +734,11 @@
 #if WF2_AUDIO
 	/*
 	 * TLV320ADC3101 i2c1 0x18: TDM slot 0 (32-bit CPU slot), two microphones (PGA 20 dB).
-	 * Clocked from BCLK (no clocks property); reset line PH10 released by a hog in &pio.
+	 * Clocked from BCLK (no clocks property); one reset line (PH10) for all five, through reset-gpio.
 	 */
 	mic_adc0: audio-codec@18 {
 		compatible = "ti,tlv320adc3101";
+		reset-gpios = <&pio 7 10 GPIO_ACTIVE_LOW>;	/* PH10, shared by all five */
 		reg = <0x18>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "ADC0";
@@ -758,6 +760,7 @@
 	/* TLV320ADC3101 i2c1 0x19: TDM slot 1, two microphones */
 	mic_adc1: audio-codec@19 {
 		compatible = "ti,tlv320adc3101";
+		reset-gpios = <&pio 7 10 GPIO_ACTIVE_LOW>;	/* PH10, shared by all five */
 		reg = <0x19>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "ADC1";
@@ -779,6 +782,7 @@
 	/* TLV320ADC3101 i2c1 0x1a: TDM slot 2, two microphones */
 	mic_adc2: audio-codec@1a {
 		compatible = "ti,tlv320adc3101";
+		reset-gpios = <&pio 7 10 GPIO_ACTIVE_LOW>;	/* PH10, shared by all five */
 		reg = <0x1a>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "ADC2";
@@ -800,6 +804,7 @@
 	/* TLV320ADC3101 i2c1 0x1b: TDM slot 3, left microphone, right reference tap */
 	mic_adc3: audio-codec@1b {
 		compatible = "ti,tlv320adc3101";
+		reset-gpios = <&pio 7 10 GPIO_ACTIVE_LOW>;	/* PH10, shared by all five */
 		reg = <0x1b>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "ADC3";
@@ -1126,19 +1131,12 @@
 
 #if WF2_AUDIO
 	/*
-	 * PH10 resets all five TLV320ADC3101s at once. One hog releases it
-	 * (vendor rc.local pulses it low once at boot); the driver then
-	 * software-resets each chip (P0 R1). Per-node reset-gpios cannot
-	 * work: without CONFIG_RESET_GPIO (no #gpio-cells = 3 support) every
-	 * node would request the same GPIO and four would fail with -EBUSY.
+	 * PH10 resets all five TLV320ADC3101s at once. Every ADC node names it
+	 * in reset-gpios; with CONFIG_RESET_GPIO the reset core turns that
+	 * into one shared reset control, released when the first ADC probes,
+	 * and the driver then software-resets each chip (P0 R1). (A gpio-hog
+	 * here used to release it; Linux 7.3 does not boot with that hog.)
 	 */
-	mic-adc-reset-hog {
-		gpio-hog;
-		gpios = <7 10 GPIO_ACTIVE_LOW>;		/* PH10, nRESET */
-		output-low;				/* deasserted: line high */
-		line-name = "mic-adc-reset";
-	};
-
 	i2s0_rx_pins: i2s0-rx-pins {
 		pins = "PB4", "PB5", "PB7";
 		function = "i2s0";
