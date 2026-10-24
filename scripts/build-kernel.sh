@@ -34,9 +34,18 @@ echo 'dtb-$(CONFIG_ARCH_SUNXI) += sun50i-a64-yandex-station.dtb' >> "$S/arch/arm
 mkdir -p "$O"
 cp "$TOP/kernel/station.config" "$O/.config"
 make -s -C "$S" O="$O" CC="$CC" olddefconfig
-missing=$(grep '^CONFIG_.*=[ym]$' "$TOP/kernel/station.config" | while IFS= read -r l; do
-	grep -qxF "$l" "$O/.config" || echo "  $l"; done)
-[ -z "$missing" ] || { echo "options lost by olddefconfig:"; echo "$missing"; exit 1; }
+# Options of station.config that olddefconfig dropped: an error when the
+# symbol still exists (a dependency is missing), only a note when this
+# kernel no longer has it (renamed or removed upstream: review on a bump).
+symbols=$(find "$S" -name 'Kconfig*' -exec grep -hoE '^\s*(menu)?config\s+\w+' {} + | awk '{print $2}' | sort -u)
+lost=""; gone=""
+while IFS= read -r l; do
+	grep -qxF "$l" "$O/.config" && continue
+	sym=${l%%=*}; sym=${sym#CONFIG_}
+	if echo "$symbols" | grep -qxF "$sym"; then lost="$lost  $l"$'\n'; else gone="$gone $sym"; fi
+done < <(grep '^CONFIG_.*=[ym]$' "$TOP/kernel/station.config")
+[ -z "$gone" ] || echo "note: no longer in this kernel:$gone"
+[ -z "$lost" ] || { echo "options lost by olddefconfig:"; printf '%s' "$lost"; exit 1; }
 
 # --- build ---
 make -s -C "$S" O="$O" CC="$CC" -j"$J" Image modules scripts_dtc

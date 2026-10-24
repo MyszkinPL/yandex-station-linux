@@ -43,7 +43,7 @@ def strace_service(rc, name):
         return None
     j = rc.index("\n", i)
     cmd = rc[i + len(head):j]
-    return (rc[:i] + head + "/sbin/station/strace -f -tt -s 96 -e trace=%file,%desc,%memory "
+    return (rc[:i] + head + "/station-debug/strace -f -tt -s 96 -e trace=%file,%desc,%memory "
             f"-o /dev/station/{name}.strace " + cmd + rc[j:])
 
 
@@ -111,7 +111,7 @@ def main():
         ino += 1
     assert not a.strace or traced, f"service {a.strace[1]} not found"
     add = [
-        ("sbin/station", 0o040750, b""),
+        ("sbin/station", 0o040755, b""),
         # it must be called "busybox" to accept "busybox sh"
         ("sbin/station/busybox", 0o100750, open(a.busybox, "rb").read()),
         ("sbin/station/mali.ko", 0o100640, open(a.mali, "rb").read()),
@@ -122,7 +122,9 @@ def main():
         ("station-init", 0o100750, lf(os.path.join(HERE, "station-init.sh"))),
     ]
     if a.strace:
-        add.append(("sbin/station/strace", 0o100755, open(a.strace[0], "rb").read()))
+        # not under /sbin: that is 0750 on Android 6, closed to the service users
+        add.append(("station-debug", 0o040755, b""))
+        add.append(("station-debug/strace", 0o100755, open(a.strace[0], "rb").read()))
     for name, mode, data in add:
         ino += 1
         body += cpio.entry(name, mode, data, ino)
