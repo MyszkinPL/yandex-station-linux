@@ -647,7 +647,8 @@ while [ "$hold" = 0 ] || [ $left -gt 0 ]; do
 		phone=""
 		$CH iw dev wlan0 station dump 2>/dev/null | grep -q "^Station" && [ $since -lt $((AP_RETRY * 3)) ] && phone=yes
 		if [ -n "$changed" ] || { [ $since -ge $AP_RETRY ] && [ -z "$phone" ]; }; then
-			say "leaving the access point to look for the known networks (${changed:+a network was saved}${changed:-every ${AP_RETRY}s})"
+			if [ -n "$changed" ]; then why_try="a network was saved"; else why_try="every ${AP_RETRY}s"; fi
+			say "leaving the access point to look for the known networks ($why_try)"
 			stop_ap
 			saved=$changed
 			start_client && { set_mode try; since=0; } || { start_ap; since=0; }
@@ -675,8 +676,9 @@ while [ "$hold" = 0 ] || [ $left -gt 0 ]; do
 	esac
 	keep_base
 	if net_up; then
-		[ $bad -ge $NET_GRACE ] && say "network back"
-		bad=0
+		# (back from the access point: the try branch says it, with the name)
+		[ $bad -ge $NET_GRACE ] && [ $MODE != try ] && say "network back"
+		[ $MODE != try ] && bad=0
 	else
 		bad=$((bad + 10))
 		[ $bad = $NET_GRACE ] && say "no network for ${bad}s: the ring shows it, still trying"
