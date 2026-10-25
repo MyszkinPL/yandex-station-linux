@@ -12,6 +12,7 @@ SUITE=${SUITE:-trixie}
 MIRROR=${MIRROR:-http://deb.debian.org/debian}
 mkdir -p out
 pkgs=$(grep -v '^\s*#' rootfs/packages | grep -v '^\s*$' | paste -sd, -)
+VERSION="$SUITE $(git rev-parse --short HEAD 2>/dev/null || echo local) $(date -u +%Y-%m-%d)"
 
 mmdebstrap --mode=root --variant=minbase --arch=arm64 \
 	--include="$pkgs" \
@@ -23,11 +24,12 @@ mmdebstrap --mode=root --variant=minbase --arch=arm64 \
 	--dpkgopt='path-exclude=/usr/share/locale/*' \
 	--dpkgopt='path-include=/usr/share/locale/locale.alias' \
 	--customize-hook='echo station > "$1/etc/hostname"' \
+	--customize-hook="echo '$VERSION' > \"\$1/etc/station-rootfs\"" \
 	--customize-hook='rm -rf "$1"/var/lib/apt/lists/* "$1"/var/cache/apt/*.bin "$1"/var/log/*.log' \
 	--customize-hook='mkdir -p "$1/station" "$1/opt/station"' \
 	"$SUITE" out/rootfs-arm64.tar "$MIRROR"
 
 gzip -9 -f out/rootfs-arm64.tar
 (cd out && sha256sum rootfs-arm64.tar.gz > rootfs-arm64.tar.gz.sha256)
-echo "$SUITE $(git rev-parse --short HEAD 2>/dev/null || echo local) $(date -u +%Y-%m-%d)" > out/rootfs-VERSION
+echo "$VERSION" > out/rootfs-VERSION
 echo "out/rootfs-arm64.tar.gz: $(cat out/rootfs-VERSION), $(stat -c %s out/rootfs-arm64.tar.gz) bytes"

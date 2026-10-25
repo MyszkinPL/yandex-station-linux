@@ -151,38 +151,88 @@ else
 	dmesg | grep -iE "brcm|mmc1|sdio|pwrseq" >> $L
 fi
 
-# --- Debian tools from Android /data, read-only, under a layer of our own ---
-# The layer (everything installed or changed in Debian, our services in
-# /opt/station) is kept on the flash in /cache/station, so it survives a
-# reboot and costs no RAM. If /cache cannot be used the layer is in RAM, as
-# before: the Station still comes up, only without its changes.
-# station/root.reset on the flash: start this boot from a clean layer.
+# --- the root filesystem ---
+# Ours: /cache/station/rootfs, built by CI from Debian packages
+# (scripts/build-rootfs.sh), read-only, with a layer in RAM on top: it is the
+# same at every boot. What must be kept lives in /cache/station/persist and is
+# bound in: /opt/station (services, settings, Wi-Fi networks), the Bluetooth
+# pairings, chrony's drift, the SSH host key. /cache/station itself is
+# /station inside.
+# A new root filesystem is tried once: init marks the try and clears the mark
+# when the network and SSH are up; a boot that never got there leaves the
+# mark, and the next one puts that root filesystem aside (rootfs.failed) and
+# comes up on the old way below.
+# The old way, while there is no root filesystem of ours: Debian from
+# Android's /data, read-only, under a layer kept in /cache/station/root (in
+# RAM if /cache cannot be used). station/root.reset: start that layer clean.
 R=/newroot
+ROOT=""
 if [ -e /sys/class/net/wlan0 ]; then
 	blockdev --setro /dev/$DATA
 	mkdir -p /mnt/data /mnt/cache /run/ovl $R
-	if mount -t ext4 -o ro,noload /dev/$DATA /mnt/data && [ -x /mnt/data/local/debian/usr/sbin/wpa_supplicant ]; then
+	# Android's saved Wi-Fi networks are read from /data either way
+	mount -t ext4 -o ro,noload /dev/$DATA /mnt/data || say "cannot mount /data"
+	C=/mnt/cache/station
+	if [ -n "$CACHE" ] && mount -t ext4 -o rw,noatime /dev/$CACHE /mnt/cache; then
+		mkdir -p $C
+		if [ -e $C/rootfs.try ] && [ -d $C/rootfs ]; then
+			rm -rf $C/rootfs.failed
+			mv $C/rootfs $C/rootfs.failed && rm -f $C/rootfs.try
+			say "root filesystem did not come up last time: put aside as rootfs.failed"
+		fi
+		if [ -x $C/rootfs/usr/sbin/wpa_supplicant ] && [ -x $C/rootfs/usr/sbin/dropbear ]; then
+			touch $C/rootfs.try && sync
+			mount -t tmpfs tmpfs /run/ovl
+			mkdir -p /run/ovl/u /run/ovl/w
+			if mount -t overlay overlay -o lowerdir=$C/rootfs,upperdir=/run/ovl/u,workdir=/run/ovl/w $R; then
+				ROOT=own
+				P=$C/persist
+				mkdir -p $P/opt-station $P/bluetooth $P/chrony $P/dropbear
+				# the first boot on it brings over what the old layer kept
+				if [ ! -e $P/.migrated ] && [ -d $C/root/opt/station ]; then
+					cp -a $C/root/opt/station/. $P/opt-station/
+					cp -a $C/root/var/lib/bluetooth/. $P/bluetooth/ 2>/dev/null
+					cp -a $C/root/etc/dropbear/. $P/dropbear/ 2>/dev/null
+					touch $P/.migrated && say "kept state brought over from the old layer"
+				fi
+				mkdir -p $R/opt/station $R/var/lib/bluetooth $R/var/lib/chrony $R/etc/dropbear $R/station
+				mount --bind $P/opt-station $R/opt/station
+				mount --bind $P/bluetooth $R/var/lib/bluetooth
+				mount --bind $P/chrony $R/var/lib/chrony
+				# the SSH host key: the same at every boot, or clients cry wolf
+				mount --bind $P/dropbear $R/etc/dropbear
+				mount --bind $C $R/station
+				say "root filesystem: ours ($(cat $C/rootfs/etc/station-rootfs 2>/dev/null || echo unknown)), $(df -h /mnt/cache | awk 'NR == 2 { print $4 }') free"
+			else
+				umount /run/ovl
+			fi
+		fi
+	fi
+	if [ -z "$ROOT" ] && [ -x /mnt/data/local/debian/usr/sbin/wpa_supplicant ]; then
 		upper=""
-		if [ -n "$CACHE" ] && mount -t ext4 -o rw,noatime /dev/$CACHE /mnt/cache; then
-			C=/mnt/cache/station
+		if mountpoint -q /mnt/cache; then
 			if [ -e $C/root.reset ]; then
 				rm -rf $C/root $C/work $C/root.reset && say "persistent layer reset"
 			fi
 			mkdir -p $C/root $C/work && upper=$C/root work=$C/work
 		fi
 		if [ -n "$upper" ] && mount -t overlay overlay -o lowerdir=/mnt/data/local/debian,upperdir=$upper,workdir=$work $R; then
+			ROOT=debian
 			say "debian overlay ready, layer on flash ($(df -h /mnt/cache | awk 'NR == 2 { print $4 }') free)"
 		else
-			mount -t tmpfs tmpfs /run/ovl
-			mkdir -p /run/ovl/u /run/ovl/w
-			mount -t overlay overlay -o lowerdir=/mnt/data/local/debian,upperdir=/run/ovl/u,workdir=/run/ovl/w $R
+			mountpoint -q /run/ovl || mount -t tmpfs tmpfs /run/ovl
+			mkdir -p /run/ovl/u2 /run/ovl/w2
+			mount -t overlay overlay -o lowerdir=/mnt/data/local/debian,upperdir=/run/ovl/u2,workdir=/run/ovl/w2 $R && ROOT=debian
 			say "debian overlay ready, layer in RAM (${CACHE:-no cache}: not usable)"
 		fi
+		mountpoint -q /mnt/cache && mkdir -p $R/station && mount --bind $C $R/station
+	fi
+	if [ -n "$ROOT" ]; then
 		for m in proc sys dev dev/pts; do mount --bind /$m $R/$m; done
 		mount -t tmpfs tmpfs $R/run
 		mount -t tmpfs tmpfs $R/tmp
 	else
-		say "cannot mount /data or no debian tools"
+		say "no root filesystem: neither ours nor Debian in /data"
 	fi
 fi
 
@@ -291,6 +341,7 @@ KX
 				i=0
 				while ! pidof dropbear >/dev/null && [ $i -lt 20 ]; do sleep 0.05; i=$((i+1)); done
 				pidof dropbear >/dev/null && result=ok
+				[ "$result" = ok ] && [ "$ROOT" = own ] && rm -f /mnt/cache/station/rootfs.try && sync
 				say "IP $(cat /tmp/ip 2>/dev/null)  ssh: $(pidof dropbear >/dev/null && echo up || echo DOWN)"
 				# Sound: the drivers are built in and probe on their own (the
 				# amplifiers asynchronously, ~0.5 s each); once both cards are
