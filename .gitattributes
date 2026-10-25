@@ -1,0 +1,2 @@
+# text files are LF in the repository and in checkouts, whatever the OS
+* text=auto eol=lf

@@ -103,6 +103,10 @@ jobs:
             os/target
           key: cargo-${{ hashFiles('os/Cargo.lock') }}-${{ github.sha }}
           restore-keys: cargo-${{ hashFiles('os/Cargo.lock') }}-
+      # the ring's rules (rules.rs) run on the runner itself: the same code,
+      # every scene played through the real output frame by frame
+      - name: Test
+        run: cd os && cargo test --release --target x86_64-unknown-linux-gnu
       - name: Build
         run: scripts/build-os.sh
       - uses: actions/upload-artifact@v4
