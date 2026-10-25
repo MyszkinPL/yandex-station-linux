@@ -92,8 +92,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      # gcc for aarch64: tract (listend's wake word models) assembles its kernels with it
       - name: Toolchain
-        run: rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-musl
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-musl
+          sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
       # crates and the build directory: a push rebuilds only what changed
       - name: Cargo cache
         uses: actions/cache@v4
