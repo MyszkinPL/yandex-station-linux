@@ -198,10 +198,12 @@ if [ -x $R/usr/sbin/wpa_supplicant ]; then
 	CH="chroot $R /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root"
 	say "hints: freq=${HINT_FREQ:-none} ip=${HINT_IP:-none}"
 
-	# Every network Android has saved, with only the fields a plain supplicant
-	# needs (Android adds fields upstream rejects). Whole lines are kept: a
-	# passphrase may contain spaces; a block ends only on a lone "}". EAP
-	# networks (no way to bring certificates over) and disabled ones are left out.
+	# Every network we know: first our own (added in the panel, kept in the
+	# persistent layer: /opt/station/etc/wifi.conf), then every one Android
+	# has saved, with only the fields a plain supplicant needs (Android adds
+	# fields upstream rejects). Whole lines are kept: a passphrase may contain
+	# spaces; a block ends only on a lone "}". EAP networks (no way to bring
+	# certificates over) and disabled ones are left out.
 	# "@FREQ@" is a placeholder for the channel hint.
 	awk '
 		/^[ \t]*network=\{[ \t]*$/ { inb = 1; blk = ""; ssid = 0; skip = 0; next }
@@ -215,7 +217,7 @@ if [ -x $R/usr/sbin/wpa_supplicant ]; then
 			l = $0; sub(/^[ \t]+/, "", l); blk = blk "\t" l "\n"
 			if (l ~ /^ssid=/) ssid = 1
 		}
-	' /mnt/data/misc/wifi/wpa_supplicant.conf > /tmp/net
+	' $(ls $R/opt/station/etc/wifi.conf 2>/dev/null) /mnt/data/misc/wifi/wpa_supplicant.conf > /tmp/net
 	if [ -s /tmp/net ]; then
 		# $1 = scan_freq (empty: scan everything)
 		start_wpa() {
