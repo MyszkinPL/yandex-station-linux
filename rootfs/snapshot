@@ -1,0 +1,4 @@
+# The moment of Debian the root filesystem is built from
+# (snapshot.debian.org/archive/debian/<this>). Newer packages: change it,
+# build, try it on the Station (update rootfs-install tries it once).
+20261020T000000Z

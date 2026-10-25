@@ -2,6 +2,8 @@
 # on top of minbase. Only what the services and the boot use; each line says
 # who needs it. Recommends are not installed.
 
+# keeps our services running (os/station/start, os/station/sv)
+runit
 # network: init brings Wi-Fi up with these
 wpasupplicant
 iw
@@ -10,7 +12,8 @@ iproute2
 dropbear-bin
 ca-certificates
 curl
-# Bluetooth speaker (os/station/bin/bluetooth, webd btplayer)
+# Bluetooth speaker (os/station/sv: dbus, bluetoothd, bluealsa, bt-agent,
+# bt-aplay; webd btplayer)
 bluez
 bluez-alsa-utils
 bluez-tools
@@ -19,7 +22,7 @@ dbus
 systemd
 # sound: amixer for the amplifiers and mics (init, audiod), aplay for playerd/audiod
 alsa-utils
-# time (os/station/bin/clock); zone files for the time zone setting
+# time (os/station/sv/clock); zone files for the time zone (bin/timezone)
 chrony
 tzdata
 # pgrep/pkill/ps (start, update, install-os), killall

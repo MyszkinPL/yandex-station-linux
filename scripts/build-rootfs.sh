@@ -9,14 +9,19 @@ set -euo pipefail
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 cd "$TOP"
 SUITE=${SUITE:-trixie}
-MIRROR=${MIRROR:-http://deb.debian.org/debian}
+# Debian as it was at one moment (rootfs/snapshot), not as it is today: a
+# rebuild gives the same packages, and moving to newer ones is a commit of
+# its own — the services read some of these programs' output (FOUNDATION.md)
+SNAPSHOT=$(grep -v '^\s*#' rootfs/snapshot | head -n1)
+MIRROR=${MIRROR:-http://snapshot.debian.org/archive/debian/$SNAPSHOT}
 mkdir -p out
 pkgs=$(grep -v '^\s*#' rootfs/packages | grep -v '^\s*$' | paste -sd, -)
-VERSION="$SUITE $(git rev-parse --short HEAD 2>/dev/null || echo local) $(date -u +%Y-%m-%d)"
+VERSION="$SUITE@$SNAPSHOT $(git rev-parse --short HEAD 2>/dev/null || echo local) $(date -u +%Y-%m-%d)"
 
 mmdebstrap --mode=root --variant=minbase --arch=arm64 \
 	--include="$pkgs" \
 	--aptopt='APT::Install-Recommends "false"' \
+	--aptopt='Acquire::Check-Valid-Until "false"' \
 	--dpkgopt='path-exclude=/usr/share/man/*' \
 	--dpkgopt='path-exclude=/usr/share/info/*' \
 	--dpkgopt='path-exclude=/usr/share/doc/*' \
