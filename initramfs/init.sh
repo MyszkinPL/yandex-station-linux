@@ -346,7 +346,10 @@ KX
 				# Sound: the drivers are built in and probe on their own (the
 				# amplifiers asynchronously, ~0.5 s each); once both cards are
 				# there, set the mic ADCs up and give the speakers a quiet
-				# volume. In the background, so it never holds up the network.
+				# volume — the safe level if nothing else ever sets one. Then
+				# /run/station/sound-ready hands the speakers over: audiod
+				# waits for it and from then on alone owns the volume. In the
+				# background, so it never holds up the network.
 				(
 					i=0
 					while ! { [ -e /proc/asound/snddaudio0 ] && [ -e /proc/asound/snddaudio1 ]; } && [ $i -lt 150 ]; do
@@ -360,6 +363,7 @@ KX
 					else
 						say "sound: setup failed"
 					fi
+					mkdir -p $R/run/station && echo done > $R/run/station/sound-ready
 				) &
 			else
 				say "DHCP failed"
