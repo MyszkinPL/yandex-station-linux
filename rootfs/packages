@@ -6,6 +6,9 @@
 runit
 # network: init brings Wi-Fi up with these
 wpasupplicant
+# the setup access point without a network (init): DHCP and a DNS that sends
+# every name to the Station, so a phone opens the panel by itself
+dnsmasq-base
 iw
 iproute2
 # SSH (init starts it)

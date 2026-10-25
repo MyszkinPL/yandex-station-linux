@@ -133,13 +133,26 @@ fi
 [ -n "$why" ] && say "misc log disabled: $why"
 writelog early
 
+# Back to Yandex Android, and stay there (the log says so; Android leaves the
+# Station alone then): the way out when ours could never be reached at all.
+to_android() {
+	say "to Android, to stay: $1"
+	writelog "to Android: $1"
+	[ -z "$why" ] && printf '%s-STAY\n' $MAGIC | dd of=/dev/$P bs=4096 seek=$LOG_SEEK conv=notrunc,sync 2>/dev/null && sync
+	kill -9 $(pidof watchdog) 2>/dev/null
+	sleep 30
+	reboot -f
+}
+
 result=fail
 # --- loopback: services talk over localhost (SSH forwards, local ports) ---
 ip link set lo up
 
 # --- Wi-Fi ---
+# Without the Wi-Fi device ours cannot be reached by anyone: no network, no
+# access point to set one up. Up to two minutes for it, then Android.
 i=0
-while [ ! -e /sys/class/net/wlan0 ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done
+while [ ! -e /sys/class/net/wlan0 ] && [ $i -lt 240 ]; do sleep 0.5; i=$((i+1)); done
 if [ -e /sys/class/net/wlan0 ]; then
 	say "wlan0 present"
 	# the kernel takes the module's own address from its OTP; an
@@ -149,6 +162,7 @@ if [ -e /sys/class/net/wlan0 ]; then
 else
 	say "NO wlan0"
 	dmesg | grep -iE "brcm|mmc1|sdio|pwrseq" >> $L
+	to_android "no Wi-Fi device after 2 minutes"
 fi
 
 # --- the root filesystem ---
@@ -194,21 +208,22 @@ if [ -e /sys/class/net/wlan0 ]; then
 			mkdir -p /run/ovl/u /run/ovl/w
 			if mount -t overlay overlay -o lowerdir=$C/rootfs,upperdir=/run/ovl/u,workdir=/run/ovl/w $R; then
 				ROOT=own
-				P=$C/persist
-				mkdir -p $P/opt-station $P/bluetooth $P/chrony $P/dropbear
+				# (not $P: that is the misc partition the log goes to)
+				KEEP=$C/persist
+				mkdir -p $KEEP/opt-station $KEEP/bluetooth $KEEP/chrony $KEEP/dropbear
 				# the first boot on it brings over what the old layer kept
-				if [ ! -e $P/.migrated ] && [ -d $C/root/opt/station ]; then
-					cp -a $C/root/opt/station/. $P/opt-station/
-					cp -a $C/root/var/lib/bluetooth/. $P/bluetooth/ 2>/dev/null
-					cp -a $C/root/etc/dropbear/. $P/dropbear/ 2>/dev/null
-					touch $P/.migrated && say "kept state brought over from the old layer"
+				if [ ! -e $KEEP/.migrated ] && [ -d $C/root/opt/station ]; then
+					cp -a $C/root/opt/station/. $KEEP/opt-station/
+					cp -a $C/root/var/lib/bluetooth/. $KEEP/bluetooth/ 2>/dev/null
+					cp -a $C/root/etc/dropbear/. $KEEP/dropbear/ 2>/dev/null
+					touch $KEEP/.migrated && say "kept state brought over from the old layer"
 				fi
 				mkdir -p $R/opt/station $R/var/lib/bluetooth $R/var/lib/chrony $R/etc/dropbear $R/station
-				mount --bind $P/opt-station $R/opt/station
-				mount --bind $P/bluetooth $R/var/lib/bluetooth
-				mount --bind $P/chrony $R/var/lib/chrony
+				mount --bind $KEEP/opt-station $R/opt/station
+				mount --bind $KEEP/bluetooth $R/var/lib/bluetooth
+				mount --bind $KEEP/chrony $R/var/lib/chrony
 				# the SSH host key: the same at every boot, or clients cry wolf
-				mount --bind $P/dropbear $R/etc/dropbear
+				mount --bind $KEEP/dropbear $R/etc/dropbear
 				mount --bind $C $R/station
 				say "root filesystem: ours ($(cat $C/rootfs/etc/station-rootfs 2>/dev/null || echo unknown)), $(df -h /mnt/cache | awk 'NR == 2 { print $4 }') free"
 			else
@@ -289,11 +304,25 @@ if [ -x $R/usr/sbin/wpa_supplicant ]; then
 	mkdir -p $R/usr/local/sbin
 	cat > $R/usr/local/sbin/station-reboot <<'RB'
 #!/bin/sh
-# Leave mainline: stop feeding the watchdog; the SoC resets within 16 s.
+# Restart: stop feeding the watchdog; the SoC resets within 16 s. Yandex
+# Android comes up first and hands the Station back to us (its
+# station-handoff.sh, android/), as after a power cut.
 echo "station: resetting through the watchdog" > /dev/kmsg
 pkill -9 -x watchdog
 RB
 	chmod 755 $R/usr/local/sbin/station-reboot
+	# Back to Android to stay there (flashing a new recovery image, say): the
+	# log in misc says "stay", and Android's hand-off leaves the Station alone.
+	# Only where the log region is checked to be ours.
+	if [ -z "$why" ]; then
+		cat > $R/usr/local/sbin/station-android <<SA
+#!/bin/sh
+# To Yandex Android, and stay there (until a one-shot boot into recovery).
+printf '$MAGIC-STAY\\n' | dd of=/dev/$P bs=4096 seek=$LOG_SEEK conv=notrunc,sync 2>/dev/null && sync &&
+	echo "station: to Android, staying there" > /dev/kmsg && pkill -9 -x watchdog
+SA
+		chmod 755 $R/usr/local/sbin/station-android
+	fi
 	cp /bin/kexec $R/usr/local/sbin/kexec
 	cat > $R/usr/local/sbin/station-kexec <<'KX'
 #!/bin/sh
@@ -331,44 +360,53 @@ NE
 	# spaces; a block ends only on a lone "}". EAP networks (no way to bring
 	# certificates over) and disabled ones are left out.
 	# "@FREQ@" is a placeholder for the channel hint.
-	awk '
-		/^[ \t]*network=\{[ \t]*$/ { inb = 1; blk = ""; ssid = 0; skip = 0; next }
-		inb && /^[ \t]*\}[ \t]*$/ {
-			if (ssid && !skip) printf "network={\n\tscan_ssid=1\n@FREQ@\n%s}\n", blk
-			inb = 0; next
-		}
-		inb && /^[ \t]*key_mgmt=.*(EAP|IEEE8021X)/ { skip = 1 }
-		inb && /^[ \t]*disabled=1/ { skip = 1 }
-		inb && /^[ \t]*(ssid|psk|key_mgmt|priority|auth_alg|wep_key[0-3]|wep_tx_keyidx)=/ {
-			l = $0; sub(/^[ \t]+/, "", l); blk = blk "\t" l "\n"
-			if (l ~ /^ssid=/) ssid = 1
-		}
-	' $(ls $R/opt/station/etc/wifi.conf 2>/dev/null) /mnt/data/misc/wifi/wpa_supplicant.conf > /tmp/net
+	build_net() {
+		awk '
+			/^[ \t]*network=\{[ \t]*$/ { inb = 1; blk = ""; ssid = 0; skip = 0; next }
+			inb && /^[ \t]*\}[ \t]*$/ {
+				if (ssid && !skip) printf "network={\n\tscan_ssid=1\n@FREQ@\n%s}\n", blk
+				inb = 0; next
+			}
+			inb && /^[ \t]*key_mgmt=.*(EAP|IEEE8021X)/ { skip = 1 }
+			inb && /^[ \t]*disabled=1/ { skip = 1 }
+			inb && /^[ \t]*(ssid|psk|key_mgmt|priority|auth_alg|wep_key[0-3]|wep_tx_keyidx)=/ {
+				l = $0; sub(/^[ \t]+/, "", l); blk = blk "\t" l "\n"
+				if (l ~ /^ssid=/) ssid = 1
+			}
+		' $(ls $R/opt/station/etc/wifi.conf 2>/dev/null) /mnt/data/misc/wifi/wpa_supplicant.conf > /tmp/net
+	}
+	# $1 = scan_freq (empty: scan everything)
+	write_wpa() {
+		{
+			echo "ctrl_interface=/run/wpa_supplicant"
+			if [ -n "$1" ]; then sed "s/^@FREQ@\$/	scan_freq=$1/" /tmp/net
+			else sed "/^@FREQ@\$/d" /tmp/net; fi
+		} > $R/etc/wpa-station.conf
+		chmod 600 $R/etc/wpa-station.conf
+	}
+	# with its debug output while it connects (the boot's log shows why it
+	# did not), down to INFO once connected: the log lives in RAM
+	start_wpa() {
+		$CH wpa_supplicant -B -i wlan0 -D nl80211 -c /etc/wpa-station.conf -f /run/wpa.log -d
+		$CH wpa_cli -i wlan0 -a /usr/local/sbin/station-net-event -B
+	}
+	# up to $1 tenths of a second for the 4-way handshake to complete
+	wait_wpa() {
+		i=0
+		while [ $i -lt $1 ]; do
+			$CH wpa_cli -i wlan0 status 2>/dev/null | grep -q "^wpa_state=COMPLETED" && return 0
+			sleep 0.1; i=$((i+1))
+		done
+		return 1
+	}
+	# until the process is gone (a new supplicant refuses a control socket an
+	# old one still holds), at most 3 s
+	wait_gone() {
+		i=0
+		while pidof $1 >/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i+1)); done
+	}
+	build_net
 	if [ -s /tmp/net ]; then
-		# $1 = scan_freq (empty: scan everything)
-		write_wpa() {
-			{
-				echo "ctrl_interface=/run/wpa_supplicant"
-				if [ -n "$1" ]; then sed "s/^@FREQ@\$/	scan_freq=$1/" /tmp/net
-				else sed "/^@FREQ@\$/d" /tmp/net; fi
-			} > $R/etc/wpa-station.conf
-			chmod 600 $R/etc/wpa-station.conf
-		}
-		# with its debug output while it connects (the boot's log shows why it
-		# did not), down to INFO once connected: the log lives in RAM
-		start_wpa() {
-			$CH wpa_supplicant -B -i wlan0 -D nl80211 -c /etc/wpa-station.conf -f /run/wpa.log -d
-			$CH wpa_cli -i wlan0 -a /usr/local/sbin/station-net-event -B
-		}
-		# up to $1 tenths of a second for the 4-way handshake to complete
-		wait_wpa() {
-			i=0
-			while [ $i -lt $1 ]; do
-				$CH wpa_cli -i wlan0 status 2>/dev/null | grep -q "^wpa_state=COMPLETED" && return 0
-				sleep 0.1; i=$((i+1))
-			done
-			return 1
-		}
 		write_wpa "$HINT_FREQ"
 		start_wpa
 		if [ -n "$HINT_FREQ" ] && ! wait_wpa 40; then
@@ -402,7 +440,8 @@ NE
 		fi
 		say "IP $(cat /tmp/ip 2>/dev/null || echo none)  ssh: $(pidof dropbear >/dev/null && echo up || echo DOWN)"
 	else
-		say "no usable network in our wifi.conf or Android's wpa_supplicant.conf"
+		say "no usable network in our wifi.conf or Android's wpa_supplicant.conf: the access point comes up"
+		export NEWROOT=$R
 	fi
 fi
 
@@ -421,33 +460,179 @@ fi
 # again. The SoC watchdog stays fed: it is for a hung kernel.
 # The ring's "offline" is init's to say: told again when ringd has lost it
 # (a restart), as every owner does.
+#
+# The way back that needs nobody but a phone: with no network for AP_AFTER,
+# the Station raises its own open access point "Станция-XXXX" (192.168.4.1,
+# 2.4 GHz); a phone that joins gets an address and a DNS that sends every
+# name to the Station, so it opens the panel by itself ("sign in to the
+# network") on the Wi-Fi page. A network saved there (webd: wifi.conf and
+# /run/station/wifi-changed) is tried at once; every AP_RETRY the Station
+# also leaves the access point for TRY_FOR to look for the networks it
+# knows, so it comes back by itself when the router does (after a power cut
+# the router often takes longer than the Station). SSH answers on the access
+# point too. /run/station/net-mode says which mode it is in (client, ap, try).
 NET_GRACE=30
+AP_AFTER=180
+AP_RETRY=300
+TRY_FOR=60
+AP_IP=192.168.4.1
+AP_SSID="Станция-$(cut -d: -f5,6 /sys/class/net/wlan0/address 2>/dev/null | tr -d : | tr a-f A-F)"
 net_up() {
 	[ "$(cat /sys/class/net/wlan0/operstate 2>/dev/null)" = up ] &&
-		ip -4 addr show wlan0 2>/dev/null | grep -q "inet "
+		ip -4 addr show wlan0 2>/dev/null | grep "inet " | grep -vq "inet $AP_IP/"
+}
+set_mode() {
+	MODE=$1
+	mkdir -p $R/run/station && echo $1 > $R/run/station/net-mode
+}
+# the client side: supplicant with the known networks, DHCP
+start_client() {
+	ip addr flush dev wlan0
+	build_net
+	[ -s /tmp/net ] || { say "no known network to look for"; return 1; }
+	write_wpa ""
+	rm -f $R/run/wpa_supplicant/wlan0
+	start_wpa
+	$CH wpa_cli -i wlan0 log_level INFO >/dev/null
+	udhcpc -i wlan0 -s /udhcpc.sh -t 8 -T 3 -b -p $R/run/udhcpc.pid
+}
+stop_client() {
+	kill "$(cat $R/run/udhcpc.pid 2>/dev/null)" 2>/dev/null
+	$CH pkill -x wpa_cli
+	killall wpa_supplicant 2>/dev/null
+	wait_gone wpa_supplicant
+	ip addr flush dev wlan0
+}
+# what is around, for the panel's list (the access point cannot scan): a
+# scan of its own, with a bare supplicant when none runs (no network known)
+scan_list() {
+	if ! pidof wpa_supplicant >/dev/null; then
+		echo "ctrl_interface=/run/wpa_supplicant" > $R/etc/wpa-scan.conf
+		rm -f $R/run/wpa_supplicant/wlan0
+		$CH wpa_supplicant -B -i wlan0 -D nl80211 -c /etc/wpa-scan.conf
+		sleep 1
+	fi
+	$CH wpa_cli -i wlan0 scan >/dev/null 2>&1
+	i=0
+	while [ $i -lt 8 ]; do
+		sleep 1; i=$((i+1))
+		[ $($CH wpa_cli -i wlan0 scan_results 2>/dev/null | wc -l) -gt 1 ] && [ $i -ge 4 ] && break
+	done
+	# an empty scan does not replace a list there was
+	$CH wpa_cli -i wlan0 scan_results > $R/run/station/scan.txt.new 2>/dev/null
+	if [ $(wc -l < $R/run/station/scan.txt.new) -gt 1 ] || [ ! -s $R/run/station/scan.txt ]; then
+		mv $R/run/station/scan.txt.new $R/run/station/scan.txt
+	else
+		rm -f $R/run/station/scan.txt.new
+	fi
+}
+start_ap() {
+	mkdir -p $R/run/station
+	scan_list
+	stop_client
+	ip addr add $AP_IP/24 dev wlan0
+	cat > $R/etc/wpa-ap.conf <<AP
+ctrl_interface=/run/wpa_supplicant
+ap_scan=2
+network={
+	ssid="$AP_SSID"
+	mode=2
+	frequency=2437
+	key_mgmt=NONE
+}
+AP
+	cat > $R/etc/dnsmasq-ap.conf <<DM
+interface=wlan0
+bind-interfaces
+except-interface=lo
+no-resolv
+no-hosts
+dhcp-range=192.168.4.10,192.168.4.60,255.255.255.0,1h
+dhcp-option=3,$AP_IP
+dhcp-option=6,$AP_IP
+address=/#/$AP_IP
+dhcp-leasefile=/run/dnsmasq-ap.leases
+pid-file=/run/dnsmasq-ap.pid
+DM
+	rm -f $R/run/wpa_supplicant/wlan0
+	$CH wpa_supplicant -B -i wlan0 -D nl80211 -c /etc/wpa-ap.conf -f /run/wpa-ap.log
+	$CH dnsmasq --conf-file=/etc/dnsmasq-ap.conf
+	set_mode ap
+	say "access point '$AP_SSID' up ($AP_IP): join it with a phone to set Wi-Fi up"
+}
+stop_ap() {
+	kill "$(cat $R/run/dnsmasq-ap.pid 2>/dev/null)" 2>/dev/null
+	killall wpa_supplicant 2>/dev/null
+	wait_gone wpa_supplicant
+	ip addr flush dev wlan0
 }
 keep_base() {
 	pidof dropbear >/dev/null || { say "dropbear was gone: starting it again"; $CH dropbear -R -E -p 22 >> $L 2>&1; }
-	[ -s /tmp/net ] || return
-	if ! pidof wpa_supplicant >/dev/null; then
-		say "wpa_supplicant was gone: starting it again"
-		$CH pkill -x wpa_cli
-		start_wpa
-		$CH wpa_cli -i wlan0 log_level INFO >/dev/null
-	fi
-	pidof wpa_cli >/dev/null || $CH wpa_cli -i wlan0 -a /usr/local/sbin/station-net-event -B
-	if ! kill -0 "$(cat $R/run/udhcpc.pid 2>/dev/null)" 2>/dev/null; then
-		say "udhcpc was gone: starting it again"
-		udhcpc -i wlan0 -s /udhcpc.sh -t 8 -T 3 -b -p $R/run/udhcpc.pid
-	fi
+	case $MODE in
+	ap)
+		pidof wpa_supplicant >/dev/null || { say "access point was gone: up again"; start_ap; }
+		kill -0 "$(cat $R/run/dnsmasq-ap.pid 2>/dev/null)" 2>/dev/null || $CH dnsmasq --conf-file=/etc/dnsmasq-ap.conf
+		;;
+	*)
+		[ -s /tmp/net ] || return
+		if ! pidof wpa_supplicant >/dev/null; then
+			say "wpa_supplicant was gone: starting it again"
+			$CH pkill -x wpa_cli
+			start_wpa
+			$CH wpa_cli -i wlan0 log_level INFO >/dev/null
+		fi
+		pidof wpa_cli >/dev/null || $CH wpa_cli -i wlan0 -a /usr/local/sbin/station-net-event -B
+		if ! kill -0 "$(cat $R/run/udhcpc.pid 2>/dev/null)" 2>/dev/null; then
+			say "udhcpc was gone: starting it again"
+			udhcpc -i wlan0 -s /udhcpc.sh -t 8 -T 3 -b -p $R/run/udhcpc.pid
+		fi
+		;;
+	esac
 }
 # the pids of our core services (a restart changes one)
 CORE="ringd audiod timerd stationd webd"
 core_pids() { for s in $CORE; do pidof $s || echo none; done | tr '\n' ' '; }
-left=$hold; bad=0; seen=""
+left=$hold; bad=0; seen=""; since=0; saved=""
+[ -n "$CH" ] && set_mode client
 while [ "$hold" = 0 ] || [ $left -gt 0 ]; do
-	sleep 10; left=$((left - 10))
+	sleep 10; left=$((left - 10)); since=$((since + 10))
 	[ -n "$CH" ] || continue
+	# a network saved in the panel: tried now
+	changed=""
+	[ -e $R/run/station/wifi-changed ] && { rm -f $R/run/station/wifi-changed; changed=yes; build_net; }
+	case $MODE in
+	ap)
+		# the timer's look waits while a phone is on the access point (someone
+		# may be typing a password), up to three rounds
+		phone=""
+		$CH iw dev wlan0 station dump 2>/dev/null | grep -q "^Station" && [ $since -lt $((AP_RETRY * 3)) ] && phone=yes
+		if [ -n "$changed" ] || { [ $since -ge $AP_RETRY ] && [ -z "$phone" ]; }; then
+			say "leaving the access point to look for the known networks (${changed:+a network was saved}${changed:-every ${AP_RETRY}s})"
+			stop_ap
+			saved=$changed
+			start_client && { set_mode try; since=0; } || { start_ap; since=0; }
+		fi
+		;;
+	try)
+		if net_up; then
+			say "network back: $($CH wpa_cli -i wlan0 status 2>/dev/null | sed -n 's/^ssid=//p')"
+			rm -f $R/run/station/net-failed
+			set_mode client; bad=0
+		elif [ $since -ge $TRY_FOR ]; then
+			say "none of the known networks within ${TRY_FOR}s: the access point again"
+			# a network just saved did not work: the page says so when the
+			# phone is back on the access point (a wrong password?)
+			[ -n "$saved" ] && date +%s > $R/run/station/net-failed
+			start_ap; since=0
+		fi
+		;;
+	client)
+		if [ -n "$changed" ] && ! net_up; then
+			write_wpa ""
+			$CH wpa_cli -i wlan0 reconfigure >/dev/null
+		fi
+		;;
+	esac
 	keep_base
 	if net_up; then
 		[ $bad -ge $NET_GRACE ] && say "network back"
@@ -455,8 +640,14 @@ while [ "$hold" = 0 ] || [ $left -gt 0 ]; do
 	else
 		bad=$((bad + 10))
 		[ $bad = $NET_GRACE ] && say "no network for ${bad}s: the ring shows it, still trying"
-		# now and then a push: look for the networks again
-		[ $((bad % 120)) = 0 ] && $CH wpa_cli -i wlan0 reassociate >/dev/null
+		if [ $MODE = client ]; then
+			# now and then a push: look for the networks again
+			[ $((bad % 120)) = 0 ] && $CH wpa_cli -i wlan0 reassociate >/dev/null
+			# no network for AP_AFTER, or none known at all: the access point
+			if [ $bad -ge $AP_AFTER ] || [ ! -s /tmp/net ]; then
+				start_ap; since=0
+			fi
+		fi
 	fi
 	want=false; [ $bad -ge $NET_GRACE ] && want=true
 	if [ -S $R/run/ringd.sock ] && ! chroot $R /opt/station/bin/ringd ctl status 2>/dev/null | grep -q "\"offline\":$want"; then
