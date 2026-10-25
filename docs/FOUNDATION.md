@@ -48,6 +48,13 @@ cause. Fixed in this order; each one struck out here when done.
    ringing and re-asserts it, audiod owns the volume (ringd sends relative
    turns), stationd owns pairing, ringd only shows; previews are a ringd
    overlay that expires by itself and touches nothing.
+   **Done:** the rules are written down in `os/bus` (one owner; an owner
+   says again what it owns on every reconnect; snapshot first, then
+   events). timerd keeps the ringing in its state file and tells ringd until
+   it has taken it; audiod follows timerd for the bell, ringd for `dial ±n`;
+   stationd has its own socket for the pairing window; ringd's `preview`;
+   the panel names the scene ringd reports. Checked on the Station: a
+   preview and a ringd restart while a timer rings leave it ringing.
 2. **Losing the network resets the Station into Android.** The health loop in
    init stops the watchdog after 60 s without Wi-Fi; DHCP runs once (`-q`, no
    renewal); `wpa_supplicant` is restarted with `killall; sleep 0.3`; the
@@ -60,7 +67,9 @@ cause. Fixed in this order; each one struck out here when done.
    write to every subscriber with a blocking write while holding the state
    lock; a suspended phone tab behind webd's event relay can stop the LEDs and
    the buttons. Fix: per-subscriber queues, sends outside the lock, a slow
-   subscriber is dropped.
+   subscriber is dropped. **Done:** `bus::Hub` (each subscriber its own
+   queue and writer; full queue — dropped), in ringd, timerd and playerd;
+   webd's event relay has a write timeout.
 4. **Supervision by sleeps.** `start` restarts after a fixed 2 s with no
    backoff or crash count; `bluetooth` starts its daemons with `pgrep || … &
    sleep 1` and never restarts them; `clock` kills an orphaned chronyd and
