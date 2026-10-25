@@ -32,3 +32,66 @@ Services read other programs' text output (`bluetoothctl`, `busctl`, `wpa_cli`,
 breaks silently on an upgrade. Plan: talk to the interfaces themselves —
 D-Bus for BlueZ and wpa_supplicant, ALSA controls through the kernel API —
 service by service, with tests like the ring's (`ringd/src/rules.rs`).
+
+## Crutches found (review of 2026-10-25)
+
+Places where a symptom is hidden instead of the cause fixed, grouped by the
+cause. Fixed in this order; each one struck out here when done.
+
+1. **Two owners of one thing.** The panel's scene preview sends real ringd
+   commands (`alert off` silences a ringing alarm, `bt pairing` opens a real
+   pairing window, `timer off` hides a running timer); an alarm's `alert on`
+   is sent once and lost if ringd is restarting; "timer done" is decided both
+   by ringd's countdown and by timerd; the volume is counted by ringd (from 50
+   after a restart) and kept by audiod; the pairing window lives in stationd
+   but is read back from ringd's status. Fix: one owner each — timerd owns
+   ringing and re-asserts it, audiod owns the volume (ringd sends relative
+   turns), stationd owns pairing, ringd only shows; previews are a ringd
+   overlay that expires by itself and touches nothing.
+2. **Losing the network resets the Station into Android.** The health loop in
+   init stops the watchdog after 60 s without Wi-Fi; DHCP runs once (`-q`, no
+   renewal); `wpa_supplicant` is restarted with `killall; sleep 0.3`; the
+   sound setup and its hand-over mark run only if DHCP succeeded; the
+   `wpa_supplicant` debug log grows in RAM. Fix: the network is a supervised
+   service (supplicant, udhcpc kept running, dropbear), the ring shows
+   `offline`, sound comes up on its own; the watchdog resets only if init or
+   the core services are stuck.
+3. **A stalled subscriber freezes the ring.** ringd (and timerd, playerd)
+   write to every subscriber with a blocking write while holding the state
+   lock; a suspended phone tab behind webd's event relay can stop the LEDs and
+   the buttons. Fix: per-subscriber queues, sends outside the lock, a slow
+   subscriber is dropped.
+4. **Supervision by sleeps.** `start` restarts after a fixed 2 s with no
+   backoff or crash count; `bluetooth` starts its daemons with `pgrep || … &
+   sleep 1` and never restarts them; `clock` kills an orphaned chronyd and
+   sleeps; ringd's button threads return on an error and stay dead while the
+   process lives; updates restart by `pkill`; webd's own service list misses
+   audiod. Fix: every daemon its own supervised entry (exec, no orphans),
+   ordered by waiting for what it needs (D-Bus names), backoff and a visible
+   crash count, one restart routine, the list read from `start`.
+5. **The fallback is the old system.** A failed new root filesystem falls
+   back to Debian in `/data` without the persist binds (old timers, Wi-Fi,
+   volume), while `rootfs.old` is kept and never used; the rootfs is accepted
+   on network + SSH alone; it is built from the live Debian mirror, not
+   pinned; an unreadable `timers.json` is silently replaced. Fix: fall back to
+   `rootfs.old` with the same binds; accept on the core services; build from a
+   fixed snapshot; keep a broken state file aside.
+6. **Time.** The zone is applied in four places with four copies of the
+   default; alarms are scheduled once and ignore a zone change or a clock step
+   (all ring at once after chrony steps a late clock). Fix: one zone helper;
+   reschedule on a zone change and on a clock step (`TFD_TIMER_CANCEL_ON_SET`),
+   skip alarms long overdue.
+7. **Text glue** (see above), with one live bug: SSIDs with non-ASCII
+   characters come out of `wpa_cli` escaped, so they can't be added or
+   forgotten. Status lines are matched with `contains` in five places; the
+   panel picks music error banners by regex on yt-dlp's English text. Fix:
+   D-Bus for wpa_supplicant and BlueZ, JSON status everywhere, error kinds
+   from playerd.
+8. **The panel.** Fetch errors shown as normal values ("будильника нет" when
+   timerd is down); ring state patched by events and overwritten by a 5 s poll
+   (events miss direction and timeouts, no snapshot on subscribe); ringd's
+   scene priority copied twice (the copies disagree); the ring's timer counted
+   down on the browser's clock; stale poll responses overwrite newer state;
+   update has no follow-through; device lists hardcoded (log sources already
+   out of date). Fix: snapshot-then-events from the device, the scene name
+   from ringd, per-source error states, one poll helper.
