@@ -127,4 +127,11 @@ cause. Fixed in this order; each one struck out here when done.
    down on the browser's clock; stale poll responses overwrite newer state;
    update has no follow-through; device lists hardcoded (log sources already
    out of date). Fix: snapshot-then-events from the device, the scene name
-   from ringd, per-source error states, one poll helper.
+   from ringd, per-source error states, one poll helper. **Done:** the ring
+   from ringd's stream (snapshot first), the scene named by ringd; `poll.ts`
+   (one request at a time, answers older than a command dropped, errors
+   apart from data) on every page; failed reads say so; countdowns on the
+   Station's clock (timerd's `now`); log sources and service states from
+   the device; update waits for the new version and reloads; pages change
+   without a reload (sealui's NavigationProvider); errors of webd read as
+   text or JSON.
