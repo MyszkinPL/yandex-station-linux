@@ -1,0 +1,45 @@
+name: rootfs
+
+# The Station's root filesystem from Debian packages (rootfs/packages), built
+# the same way every time; the Station installs it with `update rootfs`.
+on:
+  push:
+    branches: [main]
+    paths: ['rootfs/**', 'scripts/build-rootfs.sh', '.github/workflows/rootfs.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: rootfs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write     # the os-latest release
+
+jobs:
+  rootfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      # arm64 maintainer scripts run under qemu (binfmt)
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mmdebstrap qemu-user-static binfmt-support debian-archive-keyring arch-test
+          arch-test arm64
+      - name: Build
+        run: sudo -E scripts/build-rootfs.sh
+      - name: Publish for the Station
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view os-latest > /dev/null 2>&1 ||
+            gh release create os-latest --prerelease --title "Userspace for the Station" --notes "Built from main by CI."
+          gh release upload os-latest out/rootfs-arm64.tar.gz out/rootfs-arm64.tar.gz.sha256 out/rootfs-VERSION --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootfs
+          path: out/rootfs-*
+          retention-days: 30

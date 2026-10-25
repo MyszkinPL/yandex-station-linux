@@ -1,0 +1,31 @@
+# Debian packages of the Station's root filesystem (scripts/build-rootfs.sh),
+# on top of minbase. Only what the services and the boot use; each line says
+# who needs it. Recommends are not installed.
+
+# network: init brings Wi-Fi up with these
+wpasupplicant
+iw
+iproute2
+# SSH (init starts it)
+dropbear-bin
+ca-certificates
+curl
+# Bluetooth speaker (os/station/bin/bluetooth, webd btplayer)
+bluez
+bluez-alsa-utils
+bluez-tools
+dbus
+# busctl: webd reads the phone's player from BlueZ
+systemd
+# sound: amixer for the amplifiers and mics (init, audiod), aplay for playerd/audiod
+alsa-utils
+# time (os/station/bin/clock); zone files for the time zone setting
+chrony
+tzdata
+# pgrep/pkill/ps (start, update, install-os), killall
+procps
+psmisc
+# looking at the hardware when something is off
+i2c-tools
+e2fsprogs
+less
