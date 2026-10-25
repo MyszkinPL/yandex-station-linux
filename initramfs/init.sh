@@ -267,6 +267,46 @@ if [ -x $R/opt/station/start ]; then
 	say "services started"
 fi
 
+# The way back to Android that needs nothing but a hand: the Alice key held
+# for HOLD_KEY seconds, the Station running. (Not at power-on: held while the
+# power comes on it is the factory reset of the vendor U-Boot.) Read here in
+# init, not by our services, so it works whatever they or the network do.
+# The ring shows "no" just before. One event per dd: struct input_event on
+# 64-bit is 24 bytes (timeval 16, type, code, value); as hex, type is chars
+# 33-36, code 37-40, value 41-48, little-endian (EV_KEY 0100, KEY_ASSISTANT
+# 0x247 4702; value 01000000 down, 00000000 up, 02000000 repeat).
+HOLD_KEY=10
+key_watch() {
+	dev=""
+	for e in /sys/class/input/event*; do
+		[ "$(cat $e/device/name 2>/dev/null)" = gpio-keys ] && dev=/dev/input/${e##*/}
+	done
+	[ -n "$dev" ] || { say "no key device: no Alice-key way back to Android"; return; }
+	say "Alice key held ${HOLD_KEY}s: back to Android ($dev)"
+	timer=""
+	while :; do
+		ev=$(dd if=$dev bs=24 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+		[ ${#ev} = 48 ] || { sleep 1; continue; }
+		[ "$(echo $ev | cut -c33-40)" = 01004702 ] || continue
+		case $(echo $ev | cut -c41-48) in
+		01000000)
+			[ -n "$timer" ] && kill $timer 2>/dev/null
+			(
+				sleep $HOLD_KEY
+				[ -S $R/run/ringd.sock ] && chroot $R /opt/station/bin/ringd ctl preview error 30 >/dev/null
+				to_android "the Alice key held ${HOLD_KEY}s"
+			) &
+			timer=$!
+			;;
+		00000000)
+			[ -n "$timer" ] && kill $timer 2>/dev/null
+			timer=""
+			;;
+		esac
+	done
+}
+key_watch &
+
 if [ -x $R/usr/sbin/wpa_supplicant ]; then
 	CH="chroot $R /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root"
 	say "hints: freq=${HINT_FREQ:-none} ip=${HINT_IP:-none}"
@@ -649,9 +689,15 @@ while [ "$hold" = 0 ] || [ $left -gt 0 ]; do
 			fi
 		fi
 	fi
-	want=false; [ $bad -ge $NET_GRACE ] && want=true
-	if [ -S $R/run/ringd.sock ] && ! chroot $R /opt/station/bin/ringd ctl status 2>/dev/null | grep -q "\"offline\":$want"; then
-		chroot $R /opt/station/bin/ringd ctl offline $([ $want = true ] && echo on || echo off) >/dev/null
+	# the ring: "no network", and "join my access point" over it while it is up
+	if [ -S $R/run/ringd.sock ]; then
+		ring=$(chroot $R /opt/station/bin/ringd ctl status 2>/dev/null)
+		want=false; [ $bad -ge $NET_GRACE ] && want=true
+		echo "$ring" | grep -q "\"offline\":$want" ||
+			chroot $R /opt/station/bin/ringd ctl offline $([ $want = true ] && echo on || echo off) >/dev/null
+		want=false; [ $MODE = ap ] && want=true
+		echo "$ring" | grep -q "\"setup\":$want" ||
+			chroot $R /opt/station/bin/ringd ctl setup $([ $want = true ] && echo on || echo off) >/dev/null
 	fi
 	# a root filesystem on trial is ours once all its core services run and
 	# none of them restarted between two looks
