@@ -85,6 +85,14 @@ cause. Fixed in this order; each one struck out here when done.
    audiod. Fix: every daemon its own supervised entry (exec, no orphans),
    ordered by waiting for what it needs (D-Bus names), backoff and a visible
    crash count, one restart routine, the list read from `start`.
+   **Done:** runit (`os/station/sv`): every service a directory whose ./run
+   execs it, Bluetooth split into dbus, bluetoothd, bluealsa, bt-agent and
+   bt-aplay, each waiting in its ./run for the D-Bus name it needs; a quick
+   death waits longer each time (1 … 60 s) and is counted
+   (`/run/station/crashes`); `bin/services` is the one way to sync and
+   restart, for update and install-os; webd lists what runit has. ringd's
+   input threads wait for their device and reopen it (with the ownership
+   work).
 5. **The fallback is the old system.** A failed new root filesystem falls
    back to Debian in `/data` without the persist binds (old timers, Wi-Fi,
    volume), while `rootfs.old` is kept and never used; the rootfs is accepted
@@ -94,13 +102,18 @@ cause. Fixed in this order; each one struck out here when done.
    fixed snapshot; keep a broken state file aside. **Done:** only a new root
    filesystem is on trial (rootfs.try from `update rootfs-install`, one boot),
    accepted when the core services run without restarting, else back to
-   `rootfs.old`; a broken timers.json is kept as `.broken`. Left: the pinned
-   build.
+   `rootfs.old`; a broken timers.json is kept as `.broken`; the build comes
+   from a fixed Debian snapshot (`rootfs/snapshot`).
 6. **Time.** The zone is applied in four places with four copies of the
    default; alarms are scheduled once and ignore a zone change or a clock step
    (all ring at once after chrony steps a late clock). Fix: one zone helper;
    reschedule on a zone change and on a clock step (`TFD_TIMER_CANCEL_ON_SET`),
-   skip alarms long overdue.
+   skip alarms long overdue. **Done:** `bin/timezone` is the one place
+   (default included); services read `/etc/localtime`, no `setenv("TZ")` in
+   threaded processes; a zone change restarts timerd and stationd, so alarms
+   are planned anew; timerd sees a clock step (wall against monotonic, every
+   second): timers move along, alarms are planned again; an alarm more than
+   5 min late does not ring late.
 7. **Text glue** (see above), with one live bug: SSIDs with non-ASCII
    characters come out of `wpa_cli` escaped, so they can't be added or
    forgotten. Status lines are matched with `contains` in five places; the
