@@ -23,6 +23,8 @@ MISC_START=4464640          # sectors
 MISC_SECTORS=32768          # 16 MiB
 DATA_START=12559356         # Android /data (ext4), mounted read-only
 DATA_SECTORS=2710532
+CACHE_START=4562944         # Android /cache (ext4): our persistent layer lives
+CACHE_SECTORS=3145728       # in its station/ directory, the rest is Android's
 LOG_SEEK=3072               # 4 KiB blocks -> 12 MiB into misc
 LOG_BLOCKS=1024             # 4 MiB, up to the end of misc
 MAGIC=STATION-MAINLINE
@@ -39,7 +41,7 @@ part_at() {
 	[ $c = 1 ] && echo $n
 }
 
-HOLD_OK=7200               # dev session; station-reboot ends it early
+HOLD_OK=0                  # 0: stay for as long as the network is up
 HOLD_FAIL=15
 for a in $(cat /proc/cmdline); do
 	case "$a" in station.hold=*) HOLD_OK=${a#station.hold=}; HOLD_FAIL=$HOLD_OK ;; esac
@@ -54,7 +56,8 @@ i=0
 while [ -z "$(part_at $MISC_START $MISC_SECTORS)" ] && [ $i -lt 40 ]; do sleep 0.25; i=$((i+1)); done
 P=$(part_at $MISC_START $MISC_SECTORS)
 DATA=$(part_at $DATA_START $DATA_SECTORS)
-say "misc: ${P:-not found}, data: ${DATA:-not found}"
+CACHE=$(part_at $CACHE_START $CACHE_SECTORS)
+say "misc: ${P:-not found}, data: ${DATA:-not found}, cache: ${CACHE:-not found}"
 for d in /sys/class/block/mmcblk*p*; do echo "  ${d##*/} $(cat $d/start) $(cat $d/size)"; done >> $L
 why=""
 [ -n "$P" ] && [ -b /dev/$P ] || why="no misc partition"
@@ -148,22 +151,47 @@ else
 	dmesg | grep -iE "brcm|mmc1|sdio|pwrseq" >> $L
 fi
 
-# --- Debian tools from Android /data, read-only, through a RAM overlay ---
+# --- Debian tools from Android /data, read-only, under a layer of our own ---
+# The layer (everything installed or changed in Debian, our services in
+# /opt/station) is kept on the flash in /cache/station, so it survives a
+# reboot and costs no RAM. If /cache cannot be used the layer is in RAM, as
+# before: the Station still comes up, only without its changes.
+# station/root.reset on the flash: start this boot from a clean layer.
 R=/newroot
 if [ -e /sys/class/net/wlan0 ]; then
 	blockdev --setro /dev/$DATA
-	mkdir -p /mnt/data /run/ovl $R
+	mkdir -p /mnt/data /mnt/cache /run/ovl $R
 	if mount -t ext4 -o ro,noload /dev/$DATA /mnt/data && [ -x /mnt/data/local/debian/usr/sbin/wpa_supplicant ]; then
-		mount -t tmpfs tmpfs /run/ovl
-		mkdir -p /run/ovl/u /run/ovl/w
-		mount -t overlay overlay -o lowerdir=/mnt/data/local/debian,upperdir=/run/ovl/u,workdir=/run/ovl/w $R
+		upper=""
+		if [ -n "$CACHE" ] && mount -t ext4 -o rw,noatime /dev/$CACHE /mnt/cache; then
+			C=/mnt/cache/station
+			if [ -e $C/root.reset ]; then
+				rm -rf $C/root $C/work $C/root.reset && say "persistent layer reset"
+			fi
+			mkdir -p $C/root $C/work && upper=$C/root work=$C/work
+		fi
+		if [ -n "$upper" ] && mount -t overlay overlay -o lowerdir=/mnt/data/local/debian,upperdir=$upper,workdir=$work $R; then
+			say "debian overlay ready, layer on flash ($(df -h /mnt/cache | awk 'NR == 2 { print $4 }') free)"
+		else
+			mount -t tmpfs tmpfs /run/ovl
+			mkdir -p /run/ovl/u /run/ovl/w
+			mount -t overlay overlay -o lowerdir=/mnt/data/local/debian,upperdir=/run/ovl/u,workdir=/run/ovl/w $R
+			say "debian overlay ready, layer in RAM (${CACHE:-no cache}: not usable)"
+		fi
 		for m in proc sys dev dev/pts; do mount --bind /$m $R/$m; done
 		mount -t tmpfs tmpfs $R/run
 		mount -t tmpfs tmpfs $R/tmp
-		say "debian overlay ready"
 	else
 		say "cannot mount /data or no debian tools"
 	fi
+fi
+
+# --- our services (/opt/station/start): before the network, so the ring
+# shows the boot and the buttons work at once; each is kept running ---
+if [ -x $R/opt/station/start ]; then
+	chroot $R /usr/bin/env -i PATH=/opt/station/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+		/opt/station/start >> $L 2>&1 &
+	say "services started"
 fi
 
 if [ -x $R/usr/sbin/wpa_supplicant ]; then
@@ -293,7 +321,11 @@ fi
 
 writelog "$result"
 [ "$result" = ok ] && hold=$HOLD_OK || hold=$HOLD_FAIL
-say "result: $result, staying up ${hold}s, then watchdog reset to Android"
+if [ "$hold" = 0 ]; then
+	say "result: $result, staying up while the network is"
+else
+	say "result: $result, staying up ${hold}s, then watchdog reset to Android"
+fi
 
 # While up, a Station we cannot reach is useless: if Wi-Fi or SSH stays
 # down for NET_GRACE seconds, give up and let the watchdog take us back to
@@ -306,7 +338,7 @@ healthy() {
 		pidof dropbear >/dev/null
 }
 left=$hold; bad=0
-while [ $left -gt 0 ]; do
+while [ "$hold" = 0 ] || [ $left -gt 0 ]; do
 	sleep 10; left=$((left - 10))
 	[ "$result" = ok ] || continue
 	if healthy; then
