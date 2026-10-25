@@ -62,7 +62,14 @@ cause. Fixed in this order; each one struck out here when done.
    `wpa_supplicant` debug log grows in RAM. Fix: the network is a supervised
    service (supplicant, udhcpc kept running, dropbear), the ring shows
    `offline`, sound comes up on its own; the watchdog resets only if init or
-   the core services are stuck.
+   the core services are stuck. **Done (E15):** init keeps the base —
+   dropbear and wpa_supplicant started again if gone, udhcpc runs for good
+   (renews, and asks again on every reconnection through wpa_cli's action),
+   the channel hint is dropped after the boot, the supplicant's debug log
+   only while it connects; the ring shows "offline" after 30 s, and init
+   never resets for the network. Sound comes up before Wi-Fi. Checked: a
+   disconnect showed "offline" and came back by itself after 2 min; a killed
+   wpa_supplicant was back in 10 s.
 3. **A stalled subscriber freezes the ring.** ringd (and timerd, playerd)
    write to every subscriber with a blocking write while holding the state
    lock; a suspended phone tab behind webd's event relay can stop the LEDs and
@@ -84,7 +91,11 @@ cause. Fixed in this order; each one struck out here when done.
    on network + SSH alone; it is built from the live Debian mirror, not
    pinned; an unreadable `timers.json` is silently replaced. Fix: fall back to
    `rootfs.old` with the same binds; accept on the core services; build from a
-   fixed snapshot; keep a broken state file aside.
+   fixed snapshot; keep a broken state file aside. **Done:** only a new root
+   filesystem is on trial (rootfs.try from `update rootfs-install`, one boot),
+   accepted when the core services run without restarting, else back to
+   `rootfs.old`; a broken timers.json is kept as `.broken`. Left: the pinned
+   build.
 6. **Time.** The zone is applied in four places with four copies of the
    default; alarms are scheduled once and ignore a zone change or a clock step
    (all ring at once after chrony steps a late clock). Fix: one zone helper;

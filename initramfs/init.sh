@@ -41,8 +41,8 @@ part_at() {
 	[ $c = 1 ] && echo $n
 }
 
-HOLD_OK=0                  # 0: stay for as long as the network is up
-HOLD_FAIL=15
+HOLD_OK=0                  # 0: stay (station.hold=N on the command line:
+HOLD_FAIL=0                # N seconds, then back to Android; for trying kernels)
 for a in $(cat /proc/cmdline); do
 	case "$a" in station.hold=*) HOLD_OK=${a#station.hold=}; HOLD_FAIL=$HOLD_OK ;; esac
 done
@@ -158,11 +158,13 @@ fi
 # bound in: /opt/station (services, settings, Wi-Fi networks), the Bluetooth
 # pairings, chrony's drift, the SSH host key. /cache/station itself is
 # /station inside.
-# A new root filesystem is tried once: init marks the try and clears the mark
-# when the network and SSH are up; a boot that never got there leaves the
-# mark, and the next one puts that root filesystem aside (rootfs.failed) and
-# comes up on the old way below.
-# The old way, while there is no root filesystem of ours: Debian from
+# A new root filesystem (update rootfs-install leaves rootfs.try) is tried
+# once: that boot turns the mark into rootfs.trying, and the health loop
+# below removes it once our services have run steadily on it. A boot that
+# never got there leaves rootfs.trying, and the next one puts that root
+# filesystem aside (rootfs.failed) and comes up on the one before it
+# (rootfs.old), with the same kept state.
+# The last way out, with no root filesystem of ours at all: Debian from
 # Android's /data, read-only, under a layer kept in /cache/station/root (in
 # RAM if /cache cannot be used). station/root.reset: start that layer clean.
 R=/newroot
@@ -175,13 +177,19 @@ if [ -e /sys/class/net/wlan0 ]; then
 	C=/mnt/cache/station
 	if [ -n "$CACHE" ] && mount -t ext4 -o rw,noatime /dev/$CACHE /mnt/cache; then
 		mkdir -p $C
-		if [ -e $C/rootfs.try ] && [ -d $C/rootfs ]; then
+		# one replaced while it was still on trial (update rootfs-install)
+		rm -rf $C/rootfs.untried
+		if [ -e $C/rootfs.trying ]; then
 			rm -rf $C/rootfs.failed
-			mv $C/rootfs $C/rootfs.failed && rm -f $C/rootfs.try
-			say "root filesystem did not come up last time: put aside as rootfs.failed"
+			[ -d $C/rootfs ] && mv $C/rootfs $C/rootfs.failed
+			[ -d $C/rootfs.old ] && mv $C/rootfs.old $C/rootfs
+			rm -f $C/rootfs.trying && sync
+			say "the new root filesystem did not come up: put aside as rootfs.failed, back on the one before"
+		elif [ -e $C/rootfs.try ]; then
+			mv $C/rootfs.try $C/rootfs.trying && sync
+			say "trying the new root filesystem"
 		fi
 		if [ -x $C/rootfs/usr/sbin/wpa_supplicant ] && [ -x $C/rootfs/usr/sbin/dropbear ]; then
-			touch $C/rootfs.try && sync
 			mount -t tmpfs tmpfs /run/ovl
 			mkdir -p /run/ovl/u /run/ovl/w
 			if mount -t overlay overlay -o lowerdir=$C/rootfs,upperdir=/run/ovl/u,workdir=/run/ovl/w $R; then
@@ -248,6 +256,74 @@ if [ -x $R/usr/sbin/wpa_supplicant ]; then
 	CH="chroot $R /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root"
 	say "hints: freq=${HINT_FREQ:-none} ip=${HINT_IP:-none}"
 
+	# Sound: the drivers are built in and probe on their own (the amplifiers
+	# asynchronously, ~0.5 s each); once both cards are there, set the mic
+	# ADCs up and give the speakers a quiet volume — the safe level if
+	# nothing else ever sets one. Then /run/station/sound-ready hands the
+	# speakers over (whatever came of it): audiod waits for it and from then
+	# on alone owns the volume. Not tied to the network: alarms sound without
+	# it. In the background, so it holds nothing up.
+	(
+		i=0
+		while ! { [ -e /proc/asound/snddaudio0 ] && [ -e /proc/asound/snddaudio1 ]; } && [ $i -lt 150 ]; do
+			sleep 0.1; i=$((i+1))
+		done
+		if [ $i -ge 150 ]; then
+			say "sound: cards missing after 15 s"
+		elif cp /etc/station/station-audio-init.sh /etc/station/station-mics-init.sh $R/run/ &&
+		     $CH sh /run/station-audio-init.sh >> $L 2>&1; then
+			say "sound ready"
+		else
+			say "sound: setup failed"
+		fi
+		mkdir -p $R/run/station && echo done > $R/run/station/sound-ready
+	) &
+
+	# SSH from the start, whatever the network does: dropbear listens on
+	# every address the Station gets, now or later
+	mkdir -p $R/root/.ssh && chmod 700 $R/root/.ssh
+	cp /etc/station/authorized_keys $R/root/.ssh/authorized_keys && chmod 600 $R/root/.ssh/authorized_keys
+	mkdir -p $R/etc/dropbear
+	$CH dropbear -R -E -p 22 >> $L 2>&1
+
+	mkdir -p $R/usr/local/sbin
+	cat > $R/usr/local/sbin/station-reboot <<'RB'
+#!/bin/sh
+# Leave mainline: stop feeding the watchdog; the SoC resets within 16 s.
+echo "station: resetting through the watchdog" > /dev/kmsg
+pkill -9 -x watchdog
+RB
+	chmod 755 $R/usr/local/sbin/station-reboot
+	cp /bin/kexec $R/usr/local/sbin/kexec
+	cat > $R/usr/local/sbin/station-kexec <<'KX'
+#!/bin/sh
+# Start another mainline kernel without U-Boot: station-kexec Image station.dtb
+# The kernel command line comes from the new DTB's bootargs. The SoC watchdog
+# keeps running across kexec (watchdog.stop_on_reboot=0), so a kernel that
+# does not come up resets the Station back to Android within 16 s.
+set -e
+img=${1:?usage: station-kexec Image station.dtb}
+dtb=${2:?usage: station-kexec Image station.dtb}
+grep -q 'watchdog.stop_on_reboot=0' /proc/cmdline ||
+	{ echo "refusing: this kernel would stop the watchdog on kexec"; exit 1; }
+grep -aq 'watchdog.stop_on_reboot=0' "$dtb" ||
+	{ echo "refusing: $dtb bootargs lack watchdog.stop_on_reboot=0"; exit 1; }
+/usr/local/sbin/kexec -l "$img" --dtb="$dtb"
+echo "station: kexec into $img" > /dev/kmsg
+sync
+/usr/local/sbin/kexec -e
+KX
+	chmod 755 $R/usr/local/sbin/station-kexec
+	# wpa_cli's action on a (re)connection, to another access point or
+	# network too: the lease is asked for again at once
+	cat > $R/usr/local/sbin/station-net-event <<'NE'
+#!/bin/sh
+# wpa_cli -a: $1 interface, $2 CONNECTED | DISCONNECTED
+[ "$2" = CONNECTED ] && kill -USR1 "$(cat /run/udhcpc.pid 2>/dev/null)" 2>/dev/null
+exit 0
+NE
+	chmod 755 $R/usr/local/sbin/station-net-event
+
 	# Every network we know: first our own (added in the panel, kept in the
 	# persistent layer: /opt/station/etc/wifi.conf), then every one Android
 	# has saved, with only the fields a plain supplicant needs (Android adds
@@ -270,14 +346,19 @@ if [ -x $R/usr/sbin/wpa_supplicant ]; then
 	' $(ls $R/opt/station/etc/wifi.conf 2>/dev/null) /mnt/data/misc/wifi/wpa_supplicant.conf > /tmp/net
 	if [ -s /tmp/net ]; then
 		# $1 = scan_freq (empty: scan everything)
-		start_wpa() {
+		write_wpa() {
 			{
 				echo "ctrl_interface=/run/wpa_supplicant"
 				if [ -n "$1" ]; then sed "s/^@FREQ@\$/	scan_freq=$1/" /tmp/net
 				else sed "/^@FREQ@\$/d" /tmp/net; fi
 			} > $R/etc/wpa-station.conf
 			chmod 600 $R/etc/wpa-station.conf
+		}
+		# with its debug output while it connects (the boot's log shows why it
+		# did not), down to INFO once connected: the log lives in RAM
+		start_wpa() {
 			$CH wpa_supplicant -B -i wlan0 -D nl80211 -c /etc/wpa-station.conf -f /run/wpa.log -d
+			$CH wpa_cli -i wlan0 -a /usr/local/sbin/station-net-event -B
 		}
 		# up to $1 tenths of a second for the 4-way handshake to complete
 		wait_wpa() {
@@ -288,122 +369,112 @@ if [ -x $R/usr/sbin/wpa_supplicant ]; then
 			done
 			return 1
 		}
-		if [ -n "$HINT_FREQ" ]; then
-			start_wpa $HINT_FREQ
-			if ! wait_wpa 40; then
-				say "not connected on hinted $HINT_FREQ MHz, scanning all channels"
-				killall wpa_supplicant; sleep 0.3
-				start_wpa ""
-				wait_wpa 450
-			fi
-		else
-			start_wpa ""
-			wait_wpa 450
+		write_wpa "$HINT_FREQ"
+		start_wpa
+		if [ -n "$HINT_FREQ" ] && ! wait_wpa 40; then
+			say "not connected on hinted $HINT_FREQ MHz, scanning all channels"
+			write_wpa ""
+			$CH wpa_cli -i wlan0 reconfigure >/dev/null
 		fi
+		wait_wpa 450
 		ln -sf $R/run/wpa.log /run/wpa.log
 		$CH iw dev wlan0 link >> $L 2>&1
 		if $CH iw dev wlan0 link 2>/dev/null | grep -q "^Connected"; then
 			say "associated with $($CH wpa_cli -i wlan0 status 2>/dev/null | sed -n 's/^ssid=//p')"
-			if udhcpc -i wlan0 -s /udhcpc.sh -n -q -t 8 -T 3 ${HINT_IP:+-r $HINT_IP}; then
-				cp /etc/resolv.conf $R/etc/resolv.conf 2>/dev/null
-				mkdir -p $R/root/.ssh && chmod 700 $R/root/.ssh
-				cp /etc/station/authorized_keys $R/root/.ssh/authorized_keys && chmod 600 $R/root/.ssh/authorized_keys
-				mkdir -p $R/etc/dropbear
-				$CH dropbear -R -E -p 22 >> $L 2>&1
-				mkdir -p $R/usr/local/sbin
-				cat > $R/usr/local/sbin/station-reboot <<'RB'
-#!/bin/sh
-# Leave mainline: stop feeding the watchdog; the SoC resets within 16 s.
-echo "station: resetting through the watchdog" > /dev/kmsg
-pkill -9 -x watchdog
-RB
-				chmod 755 $R/usr/local/sbin/station-reboot
-				cp /bin/kexec $R/usr/local/sbin/kexec
-				cat > $R/usr/local/sbin/station-kexec <<'KX'
-#!/bin/sh
-# Start another mainline kernel without U-Boot: station-kexec Image station.dtb
-# The kernel command line comes from the new DTB's bootargs. The SoC watchdog
-# keeps running across kexec (watchdog.stop_on_reboot=0), so a kernel that
-# does not come up resets the Station back to Android within 16 s.
-set -e
-img=${1:?usage: station-kexec Image station.dtb}
-dtb=${2:?usage: station-kexec Image station.dtb}
-grep -q 'watchdog.stop_on_reboot=0' /proc/cmdline ||
-	{ echo "refusing: this kernel would stop the watchdog on kexec"; exit 1; }
-grep -aq 'watchdog.stop_on_reboot=0' "$dtb" ||
-	{ echo "refusing: $dtb bootargs lack watchdog.stop_on_reboot=0"; exit 1; }
-/usr/local/sbin/kexec -l "$img" --dtb="$dtb"
-echo "station: kexec into $img" > /dev/kmsg
-sync
-/usr/local/sbin/kexec -e
-KX
-				chmod 755 $R/usr/local/sbin/station-kexec
-				i=0
-				while ! pidof dropbear >/dev/null && [ $i -lt 20 ]; do sleep 0.05; i=$((i+1)); done
-				pidof dropbear >/dev/null && result=ok
-				[ "$result" = ok ] && [ "$ROOT" = own ] && rm -f /mnt/cache/station/rootfs.try && sync
-				say "IP $(cat /tmp/ip 2>/dev/null)  ssh: $(pidof dropbear >/dev/null && echo up || echo DOWN)"
-				# Sound: the drivers are built in and probe on their own (the
-				# amplifiers asynchronously, ~0.5 s each); once both cards are
-				# there, set the mic ADCs up and give the speakers a quiet
-				# volume — the safe level if nothing else ever sets one. Then
-				# /run/station/sound-ready hands the speakers over: audiod
-				# waits for it and from then on alone owns the volume. In the
-				# background, so it never holds up the network.
-				(
-					i=0
-					while ! { [ -e /proc/asound/snddaudio0 ] && [ -e /proc/asound/snddaudio1 ]; } && [ $i -lt 150 ]; do
-						sleep 0.1; i=$((i+1))
-					done
-					if [ $i -ge 150 ]; then
-						say "sound: cards missing after 15 s"
-					elif cp /etc/station/station-audio-init.sh /etc/station/station-mics-init.sh $R/run/ &&
-					     $CH sh /run/station-audio-init.sh >> $L 2>&1; then
-						say "sound ready"
-					else
-						say "sound: setup failed"
-					fi
-					mkdir -p $R/run/station && echo done > $R/run/station/sound-ready
-				) &
-			else
-				say "DHCP failed"
-			fi
 		else
-			say "NOT associated with any of $(grep -c '^network=' /tmp/net) saved networks"
+			say "NOT associated yet with any of $(grep -c '^network=' /tmp/net) saved networks (still trying)"
 		fi
+		# the channel hint only served this boot: kept, it would stop the
+		# Station from finding its network on another channel, ever
+		if [ -n "$HINT_FREQ" ]; then
+			write_wpa ""
+			for n in $($CH wpa_cli -i wlan0 list_networks 2>/dev/null | awk 'NR > 1 { print $1 }'); do
+				$CH wpa_cli -i wlan0 set_network $n scan_freq "" >/dev/null
+			done
+		fi
+		$CH wpa_cli -i wlan0 log_level INFO >/dev/null
+		# DHCP for as long as we run: the lease is renewed, a lost one is
+		# asked for again, and a (re)connection asks at once (station-net-event)
+		export NEWROOT=$R
+		udhcpc -i wlan0 -s /udhcpc.sh -t 8 -T 3 -b -p $R/run/udhcpc.pid ${HINT_IP:+-r $HINT_IP}
+		if ip -4 addr show wlan0 2>/dev/null | grep -q "inet " && pidof dropbear >/dev/null; then
+			result=ok
+		fi
+		say "IP $(cat /tmp/ip 2>/dev/null || echo none)  ssh: $(pidof dropbear >/dev/null && echo up || echo DOWN)"
 	else
-		say "no usable network in Android wpa_supplicant.conf"
+		say "no usable network in our wifi.conf or Android's wpa_supplicant.conf"
 	fi
 fi
 
 writelog "$result"
 [ "$result" = ok ] && hold=$HOLD_OK || hold=$HOLD_FAIL
 if [ "$hold" = 0 ]; then
-	say "result: $result, staying up while the network is"
+	say "result: $result, staying up"
 else
-	say "result: $result, staying up ${hold}s, then watchdog reset to Android"
+	say "result: $result, staying up ${hold}s (station.hold), then watchdog reset to Android"
 fi
 
-# While up, a Station we cannot reach is useless: if Wi-Fi or SSH stays
-# down for NET_GRACE seconds, give up and let the watchdog take us back to
-# Android instead of feeding it for the rest of the hold. Only initramfs
-# tools here, so a broken Debian overlay cannot stop the check itself.
-NET_GRACE=60
-healthy() {
+# While up, init keeps the base: the network and SSH. Without the network
+# the Station goes on — alarms, timers, Bluetooth and the ring do not need
+# it — shows it on the ring, and gets it back; losing it is never a reason
+# to leave (a reset goes to Android). Whatever of the base died is started
+# again. The SoC watchdog stays fed: it is for a hung kernel.
+# The ring's "offline" is init's to say: told again when ringd has lost it
+# (a restart), as every owner does.
+NET_GRACE=30
+net_up() {
 	[ "$(cat /sys/class/net/wlan0/operstate 2>/dev/null)" = up ] &&
-		ip -4 addr show wlan0 2>/dev/null | grep -q "inet " &&
-		pidof dropbear >/dev/null
+		ip -4 addr show wlan0 2>/dev/null | grep -q "inet "
 }
-left=$hold; bad=0
+keep_base() {
+	pidof dropbear >/dev/null || { say "dropbear was gone: starting it again"; $CH dropbear -R -E -p 22 >> $L 2>&1; }
+	[ -s /tmp/net ] || return
+	if ! pidof wpa_supplicant >/dev/null; then
+		say "wpa_supplicant was gone: starting it again"
+		$CH pkill -x wpa_cli
+		start_wpa
+		$CH wpa_cli -i wlan0 log_level INFO >/dev/null
+	fi
+	pidof wpa_cli >/dev/null || $CH wpa_cli -i wlan0 -a /usr/local/sbin/station-net-event -B
+	if ! kill -0 "$(cat $R/run/udhcpc.pid 2>/dev/null)" 2>/dev/null; then
+		say "udhcpc was gone: starting it again"
+		udhcpc -i wlan0 -s /udhcpc.sh -t 8 -T 3 -b -p $R/run/udhcpc.pid
+	fi
+}
+# the pids of our core services (a restart changes one)
+CORE="ringd audiod timerd stationd webd"
+core_pids() { for s in $CORE; do pidof $s || echo none; done | tr '\n' ' '; }
+left=$hold; bad=0; seen=""
 while [ "$hold" = 0 ] || [ $left -gt 0 ]; do
 	sleep 10; left=$((left - 10))
-	[ "$result" = ok ] || continue
-	if healthy; then
+	[ -n "$CH" ] || continue
+	keep_base
+	if net_up; then
+		[ $bad -ge $NET_GRACE ] && say "network back"
 		bad=0
 	else
 		bad=$((bad + 10))
-		say "health check failed (${bad}s of ${NET_GRACE}s)"
-		[ $bad -ge $NET_GRACE ] && { result="$result, net lost"; break; }
+		[ $bad = $NET_GRACE ] && say "no network for ${bad}s: the ring shows it, still trying"
+		# now and then a push: look for the networks again
+		[ $((bad % 120)) = 0 ] && $CH wpa_cli -i wlan0 reassociate >/dev/null
+	fi
+	want=false; [ $bad -ge $NET_GRACE ] && want=true
+	if [ -S $R/run/ringd.sock ] && ! chroot $R /opt/station/bin/ringd ctl status 2>/dev/null | grep -q "\"offline\":$want"; then
+		chroot $R /opt/station/bin/ringd ctl offline $([ $want = true ] && echo on || echo off) >/dev/null
+	fi
+	# a root filesystem on trial is ours once all its core services run and
+	# none of them restarted between two looks
+	if [ -e /mnt/cache/station/rootfs.trying ] && [ "$ROOT" = own ]; then
+		now=$(core_pids)
+		case "$now" in
+		*none*) seen="" ;;
+		*) if [ "$now" = "$seen" ]; then
+			rm -f /mnt/cache/station/rootfs.trying && sync
+			say "the new root filesystem works: kept"
+		   else
+			seen=$now
+		   fi ;;
+		esac
 	fi
 done
 writelog "$result, final"
