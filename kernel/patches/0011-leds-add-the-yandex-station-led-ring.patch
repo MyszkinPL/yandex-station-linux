@@ -129,7 +129,7 @@ new file mode 100644
 index 0000000..6a60fb7
 --- /dev/null
 +++ b/drivers/leds/leds-yandex-ring.c
-@@ -0,0 +1,555 @@
+@@ -0,0 +1,572 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * LED ring of the Yandex Station (YNDX-0001): 24 RGB LEDs on two Si-En SN3236
@@ -188,6 +188,8 @@ index 0000000..6a60fb7
 +#define RING_LEDS_PER_CHIP	12
 +#define RING_LEDS		(RING_CHIPS * RING_LEDS_PER_CHIP)
 +#define RING_FRAME		(RING_LEDS * 3)	/* R, G, B per LED */
++/* chip init at probe: again after a bus recovery, this many times in all */
++#define RING_INIT_TRIES		3
 +
 +/* R, G, B -> output offset from the first output of an LED (that is G) */
 +static const u8 ring_rgb_out[3] = { 1, 0, 2 };
@@ -582,7 +584,7 @@ index 0000000..6a60fb7
 +	struct gpio_descs *sdb;
 +	struct i2c_client *second;
 +	struct ring *r;
-+	int ret;
++	int ret, try;
 +
 +	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
 +		return dev_err_probe(dev, -EOPNOTSUPP, "adapter lacks plain I2C\n");
@@ -631,9 +633,24 @@ index 0000000..6a60fb7
 +	r->chip[1] = second;
 +	i2c_set_clientdata(client, r);
 +
-+	mutex_lock(&r->lock);
-+	ret = ring_hw_init(r);
-+	mutex_unlock(&r->lock);
++	/*
++	 * Stopped mid-byte at power-on, the MCU can leave a chip holding SDA
++	 * low: the first write fails. The adapter clocks the bus free (bus
++	 * recovery, from the DT) — then the chips answer: try again.
++	 */
++	for (try = 0; try < RING_INIT_TRIES; try++) {
++		if (try) {
++			dev_warn(dev, "chip init failed (%d): bus recovery, try %d\n",
++				 ret, try + 1);
++			i2c_recover_bus(client->adapter);
++			msleep(20);
++		}
++		mutex_lock(&r->lock);
++		ret = ring_hw_init(r);
++		mutex_unlock(&r->lock);
++		if (!ret)
++			break;
++	}
 +	if (ret)
 +		return dev_err_probe(dev, ret, "chip init failed\n");
 +	ret = devm_add_action_or_reset(dev, ring_hw_dark, r);
