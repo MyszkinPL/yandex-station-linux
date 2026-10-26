@@ -4,3 +4,4 @@
 *.img
 __pycache__/
 /os/target/
+/tools/*/target/
