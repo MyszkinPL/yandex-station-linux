@@ -40,7 +40,9 @@ esac
 gain() {
 	case "$1" in
 	0|1|2) echo 40,40 ;;
-	3) echo 40,1 ;;
+	# ADC3 right: the speaker amplifier's tap, the echo canceller's reference
+	# (listend sets it too): 30 dB, else it sinks in the ADC's noise
+	3) echo 40,61 ;;
 	4) echo 1,1 ;;
 	esac
 }
