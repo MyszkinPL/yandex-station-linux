@@ -630,21 +630,16 @@
 	};
 };
 
-/* vendor: twi0 400 kHz (LED drivers, mic ADC 4), twi1 200 kHz (mic ADCs 0-3, amplifiers) */
+/*
+ * vendor: twi0 400 kHz (LED drivers, mic ADC 4), twi1 200 kHz (mic ADCs 0-3, amplifiers).
+ * A locked bus (the STM32 boot animation stopped mid-byte at power-on) is
+ * clocked free by the driver through the TWI line control register
+ * (patch 0026); no "gpio" pinctrl state: sunxi pinctrl is strict, the pins
+ * cannot be GPIOs while the controller owns them.
+ */
 &i2c0 {
-	/*
-	 * Bus recovery: the STM32 boot animation drives this bus at power-on;
-	 * stopped mid-byte (the ring driver holds it in reset), a chip was
-	 * left holding SDA low and the bus stayed locked — no ring, no mic
-	 * ADC 4, no mic card, on a cold boot (2026-10-26). With the pins as
-	 * GPIOs here, i2c-mv64xxx clocks the bus free by itself when it finds
-	 * it locked (i2c_generic_scl_recovery: up to 9 SCL pulses and a STOP).
-	 */
-	pinctrl-names = "default", "gpio";
+	pinctrl-names = "default";
 	pinctrl-0 = <&i2c0_pins>;
-	pinctrl-1 = <&i2c0_gpio_pins>;
-	scl-gpios = <&pio 7 0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;	/* PH0 */
-	sda-gpios = <&pio 7 1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;	/* PH1 */
 	clock-frequency = <400000>;
 	status = "okay";
 
@@ -1082,11 +1077,6 @@
 &pio {
 	interrupt-parent = <&gic>;
 
-	/* i2c0's pins as plain GPIOs, for its bus recovery (&i2c0) */
-	i2c0_gpio_pins: i2c0-gpio-pins {
-		pins = "PH0", "PH1";
-		function = "gpio_in";
-	};
 
 #if WF2_AUDIO
 	/*

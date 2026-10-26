@@ -1,0 +1,138 @@
+From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
+Subject: [PATCH] i2c: mv64xxx: recover an Allwinner bus through its line control register
+
+The Allwinner TWI has a line control register (offset 0x20): with its
+_EN bits set, SCL and SDA are driven from it, and their levels are read
+back. The vendor kernel clocks a stuck bus free with it. Do the same:
+generic SCL recovery with get/set_scl and get/set_sda on that register.
+
+The driver's own recovery takes the pins as GPIOs through a "gpio"
+pinctrl state, which cannot work on sunxi: its pin controller is strict,
+and the pins stay owned by the controller's mux ("pin PH0 already
+requested by 1c2ac00.i2c"). Through the register the pins never leave it.
+
+On the Yandex Station the STM32 boot animation drives i2c0 at power-on;
+stopped mid-byte, it left a chip holding SDA low, and on a cold boot the
+LED ring and a mic ADC timed out at probe with the bus locked for good.
+
+---
+diff --git a/drivers/i2c/busses/i2c-mv64xxx.c b/drivers/i2c/busses/i2c-mv64xxx.c
+--- a/drivers/i2c/busses/i2c-mv64xxx.c
++++ b/drivers/i2c/busses/i2c-mv64xxx.c
+@@ -29,6 +29,18 @@
+ 
+ #define MV64XXX_I2C_BAUD_DIV_N(val)			(val & 0x7)
+ #define MV64XXX_I2C_BAUD_DIV_M(val)			((val & 0xf) << 3)
++
++/*
++ * Allwinner TWI line control register: SCL and SDA driven by hand while
++ * their _EN bit is set (released high, open drain), their levels read back.
++ */
++#define SUN4I_TWI_LCR					0x20
++#define SUN4I_TWI_LCR_SDA_EN				BIT(0)
++#define SUN4I_TWI_LCR_SDA				BIT(1)
++#define SUN4I_TWI_LCR_SCL_EN				BIT(2)
++#define SUN4I_TWI_LCR_SCL				BIT(3)
++#define SUN4I_TWI_LCR_SDA_STATE				BIT(4)
++#define SUN4I_TWI_LCR_SCL_STATE				BIT(5)
+ 
+ #define	MV64XXX_I2C_REG_CONTROL_ACK			BIT(2)
+ #define	MV64XXX_I2C_REG_CONTROL_IFLG			BIT(3)
+@@ -147,6 +159,8 @@
+ 	bool			irq_clear_inverted;
+ 	/* Clk div is 2 to the power n, not 2 to the power n + 1 */
+ 	bool			clk_n_base_0;
++	/* Allwinner: SCL and SDA can be driven through SUN4I_TWI_LCR */
++	bool			line_control;
+ 	struct i2c_bus_recovery_info	rinfo;
+ 	bool			atomic;
+ };
+@@ -870,8 +884,10 @@
+ 		bus_freq = I2C_MAX_STANDARD_MODE_FREQ; /* 100kHz by default */
+ 
+ 	if (of_device_is_compatible(np, "allwinner,sun4i-a10-i2c") ||
+-	    of_device_is_compatible(np, "allwinner,sun6i-a31-i2c"))
++	    of_device_is_compatible(np, "allwinner,sun6i-a31-i2c")) {
+ 		drv_data->clk_n_base_0 = true;
++		drv_data->line_control = true;
++	}
+ 
+ 	if (!mv64xxx_find_baud_factors(drv_data, bus_freq, tclk)) {
+ 		rc = -EINVAL;
+@@ -928,10 +944,76 @@
+ }
+ #endif /* CONFIG_OF */
+ 
++/*
++ * Bus recovery through the Allwinner line control register: the pins stay
++ * muxed to the controller (sunxi pinctrl is strict, they cannot be taken as
++ * GPIOs while it owns them), and SCL is clocked by hand from here.
++ */
++static struct mv64xxx_i2c_data *mv64xxx_lcr_data(struct i2c_adapter *adap)
++{
++	return container_of(adap, struct mv64xxx_i2c_data, adapter);
++}
++
++static void mv64xxx_lcr_update(struct i2c_adapter *adap, u32 mask, u32 val)
++{
++	struct mv64xxx_i2c_data *drv_data = mv64xxx_lcr_data(adap);
++	u32 lcr = readl(drv_data->reg_base + SUN4I_TWI_LCR);
++
++	writel((lcr & ~mask) | (val & mask), drv_data->reg_base + SUN4I_TWI_LCR);
++}
++
++static int mv64xxx_lcr_get_scl(struct i2c_adapter *adap)
++{
++	return !!(readl(mv64xxx_lcr_data(adap)->reg_base + SUN4I_TWI_LCR) &
++		  SUN4I_TWI_LCR_SCL_STATE);
++}
++
++static void mv64xxx_lcr_set_scl(struct i2c_adapter *adap, int val)
++{
++	mv64xxx_lcr_update(adap, SUN4I_TWI_LCR_SCL, val ? SUN4I_TWI_LCR_SCL : 0);
++}
++
++static int mv64xxx_lcr_get_sda(struct i2c_adapter *adap)
++{
++	return !!(readl(mv64xxx_lcr_data(adap)->reg_base + SUN4I_TWI_LCR) &
++		  SUN4I_TWI_LCR_SDA_STATE);
++}
++
++static void mv64xxx_lcr_set_sda(struct i2c_adapter *adap, int val)
++{
++	mv64xxx_lcr_update(adap, SUN4I_TWI_LCR_SDA, val ? SUN4I_TWI_LCR_SDA : 0);
++}
++
++/* both lines taken by hand, released high; given back after */
++static void mv64xxx_lcr_prepare(struct i2c_adapter *adap)
++{
++	u32 all = SUN4I_TWI_LCR_SCL_EN | SUN4I_TWI_LCR_SCL |
++		  SUN4I_TWI_LCR_SDA_EN | SUN4I_TWI_LCR_SDA;
++
++	mv64xxx_lcr_update(adap, all, all);
++}
++
++static void mv64xxx_lcr_unprepare(struct i2c_adapter *adap)
++{
++	mv64xxx_lcr_update(adap, SUN4I_TWI_LCR_SCL_EN | SUN4I_TWI_LCR_SDA_EN, 0);
++}
++
+ static int mv64xxx_i2c_init_recovery_info(struct mv64xxx_i2c_data *drv_data,
+ 					  struct device *dev)
+ {
+ 	struct i2c_bus_recovery_info *rinfo = &drv_data->rinfo;
++
++	if (drv_data->line_control) {
++		rinfo->recover_bus = i2c_generic_scl_recovery;
++		rinfo->get_scl = mv64xxx_lcr_get_scl;
++		rinfo->set_scl = mv64xxx_lcr_set_scl;
++		rinfo->get_sda = mv64xxx_lcr_get_sda;
++		rinfo->set_sda = mv64xxx_lcr_set_sda;
++		rinfo->prepare_recovery = mv64xxx_lcr_prepare;
++		rinfo->unprepare_recovery = mv64xxx_lcr_unprepare;
++		drv_data->adapter.bus_recovery_info = rinfo;
++		return 0;
++	}
+ 
+ 	rinfo->pinctrl = devm_pinctrl_get(dev);
+ 	if (IS_ERR(rinfo->pinctrl)) {
