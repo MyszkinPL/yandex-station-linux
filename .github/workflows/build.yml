@@ -3,7 +3,7 @@ name: build
 on:
   push:
     branches: [main]
-    paths: ['kernel/**', 'boot/**', 'scripts/**', 'os/**', '.github/workflows/build.yml']
+    paths: ['kernel/**', 'boot/**', 'initramfs/**', 'scripts/**', 'os/**', '.github/workflows/build.yml']
   pull_request:
   workflow_dispatch:
 
