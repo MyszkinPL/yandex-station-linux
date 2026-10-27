@@ -62,9 +62,28 @@
 #define AXP_DCDC2_V	0x21		/* CPU */
 #define AXP_DCDC5_V	0x24		/* DRAM */
 
+/*
+ * Started from the boot partition (pack.py --slot boot) instead of recovery,
+ * the Station would come back to us after every reset, a broken kernel too.
+ * So this shim counts the boots that did not come up, in an RTC
+ * general-purpose register (kept across the watchdog reset, cleared by a
+ * power cut; boot0 reads GP0-5 only, U-Boot, BL31, the SCP and Android's
+ * kernel none of 6-7), and init clears the count once our system is up.
+ * After BOOTW_MAX_TRIES of them, or when Linux asks for Android
+ * (BOOTW_CMD_ANDROID), it sets the PMIC's one-shot flag (vendor U-Boot then
+ * boots recovery, where Android is) and resets at once.
+ */
+#define RTC_GP7		0x01f0011c
+#define BOOTW_MAGIC	0x5354		/* "ST", the word's top half */
+#define BOOTW_CMD_ANDROID 1		/* bits 15:8 */
+#define BOOTW_MAX_TRIES	3		/* bits 7:0 */
+#define AXP_BOOT_FLAG	0x0f
+#define AXP_BOOT_RECOVERY 0x10
+#define WDT_MODE_INTV	0xf0		/* interval field; 0 = 0.5 s */
+
 /* results for init to log; reserved (no-map) in the DTS, own 2 MiB block */
 #define SHIMLOG		0x4e400000
-#define SHIMLOG_MAGIC	0x314d4853	/* "SHM1" */
+#define SHIMLOG_MAGIC	0x324d4853	/* "SHM2" */
 #define LOG_CTRL	0x08
 #define LOG_INTE	0x0c
 #define LOG_ID		0x10
@@ -81,7 +100,11 @@
 #define LOG_RB_DATA	0x3c
 #define LOG_RB_DAR	0x40
 #define LOG_RB_CMD	0x44
-#define LOG_SIZE	0x48
+#define LOG_SLOT	0x48		/* 1: started from the boot partition */
+#define LOG_BOOTW	0x4c		/* the boot word as found */
+#define LOG_BOOTW_NEW	0x50		/* as left for this boot */
+#define LOG_TO_ANDROID	0x54		/* the flag write's result, if it was tried */
+#define LOG_SIZE	0x58
 #define RES_ENABLED	1
 #define RES_ALREADY_ON	2
 #define RES_MISMATCH	3		/* not an AXP803 or DLDO4 not at 3.0 V */
@@ -154,6 +177,52 @@ entry:
 	b.ne	3b
 	ldr	w1, =SHIMLOG_MAGIC
 	str	w1, [x21]
+
+	/* --- started from the boot partition: the boot word, see RTC_GP7 --- */
+	ldr	w22, slot
+	str	w22, [x21, #LOG_SLOT]
+	cbz	w22, bootw_done
+	ldr	x19, =RTC_GP7
+	ldr	w1, [x19]
+	str	w1, [x21, #LOG_BOOTW]
+	lsr	w2, w1, #16
+	mov	w3, #BOOTW_MAGIC
+	cmp	w2, w3
+	b.eq	1f
+	mov	w1, #(BOOTW_MAGIC << 16)	/* not ours (a power cut): a fresh count */
+1:	ubfx	w2, w1, #8, #8
+	cmp	w2, #BOOTW_CMD_ANDROID
+	b.eq	to_android
+	and	w2, w1, #0xff
+	cmp	w2, #BOOTW_MAX_TRIES
+	b.hs	to_android
+	add	w1, w1, #1			/* one more try; init clears it */
+	str	w1, [x19]
+	str	w1, [x21, #LOG_BOOTW_NEW]
+	dsb	sy
+	b	bootw_done
+to_android:
+	mov	w1, #(BOOTW_MAGIC << 16)
+	str	w1, [x19]
+	str	w1, [x21, #LOG_BOOTW_NEW]
+	mov	w27, #AXP_BOOT_FLAG
+	mov	w26, #AXP_BOOT_RECOVERY
+	bl	axp_write
+	str	w25, [x21, #LOG_TO_ANDROID]
+	dsb	sy
+	cmp	w25, #RES_ENABLED
+	b.ne	bootw_done			/* the flag did not take: ours, not a reset back into ours */
+	ldr	x1, =WDT_BASE			/* reset now: the watchdog armed above, cut to 0.5 s */
+	ldr	w2, [x1, #WDT_MODE]
+	bic	w2, w2, #WDT_MODE_INTV
+	str	w2, [x1, #WDT_MODE]
+	ldr	w3, =WDT_CTRL_RELOAD
+	str	w3, [x1, #WDT_CTRL]
+	dsb	sy
+2:	wfi
+	b	2b
+bootw_done:
+
 	ldr	w23, [x20, #RSB_CTRL]
 	str	w23, [x21, #LOG_CTRL]
 	ldr	w24, [x20, #RSB_INTE]
@@ -322,6 +391,66 @@ rsb_xfer:
 	ret
 3:	str	w0, [x20, #RSB_INTS]		/* ack */
 	ret
+
+/*
+ * One PMIC register write, w27 = register, w26 = value, under the checks of
+ * the DLDO4 write (no SCP transfer in flight, an AXP803, the transfer
+ * registers still ours) and read back. w25 <- RES_ENABLED if it took.
+ * Clobbers w0-w4, x2, w13, w14, x28.
+ */
+axp_write:
+	mov	x28, x30
+	mov	w25, #RES_BUS_ERROR
+	ldr	w13, [x20, #RSB_CTRL]
+	ldr	w14, [x20, #RSB_INTE]
+	tbnz	w13, #7, 9f			/* SCP transfer in flight: nothing touched */
+	rsb_read AXP_IC_TYPE
+	cmp	w0, #RSB_TRANS_OVER
+	b.ne	8f
+	mov	w25, #RES_MISMATCH
+	and	w2, w1, #0xff
+	cmp	w2, #AXP803_ID
+	b.ne	8f
+	mov	w25, #RES_BUS_ERROR
+	str	w27, [x20, #RSB_ADDR]
+	str	w26, [x20, #RSB_DATA]
+	mov	w1, #(AXP_RTA << 16)
+	str	w1, [x20, #RSB_DAR]
+	mov	w1, #RSB_CMD_WR8
+	str	w1, [x20, #RSB_CMD]
+	ldr	w1, [x20, #RSB_ADDR]
+	and	w1, w1, #0xff
+	cmp	w1, w27
+	b.ne	8f
+	ldr	w3, [x20, #RSB_DAR]
+	ubfx	w3, w3, #16, #8
+	cmp	w3, #AXP_RTA
+	b.ne	8f
+	ldr	w4, [x20, #RSB_CMD]
+	and	w4, w4, #0xff
+	cmp	w4, #RSB_CMD_WR8
+	b.ne	8f
+	bl	rsb_xfer
+	cmp	w0, #RSB_TRANS_OVER
+	b.ne	8f
+	str	w27, [x20, #RSB_ADDR]		/* read it back */
+	mov	w1, #(AXP_RTA << 16)
+	str	w1, [x20, #RSB_DAR]
+	mov	w1, #RSB_CMD_RD8
+	str	w1, [x20, #RSB_CMD]
+	bl	rsb_xfer
+	cmp	w0, #RSB_TRANS_OVER
+	b.ne	8f
+	ldr	w1, [x20, #RSB_DATA]
+	and	w1, w1, #0xff
+	cmp	w1, w26
+	b.ne	8f
+	mov	w25, #RES_ENABLED
+8:	str	w14, [x20, #RSB_INTE]
+	and	w1, w13, #RSB_CTRL_GIE		/* never START/ABORT/reset here */
+	str	w1, [x20, #RSB_CTRL]
+9:	mov	x30, x28
+	ret
 	.ltorg
 
 	.balign	8
@@ -330,6 +459,7 @@ rsb_xfer:
 dtb_size:	.quad	0			/* DTB size, multiple of 16 */
 image_off:	.quad	0x180000		/* lands on 0x40200000 when loaded at 0x40080000 */
 image_size:	.quad	0			/* Image size, multiple of 16 */
+slot:		.quad	0			/* 1: built for the boot partition (pack.py --slot boot) */
 shim_end:
 
 	.equ	dtb, _start + 0x10000

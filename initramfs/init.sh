@@ -113,19 +113,30 @@ for a in 0x01F00000 0x01F00004 0x01F00060 0x01000010; do
 	echo "devmem $a = $(devmem $a 32 2>&1)" >> $L
 done
 
-# --- what the shim did on the PMIC (AXP803 DLDO4 = Wi-Fi VDDIO) ---
+# --- what the shim did (boot/shim.S): the PMIC (AXP803 DLDO4 = Wi-Fi
+# VDDIO), and, started from the boot partition, the boot word ---
 S=0x4E400000
+# Started from the boot partition, a reset comes back here: the shim counts
+# the boots that did not come up in RTC GP7 and, after three or when asked
+# (BOOTW_ANDROID), boots Android from recovery instead. Cleared once ours is up.
+BOOTW=0x01F0011C BOOTW_OK=0x53540000 BOOTW_ANDROID=0x53540100
+DIRECT=""
 if [ "$(devmem $S 32)" = "0x324D4853" ]; then
-	for o in 08:ATF 10:ID 14:PWR2 18:DLDO4V 1C:DCDC2 20:DCDC5 24:WRITE 28:PWR2_NEW 2C:DCDC2_NEW 30:DCDC5_NEW 34:RESULT; do
+	for o in 08:CTRL 0C:INTE 10:ID 14:PWR2 18:DLDO4V 1C:DCDC2 20:DCDC5 24:WRITE 28:PWR2_NEW 2C:DCDC2_NEW \
+		30:DCDC5_NEW 34:RESULT 48:SLOT 4C:BOOTW 50:BOOTW_NEW 54:TO_ANDROID; do
 		echo "shim ${o#*:} = $(devmem $((S + 0x${o%%:*})) 32)" >> $L
 	done
 	case $(devmem $((S + 0x34)) 32) in
 	0x00000001) r="DLDO4 enabled" ;;
 	0x00000002) r="DLDO4 was already on" ;;
 	0x00000003) r="PMIC checks failed, nothing written" ;;
-	*) r="PMIC access through ATF failed, nothing written" ;;
+	*) r="PMIC bus busy or failed, nothing written" ;;
 	esac
 	say "shim pmic: $r"
+	if [ "$(devmem $((S + 0x48)) 32)" = 0x00000001 ]; then
+		DIRECT=1
+		say "started from the boot partition: try $(( $(devmem $((S + 0x50)) 32) & 0xff )) of 3 (boot word was $(devmem $((S + 0x4C)) 32))"
+	fi
 else
 	say "shim pmic: no log"
 fi
@@ -139,6 +150,8 @@ to_android() {
 	say "to Android, to stay: $1"
 	writelog "to Android: $1"
 	[ -z "$why" ] && printf '%s-STAY\n' $MAGIC | dd of=/dev/$P bs=4096 seek=$LOG_SEEK conv=notrunc,sync 2>/dev/null && sync
+	# started from boot, the reset would come back here: the shim takes it to Android
+	[ -n "$DIRECT" ] && devmem $BOOTW 32 $BOOTW_ANDROID
 	kill -9 $(pidof watchdog) 2>/dev/null
 	sleep 30
 	reboot -f
@@ -329,6 +342,8 @@ elif [ -x $R/opt/station/start ]; then
 		/opt/station/start >> $L 2>&1 &
 	say "services started"
 fi
+# kernel, Wi-Fi device and root filesystem up: this boot counts as one that came up
+[ -n "$DIRECT" ] && [ -n "$ROOT" ] && devmem $BOOTW 32 $BOOTW_OK && say "boot word cleared: $(devmem $BOOTW 32)"
 
 # The way back to Android that needs nothing but a hand: the Alice key held
 # for HOLD_KEY seconds, the Station running. (Not at power-on: held while the
@@ -443,7 +458,16 @@ RB
 	# Back to Android to stay there (flashing a new recovery image, say): the
 	# log in misc says "stay", and Android's hand-off leaves the Station alone.
 	# Only where the log region is checked to be ours.
-	if [ -z "$why" ]; then
+	if [ -n "$DIRECT" ]; then
+		# started from boot: Android is in recovery, the shim takes the next reset there
+		cat > $R/usr/local/sbin/station-android <<SA
+#!/bin/sh
+# To Yandex Android (in recovery; a plain reboot of Android comes back here).
+/proc/1/root/bin/busybox devmem $BOOTW 32 $BOOTW_ANDROID &&
+	echo "station: to Android" > /dev/kmsg && pkill -9 -x watchdog
+SA
+		chmod 755 $R/usr/local/sbin/station-android
+	elif [ -z "$why" ]; then
 		cat > $R/usr/local/sbin/station-android <<SA
 #!/bin/sh
 # To Yandex Android, and stay there (until a one-shot boot into recovery).

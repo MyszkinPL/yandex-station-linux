@@ -35,7 +35,7 @@ DTB_OFF = 0x10000
 IMAGE_OFF = 0x180000
 ATF = 0x48000000            # BL31 region: nothing of ours may reach it
 SHIMLOG_RAMDISK = 0x4e400800
-MAX_IMAGE = 32 << 20        # recovery partition
+MAX_IMAGE = {"recovery": 32 << 20, "boot": 16 << 20}   # the partitions' sizes
 MARKER = b"STATIONSHIMLIT01"
 
 
@@ -94,6 +94,8 @@ def main():
     ap.add_argument("--dtb", required=True)
     ap.add_argument("--initramfs", help="gen_init_cpio list, or a ready cpio (.gz)")
     ap.add_argument("-D", action="append", default=[], metavar="NAME=DIR", help="${NAME} in the list")
+    ap.add_argument("--slot", choices=("recovery", "boot"), default="recovery",
+                    help="boot: the shim counts boots that did not come up and falls back to Android (shim.S, RTC_GP7)")
     ap.add_argument("-o", "--output", required=True)
     a = ap.parse_args()
 
@@ -109,6 +111,7 @@ def main():
     assert lit > 0 and shim.find(MARKER, lit + 1) < 0, "shim literals marker"
     lit += len(MARKER)
     assert struct.unpack_from("<Q", shim, lit + 8)[0] == IMAGE_OFF, "shim image_off"
+    assert struct.unpack_from("<Q", shim, lit + 24)[0] == 0, "shim slot (a shim without one?)"
 
     initrd = b""
     if a.initramfs:
@@ -131,7 +134,7 @@ def main():
     assert DTB_OFF + len(dtb) <= IMAGE_OFF, "DTB too large"
     img16 = img + b"\0" * ((-len(img)) % 16)
 
-    struct.pack_into("<QQQ", shim, lit, len(dtb), IMAGE_OFF, len(img16))
+    struct.pack_into("<QQQQ", shim, lit, len(dtb), IMAGE_OFF, len(img16), int(a.slot == "boot"))
     pay = bytearray(shim.ljust(DTB_OFF, b"\0"))
     pay += dtb.ljust(IMAGE_OFF - DTB_OFF, b"\0")
     pay += img16
@@ -154,7 +157,7 @@ def main():
              page_size=2048, hdr_version=0, os_version=0, name=b"", cmdline=b"", extra=b"")
     out = bootimg.build(h)
     h2 = bootimg.parse(out)
-    assert h2["kernel"] == pay and h2["kernel_addr"] == LOAD and len(out) <= MAX_IMAGE, "image too large"
+    assert h2["kernel"] == pay and h2["kernel_addr"] == LOAD and len(out) <= MAX_IMAGE[a.slot], "image too large for the partition"
     assert h2["ramdisk_addr"] == SHIMLOG_RAMDISK and len(h2["ramdisk"]) <= 0x800, \
         "the dummy ramdisk must stay in the shim log page"
     open(a.output, "wb").write(out)

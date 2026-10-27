@@ -152,6 +152,9 @@ jobs:
               --initramfs initramfs/initramfs.list -D BUILD=out/userspace -D MODULES=out/initramfs-modules \
               -o out/image/recovery-$d.img
           done
+          # our Station started straight from the boot partition (Android in recovery):
+          # the shim falls back to Android after three boots that did not come up
+          python3 boot/pack.py --shim out/shim.bin --image out/Image --dtb out/dtb/station.dtb --slot boot             --initramfs initramfs/initramfs.list -D BUILD=out/userspace -D MODULES=out/initramfs-modules             -o out/image/boot-station.img
           (cd out/image && sha256sum *.img > SHA256SUMS && cat SHA256SUMS && ls -l)
       - uses: actions/upload-artifact@v4
         with:
