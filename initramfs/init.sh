@@ -316,15 +316,16 @@ fi
 
 # --- our services (/opt/station/start): before the network, so the ring
 # shows the boot and the buttons work at once; each is kept running ---
-if [ -x $R/opt/station/start ]; then
+# Plain Debian starts what its owner put in (runit's /etc/service), never
+# ours, even where a kept /opt/station has them.
+if [ -e $R/etc/station/plain ]; then
+	[ -x $R/etc/station/start ] && chroot $R /usr/bin/env -i PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+		/etc/station/start >> $L 2>&1 &
+	say "services started (/etc/station/start)"
+elif [ -x $R/opt/station/start ]; then
 	chroot $R /usr/bin/env -i PATH=/opt/station/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
 		/opt/station/start >> $L 2>&1 &
 	say "services started"
-elif [ -x $R/etc/station/start ]; then
-	# plain Debian has none of ours: its own start (runit's /etc/service)
-	chroot $R /usr/bin/env -i PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-		/etc/station/start >> $L 2>&1 &
-	say "services started (/etc/station/start)"
 fi
 
 # The way back to Android that needs nothing but a hand: the Alice key held

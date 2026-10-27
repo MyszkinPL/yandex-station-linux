@@ -1,0 +1,84 @@
+name: release
+
+# A release for the community: Debian on the Station with our kernel. What
+# main's CI has already built and checked (build.yml: the recovery images,
+# the kernel, busybox; rootfs.yml: plain Debian) is taken as it is, not built
+# again, and the installer pins it all by sha256 (scripts/pack-installer.sh).
+#   git tag debian-v1 && git push origin debian-v1     (or run it by hand)
+on:
+  push:
+    tags: ['debian-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'the release tag, e.g. debian-v1 (made on main if it does not exist)'
+        required: true
+
+permissions:
+  contents: write     # the release
+  actions: read       # the other workflows' artifacts
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Take what CI built on main
+        run: |
+          last() {
+            gh run list --workflow "$1" --branch main --status success --limit 1 \
+              --json databaseId,headSha -q '.[0] | "\(.databaseId) \(.headSha)"'
+          }
+          read -r B BSHA <<< "$(last build.yml)"
+          read -r R RSHA <<< "$(last rootfs.yml)"
+          echo "build.yml run $B ($BSHA), rootfs.yml run $R ($RSHA)"
+          gh run download "$B" -n image -D w/image
+          gh run download "$B" -n kernel -D w/kernel
+          gh run download "$B" -n userspace -D w/userspace
+          gh run download "$R" -n rootfs -D w/rootfs
+          # what they said they built is what arrived
+          (cd w/image && sha256sum -c SHA256SUMS)
+          (cd w/rootfs && sha256sum -c rootfs-plain-arm64.tar.gz.sha256)
+          (cd w/userspace && sha256sum -c --ignore-missing SHA256SUMS)
+          mkdir rel
+          cp w/image/recovery-station.img w/image/recovery-station-fixed.img w/rootfs/rootfs-plain-arm64.tar.gz rel/
+          KREL=$(cat w/kernel/kernel.release)
+          tar -C w/kernel --owner=0 --group=0 -czf "rel/kernel-$KREL.tar.gz" \
+            Image dtb modules.tar.gz shim.bin config defconfig System.map kernel.release
+          echo "KREL=$KREL" >> "$GITHUB_ENV"
+          echo "BSHA=$BSHA" >> "$GITHUB_ENV"
+          echo "DEBIAN=$(cat w/rootfs/rootfs-plain-VERSION)" >> "$GITHUB_ENV"
+      - name: The installer
+        run: scripts/pack-installer.sh "$TAG" rel w/userspace/busybox
+      - name: Publish
+        run: |
+          (cd rel && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          cat > notes.md <<EOF
+          Debian 13 (trixie) on the Yandex Station 1 (YNDX-0001) with our Linux $KREL.
+          How to install: [docs/INSTALL-DEBIAN.md](https://github.com/$GH_REPO/blob/$TAG/docs/INSTALL-DEBIAN.md).
+
+          On the Station, in Android, as root:
+
+              curl -fLo /data/local/tmp/station-debian.run https://github.com/$GH_REPO/releases/download/$TAG/station-debian.run
+              sh /data/local/tmp/station-debian.run
+
+          | file | what |
+          |---|---|
+          | station-debian.run | the installer: checks the Station, installs, checks every step |
+          | recovery-station.img | kernel + initramfs, written to the recovery partition |
+          | recovery-station-fixed.img | the same at a fixed CPU clock (no DVFS), for trying |
+          | rootfs-plain-arm64.tar.gz | Debian: $DEBIAN |
+          | kernel-$KREL.tar.gz | the kernel on its own: Image, DTBs, modules, config |
+
+          Kernel and images built from $BSHA.
+          EOF
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" rel/* --clobber
+          else
+            gh release create "$TAG" rel/* --target main --title "Debian for the Station ($TAG)" --notes-file notes.md
+          fi
