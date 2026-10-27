@@ -183,9 +183,14 @@ fw_from_android() {
 	say "firmware: $got of 5 from Android${odd:+, not the known one:$odd}"
 }
 fw_from_android
-for m in brcmfmac snd-soc-tas571x hci_uart; do
-	modprobe $m || say "cannot load $m"
-done
+# in the order CI wrote down, each one's dependencies first; the kernel
+# itself asks for brcmfmac's vendor parts later through modprobe, from here
+echo /bin/modprobe > /proc/sys/kernel/modprobe
+MD=/lib/modules/$(uname -r)
+while read -r ko; do
+	n=${ko##*/}; n=${n%.ko}
+	grep -q "^$(echo $n | tr - _) " /proc/modules || insmod $MD/$ko || say "cannot load $n"
+done < $MD/station-load
 
 # --- Wi-Fi ---
 # Without the Wi-Fi device ours cannot be reached by anyone: no network, no

@@ -63,18 +63,23 @@ KREL=$(cat "$O/include/config/kernel.release")
 M=$B/modroot/lib/modules/$KREL
 IM=$OUT/initramfs-modules
 rm -rf "$IM"; mkdir -p "$IM/lib/modules/$KREL"
+# station-load: the order init loads them in, what each depends on first
+# (busybox's modprobe left the dependencies out on the Station)
 {
 	for n in brcmfmac snd-soc-tas571x hci_uart; do
 		modprobe --show-depends -d "$B/modroot" -S "$KREL" "$n" | awk '$1 == "insmod" { print $2 }'
 	done
-	find "$M/kernel/drivers/net/wireless/broadcom" -name '*.ko'
-} | sort -u | while read -r ko; do
+	find "$M/kernel/drivers/net/wireless/broadcom" -name '*.ko' | sort
+} | awk '!seen[$0]++' | while read -r ko; do
 	rel=${ko#"$M"/}
 	mkdir -p "$IM/lib/modules/$KREL/$(dirname "$rel")"
 	cp "$ko" "$IM/lib/modules/$KREL/$rel"
-done
+	echo "$rel"
+done > "$IM/station-load"
+mv "$IM/station-load" "$IM/lib/modules/$KREL/station-load"
 cp "$M"/modules.builtin* "$M"/modules.order "$IM/lib/modules/$KREL/"
 depmod -b "$IM" "$KREL"
+echo "initramfs modules, in load order:"; cat "$IM/lib/modules/$KREL/station-load"
 echo "initramfs modules: $(find "$IM" -name '*.ko' | sed 's|.*/||' | tr '\n' ' ')"
 "$TOP/kernel/dts/build-dtbs.sh" "$S" "$OUT/dtb" "$O/scripts/dtc/dtc"
 
