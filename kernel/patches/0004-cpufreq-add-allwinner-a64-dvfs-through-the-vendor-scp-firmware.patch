@@ -45,7 +45,7 @@ Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
  obj-$(CONFIG_ARM_TEGRA186_CPUFREQ)	+= tegra186-cpufreq.o
 --- /dev/null
 +++ b/drivers/cpufreq/sun50i-a64-scp-cpufreq.c
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,430 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * CPU DVFS for Allwinner A64 (R18) boards that run the vendor BSP firmware
@@ -412,11 +412,20 @@ Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 +		 readl(scp->ccu + CCU_PLL_CPUX),
 +		 readl(scp->ccu + CCU_CPUX_AXI_CFG), khz, raw, mv);
 +
-+	if (!mv || mv < scp_vendor_mv(khz)) {
++	/*
++	 * Vendor U-Boot leaves 1104 MHz at 1.20 V (the table wants 1.26 V).
++	 * The SCP lowers PLL_CPUX before the rail, so the request for the
++	 * lowest point below only moves towards safety from there: refuse
++	 * only a rail that does not even cover the lowest point, or none.
++	 */
++	if (!mv || mv < scp_vendor_mv(scp->min_khz)) {
 +		ret = dev_err_probe(dev, -ENODEV,
 +				    "rail does not match the vendor table, not touching it\n");
 +		goto err_unmap;
 +	}
++	if (mv < scp_vendor_mv(khz))
++		dev_warn(dev, "%u mV is below the %u mV the table wants at %u kHz: lowest point first\n",
++			 mv, scp_vendor_mv(khz), khz);
 +
 +	/* bring the SCP's cached rail voltage to a known value */
 +	ret = scp_dvfs_request(scp->min_khz);
