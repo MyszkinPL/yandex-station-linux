@@ -30,7 +30,7 @@ plain)
 	EXTRA=(
 		# its own files, owned by root whatever the checkout's owner
 		--customize-hook="tar -C '$TOP/rootfs/plain/files' --owner=0 --group=0 -c . | tar -C \"\$1\" -x"
-		--customize-hook='chmod 755 "$1/etc/station/start" "$1/usr/local/sbin/station-wifi"'
+		--customize-hook='chmod 755 "$1/etc/station/start" "$1/usr/local/sbin/station-wifi" "$1"/etc/service/*/run'
 		# apt from the live mirrors (debian.sources), not the snapshot it was built from
 		--customize-hook='rm -f "$1/etc/apt/sources.list"'
 	)

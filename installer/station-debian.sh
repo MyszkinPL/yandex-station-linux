@@ -17,6 +17,8 @@ IMG=@IMG@ IMG_SHA=@IMG_SHA@ IMG_SIZE=@IMG_SIZE@
 ROOTFS=@ROOTFS@ ROOTFS_SHA=@ROOTFS_SHA@
 
 set -u
+# Android's umask is 077: Debian's own users (_apt, _chrony) must see its files
+umask 022
 export PATH=/data/local/station/bin:/system/bin:/system/xbin
 BB=${BB:-/data/local/station/bin/busybox}
 S=/data/local/station            # ours in Android's /data
@@ -150,15 +152,17 @@ have_login() { [ -s $C/persist/ssh/authorized_keys ] || [ -s $C/persist/ssh/root
 choices() {
 	step "Настройки (Enter — то, что в скобках)"
 	if [ -z "$MODE" ]; then
-		echo "  Что запускать при включении Станции:"
-		echo "    1) Debian: Android загружается первым и через пару минут сам передаёт Станцию Debian"
-		echo "    2) Android с Алисой, как сейчас; Debian — по команде «enter»"
+		if asking; then
+			echo "  Что запускать при включении Станции:"
+			echo "    1) Debian: Android загружается первым и через пару минут сам передаёт Станцию Debian"
+			echo "    2) Android с Алисой, как сейчас; Debian — по команде «enter»"
+		fi
 		ask "  Выбор" 1; case "$REPLY" in 2) MODE=android ;; *) MODE=debian ;; esac
 	fi
 	case "$MODE" in debian|android) ;; *) die "--mode: debian или android, а не «$MODE»." "" ;; esac
 	if [ -z "$KEY" ] && [ -z "$PASSWORD" ] && ! have_login; then
-		echo "  Вход в Debian по SSH (root): вставьте свой открытый ключ (ssh-ed25519 ...)"
-		echo "  или нажмите Enter — тогда будет пароль, он покажется один раз в конце."
+		asking && echo "  Вход в Debian по SSH (root): вставьте свой открытый ключ (ssh-ed25519 ...)" &&
+			echo "  или нажмите Enter — тогда будет пароль, он покажется один раз в конце."
 		ask "  Ключ" ""; case "$REPLY" in ssh-*|ecdsa-*|sk-*) KEY=$REPLY ;; *) PASSWORD=yes ;; esac
 	fi
 	if [ -z "$WIFI_NAME" ] && asking; then
@@ -410,6 +414,8 @@ install|update)
 	fetch $IMG $IMG_SHA
 	[ $CMD = install ] && fetch $ROOTFS $ROOTFS_SHA
 	step "Установка"
+	# installer debian-v1 left these 700: none of Debian's own users could get in
+	for d in $C/rootfs $C/upper; do [ -d $d ] && chmod 755 $d; done
 	backup_recovery
 	# update: a new kernel and hand-off; Debian itself its owner updates with apt
 	[ $CMD = install ] && { unpack_rootfs; persist; }

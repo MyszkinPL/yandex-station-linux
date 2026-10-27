@@ -1,0 +1,5 @@
+#!/bin/sh
+# The clock from the network: the RTC alone drifts, and apt and TLS need the
+# right date. Debian's own /etc/chrony/chrony.conf (its pool; add your own
+# servers in /etc/chrony/sources.d).
+exec chronyd -d 2>&1

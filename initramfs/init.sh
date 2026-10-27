@@ -259,6 +259,8 @@ if [ -e /sys/class/net/wlan0 ]; then
 				up=$C/upper wk=$C/work
 			fi
 			mkdir -p $up $wk
+			# the root of the tree is everyone's to read, whoever made these
+			chmod 755 $C/rootfs $up
 			if mount -t overlay overlay -o lowerdir=$C/rootfs,upperdir=$up,workdir=$wk $R; then
 				ROOT=own
 				# (not $P: that is the misc partition the log goes to)
