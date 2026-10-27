@@ -10,19 +10,21 @@ set -euo pipefail
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 TAG=${1:?tag}; D=${2:?dir}; BUSYBOX=${3:?busybox}
 REPO=${GITHUB_REPOSITORY:-MyszkinPL/yandex-station-linux}
-IMG=recovery-station.img ROOTFS=rootfs-plain-arm64.tar.gz
-for f in $IMG $ROOTFS; do [ -s "$D/$f" ] || { echo "no $D/$f" >&2; exit 1; }; done
+IMG=recovery-station.img BOOT_IMG=boot-station.img ROOTFS=rootfs-plain-arm64.tar.gz
+for f in $IMG $BOOT_IMG $ROOTFS; do [ -s "$D/$f" ] || { echo "no $D/$f" >&2; exit 1; }; done
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 
 # the installer, with what it installs pinned and Android's hand-off inside
 sed -e "s|@VERSION@|$TAG|" -e "s|@URL@|https://github.com/$REPO/releases/download/$TAG|" \
 	-e "s|@IMG@|$IMG|" -e "s|@IMG_SHA@|$(sha "$D/$IMG")|" -e "s|@IMG_SIZE@|$(stat -c %s "$D/$IMG")|" \
-	-e "s|@ROOTFS@|$ROOTFS|" -e "s|@ROOTFS_SHA@|$(sha "$D/$ROOTFS")|" "$TOP/installer/station-debian.sh" |
+	-e "s|@BOOT_IMG@|$BOOT_IMG|" -e "s|@BOOT_SHA@|$(sha "$D/$BOOT_IMG")|" -e "s|@BOOT_SIZE@|$(stat -c %s "$D/$BOOT_IMG")|" 	-e "s|@ROOTFS@|$ROOTFS|" -e "s|@ROOTFS_SHA@|$(sha "$D/$ROOTFS")|" "$TOP/installer/station-debian.sh" |
 	awk -v f="$TOP/android/station-handoff.sh" '$0 == "@HANDOFF@" { while ((getline l < f) > 0) print l; next } { print }' > "$W/installer.sh"
 ! grep -n '@[A-Z_]*@' "$W/installer.sh" || { echo "placeholders left" >&2; exit 1; }
 grep -q '^HANDOFF_EOF$' "$W/installer.sh" && [ "$(grep -c '^HANDOFF_EOF$' "$W/installer.sh")" = 1 ]
 sh -n "$W/installer.sh"
+# the boot partition is 16 MiB
+[ $(stat -c %s "$D/$BOOT_IMG") -le 16777216 ] || { echo "$BOOT_IMG does not fit the boot partition" >&2; exit 1; }
 
 # busybox in whole 4 KiB blocks (an ELF does not mind the zeros after it)
 cp "$BUSYBOX" "$W/busybox"

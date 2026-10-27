@@ -46,7 +46,7 @@ jobs:
           (cd w/rootfs && sha256sum -c rootfs-plain-arm64.tar.gz.sha256)
           (cd w/userspace && sha256sum -c --ignore-missing SHA256SUMS)
           mkdir rel
-          cp w/image/recovery-station.img w/image/recovery-station-fixed.img w/rootfs/rootfs-plain-arm64.tar.gz rel/
+          cp w/image/recovery-station.img w/image/recovery-station-fixed.img w/image/boot-station.img w/rootfs/rootfs-plain-arm64.tar.gz rel/
           KREL=$(cat w/kernel/kernel.release)
           tar -C w/kernel --owner=0 --group=0 -czf "rel/kernel-$KREL.tar.gz" \
             Image dtb modules.tar.gz shim.bin config defconfig System.map kernel.release
@@ -72,6 +72,7 @@ jobs:
           |---|---|
           | station-debian.run | установщик: проверяет Станцию, ставит, проверяет каждый шаг |
           | recovery-station.img | ядро + initramfs для раздела recovery |
+          | boot-station.img | ядро + initramfs для раздела boot (быстрая загрузка, --mode direct) |
           | recovery-station-fixed.img | то же с постоянной частотой процессора (без DVFS), для проверки |
           | rootfs-plain-arm64.tar.gz | Debian: $DEBIAN |
           | kernel-$KREL.tar.gz | ядро отдельно: Image, DTB, модули, config |
