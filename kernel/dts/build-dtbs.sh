@@ -8,10 +8,12 @@ mkdir -p "$OUT"
 COMMON="-DWF2_SMP=1 -DWF2_RTC=1 -DWF2_THERMAL=1 -DWF2_CPUFREQ=1 -DWF2_WIFI=0 -DWF2_WIFI_ID=1"
 variants=(
 	# Linux mode (stage B): serdev Bluetooth, LED ring and keys, audio
-	"station|$COMMON -DWF2_BT=2 -DWF2_LEDS_KEYS=1 -DWF2_AUDIO=1 -DWF2_PMIC=1"
-	# the same with CPU DVFS through the vendor SCP (module sun50i-a64-scp-cpufreq):
-	# up to 1152 MHz at the vendor's voltages instead of 1008 MHz at a fixed 1.20 V
-	"station-dvfs|$COMMON -DWF2_BT=2 -DWF2_LEDS_KEYS=1 -DWF2_AUDIO=1 -DWF2_PMIC=1 -DWF2_CPUFREQ=2"
+	# CPU DVFS through the vendor SCP: up to 1152 MHz at the vendor's voltages
+	# (checked on the Station 2026-10-27: every point at its voltage, 50 C under
+	# full load at 1152 MHz)
+	"station|$COMMON -DWF2_BT=2 -DWF2_LEDS_KEYS=1 -DWF2_AUDIO=1 -DWF2_PMIC=1 -DWF2_CPUFREQ=2"
+	# the fallback: cpufreq-dt, 1008 MHz at a fixed 1.20 V, no SCP calls
+	"station-fixed|$COMMON -DWF2_BT=2 -DWF2_LEDS_KEYS=1 -DWF2_AUDIO=1 -DWF2_PMIC=1"
 )
 # Bring-up of a new kernel version: the board with every optional block off
 # (eMMC, Wi-Fi, watchdog: enough for stage B and SSH), then one block at a
