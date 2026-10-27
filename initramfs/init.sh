@@ -16,6 +16,11 @@ exec >/dev/kmsg 2>&1
 
 L=/tmp/b.log
 say() { echo "station-b: $*" > /dev/kmsg; echo "$*" >> $L; echo ">> $*" > /dev/tty0 2>/dev/null; }
+# A daemon's pid from its file, or nothing: busybox's kill takes "" for 0,
+# init's whole process group (and kill -0 "" for one that runs).
+pid_in() { _p=$(cat "$1" 2>/dev/null); case "$_p" in ""|*[!0-9]*) return 1 ;; esac; echo $_p; }
+alive() { _p=$(pid_in "$1") && kill -0 $_p 2>/dev/null; }
+stop_pid() { _p=$(pid_in "$1") && kill $_p 2>/dev/null; return 0; }
 
 # Partitions are found by where they are on the eMMC (vendor MBR/EBR chain),
 # not by number: a kernel may number the logical ones differently.
@@ -650,7 +655,7 @@ start_client() {
 	udhcpc -i wlan0 -s /udhcpc.sh -t 8 -T 3 -b -p $R/run/udhcpc.pid
 }
 stop_client() {
-	kill "$(cat $R/run/udhcpc.pid 2>/dev/null)" 2>/dev/null
+	stop_pid $R/run/udhcpc.pid
 	$CH pkill -x wpa_cli
 	killall wpa_supplicant 2>/dev/null
 	wait_gone wpa_supplicant
@@ -718,14 +723,14 @@ DM
 # this image's own (busybox httpd, /www), whatever the owner did to Debian
 setup_page() {
 	[ -e $R/etc/station/plain ] || return 0
-	kill -0 "$(cat /tmp/httpd-ap.pid 2>/dev/null)" 2>/dev/null && return 0
+	alive /tmp/httpd-ap.pid && return 0
 	httpd -f -p $AP_IP:80 -h /www -c /etc/httpd-setup.conf &
 	echo $! > /tmp/httpd-ap.pid
 	say "Wi-Fi page on http://$AP_IP/"
 }
 stop_ap() {
-	kill "$(cat /tmp/httpd-ap.pid 2>/dev/null)" 2>/dev/null; rm -f /tmp/httpd-ap.pid
-	kill "$(cat $R/run/dnsmasq-ap.pid 2>/dev/null)" 2>/dev/null
+	stop_pid /tmp/httpd-ap.pid; rm -f /tmp/httpd-ap.pid
+	stop_pid $R/run/dnsmasq-ap.pid
 	killall wpa_supplicant 2>/dev/null
 	wait_gone wpa_supplicant
 	ip addr flush dev wlan0
@@ -735,7 +740,7 @@ keep_base() {
 	case $MODE in
 	ap)
 		pidof wpa_supplicant >/dev/null || { say "access point was gone: up again"; start_ap; }
-		kill -0 "$(cat $R/run/dnsmasq-ap.pid 2>/dev/null)" 2>/dev/null || $CH dnsmasq --conf-file=/etc/dnsmasq-ap.conf
+		alive $R/run/dnsmasq-ap.pid || $CH dnsmasq --conf-file=/etc/dnsmasq-ap.conf
 		setup_page
 		;;
 	*)
@@ -747,7 +752,7 @@ keep_base() {
 			$CH wpa_cli -i wlan0 log_level INFO >/dev/null
 		fi
 		pidof wpa_cli >/dev/null || $CH wpa_cli -i wlan0 -a /usr/local/sbin/station-net-event -B
-		if ! kill -0 "$(cat $R/run/udhcpc.pid 2>/dev/null)" 2>/dev/null; then
+		if ! alive $R/run/udhcpc.pid; then
 			say "udhcpc was gone: starting it again"
 			udhcpc -i wlan0 -s /udhcpc.sh -t 8 -T 3 -b -p $R/run/udhcpc.pid
 		fi
