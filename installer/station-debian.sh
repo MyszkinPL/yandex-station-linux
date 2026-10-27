@@ -54,11 +54,15 @@ m() { [ -n "$MACHINE" ] && echo "@$*" >&3; return 0; }
 mkdir -p $S $DL
 log() { echo "$(date '+%F %T') $*" >> $LOG; }
 say() { echo "$*"; log "$*"; }
-ok() { echo "  [ok] $*"; log "ok: $*"; m ok "$*"; }
-warn() { echo "  [!]  $*"; log "warn: $*"; m warn "$*"; }
-step() { echo; echo "== $*"; log "== $*"; m step "$*"; }
+# colour on a terminal (green done, yellow note, red stop)
+COLOR=""
+[ -z "$MACHINE" ] && [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && COLOR=yes
+c() { [ -n "$COLOR" ] && printf '\033[%sm' "$1"; return 0; }
+ok() { echo "  $(c 32)[ok]$(c 0) $*"; log "ok: $*"; m ok "$*"; }
+warn() { echo "  $(c 33)[!]$(c 0)  $*"; log "warn: $*"; m warn "$*"; }
+step() { echo; echo "$(c 1)== $*$(c 0)"; log "== $*"; m step "$*"; }
 die() { # $1 what, $2 what to do, $3 exit code
-	echo; echo "  [x]  $1"; log "FAIL: $1"
+	echo; echo "  $(c 31)[x]$(c 0)  $1"; log "FAIL: $1"
 	[ -n "${2:-}" ] && echo "       $2"
 	echo; echo "  Остановился здесь; всё, что сделано до этого, проверено. Журнал: $LOG"
 	m fail "${3:-$E_FAIL}" "$1${2:+ | $2}"
@@ -118,12 +122,31 @@ direct_ok() {
 		[ "$(dd if=/dev/block/mmcblk0 bs=512 skip=32806 count=1984 2>/dev/null | sha256sum | cut -d' ' -f1)" = $UBOOT_OK ]
 }
 
+# A problem found by the check: kept, and all of them are shown at its end
+# with what to do (the basics - Android, the Station, root - stop at once:
+# nothing after them could be checked)
+PROBLEMS="" PCODE=""
+problem() { # $1 what, $2 what to do, $3 exit code
+	warn "$1"; [ -n "${2:-}" ] && echo "       $2"
+	PROBLEMS="$PROBLEMS$1|${2:-}
+"
+	[ -n "$PCODE" ] || PCODE=${3:-$E_FAIL}
+	m problem "${3:-$E_FAIL}" "$1${2:+ | $2}"
+}
+report_problems() {
+	echo
+	echo "  $(c 31)$(c 1)Установка не начнётся: на Станции надо поправить вот что$(c 0)"
+	printf %s "$PROBLEMS" | awk -F '|' '{ printf "  %d. %s\n", NR, $1; if ($2 != "") printf "     → %s\n", $2 }'
+	echo; echo "  Поправьте и запустите ту же команду снова: на Станции ничего не менялось."
+}
+
 checks() {
 	step "Проверка Станции (ничего не меняет)"
 	in_android || die "Это запускается в Android Станции." "Войдите в Android по SSH под root и запустите там." $E_NOT_STATION
 	[ "$(getprop ro.board.platform)" = tulip ] && [ "$(getprop ro.build.version.release)" = 6.0.1 ] ||
 		die "Это не Яндекс Станция 1 (YNDX-0001): $(getprop ro.product.model) на $(getprop ro.board.platform)." "Установщик только для неё." $E_NOT_STATION
-	ok "Яндекс Станция 1, прошивка $(getprop ro.build.version.incremental)"
+	FW=$(getprop ro.build.version.incremental)
+	ok "Яндекс Станция 1, прошивка $FW"
 	[ "$(id -u)" = 0 ] || die "Нужен root." "Запустите от root." $E_NO_ROOT
 	eff=$(awk '/^CapEff/ { print $2 }' /proc/self/status)
 	[ $(( (0x$eff >> 21) & 1 )) = 1 ] ||
@@ -134,15 +157,14 @@ checks() {
 			"Пришлите: for p in /sys/class/block/mmcblk0p*; do echo \$p \$(cat \$p/start \$p/size); done" $E_NOT_STATION
 	ok "разметка eMMC как на проверенных Станциях"
 	r=$(pmic_reg)
-	[ "$r" = "REG[f]=e" ] || die "Флаг загрузки в PMIC не в обычном состоянии ($r)." "Выключите Станцию из розетки на 10 с и повторите."
-	ok "флаг загрузки в PMIC в норме"
-	misc_ours_or_free || die "Конец раздела misc занят чем-то чужим." "Там должен быть журнал Debian. Не трогаю." $E_NOT_STATION
-	ok "место для журнала Debian в misc $(misc_head | grep -q $MAGIC && echo 'уже наше' || echo свободно)"
-	[ -f $RC ] && grep -qE 'quasar/onboot\.sh|station/handoff\.sh' $RC ||
-		die "В $RC нет запуска Яндекса." "Прошивка не такая, как на проверенных Станциях." $E_NOT_STATION
-	remount_system rw || die "/system не делается записываемым." "Нужен root с полными правами." $E_NO_ROOT
-	remount_system ro
-	ok "/system можно менять (одна строка в rc.local для передачи в Debian)"
+	if [ "$r" = "REG[f]=e" ]; then ok "флаг загрузки в PMIC в норме"
+	else problem "Флаг загрузки в PMIC не в обычном состоянии ($r)." "Выключите Станцию из розетки на 10 секунд, включите и повторите." $E_FAIL; fi
+	if misc_ours_or_free; then ok "место для журнала Debian в misc $(misc_head | grep -q $MAGIC && echo 'уже наше' || echo свободно)"
+	else problem "Конец раздела misc занят чем-то чужим (там будет журнал Debian)." "Похоже, на Станции стоит что-то ещё. Пришлите журнал $LOG." $E_NOT_STATION; fi
+	if [ -f $RC ] && grep -qE 'quasar/onboot\.sh|station/handoff\.sh' $RC; then :
+	else problem "В $RC нет запуска Яндекса: прошивка не такая, как на проверенных Станциях." "Пришлите журнал $LOG и версию прошивки ($FW)." $E_NOT_STATION; fi
+	if remount_system rw; then remount_system ro; ok "/system можно менять (одна строка в rc.local для передачи в Debian)"
+	else problem "/system не делается записываемым." "Нужна оболочка root с полными правами (SSH под root, adb root)." $E_NO_ROOT; fi
 	n=0
 	for f in vendor/modules/fw_bcm4356a2_ag.bin:ff7351dae9bd36f47a494579ae22330dcbeee61bf755e902c67b7bb418928e55 \
 		vendor/modules/nvram.txt:fa23dcba44074022314e9ac2eafb5993cf47f0a5b75df27f770f3e542f991560 \
@@ -150,36 +172,39 @@ checks() {
 		vendor/firmware/tas5751m-2a.txt:9df7ff949168a040f6f7db36a0c7ee4c1c932274622e9ac9d6f5d665864ddc1f \
 		vendor/firmware/tas5751m-2b.txt:6fddd462a57681870ebba0ca22e902b6044e0c697bcea5d1540f33ea2efd450e; do
 		p=/system/${f%%:*}
-		[ -e $p ] || die "В Android нет $p." "Без него в Debian не будет Wi-Fi или звука." $E_NOT_STATION
-		[ "$(sha_of $p)" = "${f#*:}" ] && n=$((n+1)) || warn "$p не такой, как на проверенных Станциях (Debian возьмёт его всё равно)"
+		if [ ! -e $p ]; then problem "В Android нет $p: без него в Debian не будет Wi-Fi или звука." "Прошивка Станции не такая, как на проверенных. Пришлите журнал $LOG." $E_NOT_STATION
+		elif [ "$(sha_of $p)" = "${f#*:}" ]; then n=$((n+1))
+		else warn "$p не такой, как на проверенных Станциях (Debian возьмёт его всё равно)"; fi
 	done
-	ok "прошивки Wi-Fi, Bluetooth и усилителей на месте ($n из 5 как на проверенных)"
+	[ $n = 5 ] && ok "прошивки Wi-Fi, Bluetooth и усилителей на месте"
 	if direct_ok; then ok "загрузчик как на проверенных Станциях: можно и быструю загрузку (--mode direct)"; DIRECT_OK=yes
 	else ok "загрузчик другой, чем на проверенных Станциях: быстрая загрузка недоступна, обычная — да"; fi
-	cf=$(mb_free /cache) df=$(mb_free /data)
-	if [ "${cf:-0}" -lt $NEED_CACHE_MB ] && ! plain_rootfs; then
+	CF=$(mb_free /cache) DF=$(mb_free /data) space=yes
+	if [ "${CF:-0}" -lt $NEED_CACHE_MB ] && ! plain_rootfs; then
 		big=$(ls -S /cache/*.zip 2>/dev/null | head -1)
-		msg="В /cache свободно ${cf:-?} МБ, а Debian нужно $NEED_CACHE_MB."
-		h="${big:+Там лежит скачанное обновление Android ($(du -m $big | cut -f1) МБ), его можно удалить: rm $big}"
-		[ $CMD = install ] && die "$msg" "$h" $E_SPACE
-		warn "$msg"; [ -n "$h" ] && echo "       $h"
-		BLOCK="${BLOCK}место в /cache; "
+		problem "В /cache свободно ${CF:-?} МБ, а Debian нужно $NEED_CACHE_MB." \
+			"${big:+Там лежит скачанное обновление Android ($(du -m $big | cut -f1) МБ), его можно удалить: rm $big}" $E_SPACE
+		space=""
 	fi
-	[ "${df:-0}" -ge $NEED_DATA_MB ] || die "В /data свободно ${df:-?} МБ, нужно $NEED_DATA_MB." "Освободите место в /data." $E_SPACE
-	ok "место: /cache ${cf} МБ, /data ${df} МБ"
-	ip -4 addr show wlan0 2>/dev/null | grep -q "inet " ||
-		die "Станция не в сети Wi-Fi." "Подключите её в приложении Яндекса и повторите." $E_NET
-	ok "Wi-Fi: $(ip -4 addr show wlan0 | awk '/inet / { print $2; exit }')"
+	if [ "${DF:-0}" -lt $NEED_DATA_MB ]; then
+		problem "В /data свободно ${DF:-?} МБ, а нужно $NEED_DATA_MB." "Удалите ненужное из /data (например, старые файлы в /data/local/tmp)." $E_SPACE
+		space=""
+	fi
+	[ -n "$space" ] && ok "место: /cache ${CF} МБ, /data ${DF} МБ"
+	IPADDR=$(ip -4 addr show wlan0 2>/dev/null | awk '/inet / { sub("/.*", "", $2); print $2; exit }')
+	if [ -n "$IPADDR" ]; then ok "Wi-Fi: $IPADDR"
+	else problem "Станция не в сети Wi-Fi: Debian нечего скачать и не к чему подключиться." "Подключите Станцию к Wi-Fi в приложении Яндекса и повторите." $E_NET; fi
 	if [ -d $C/rootfs ] && ! plain_rootfs; then
-		[ $CMD = install ] || [ $CMD = update ] &&
-			die "В $C/rootfs уже стоит другая система (не этот Debian)." "Не трогаю её. Если она не нужна: rm -rf $C/rootfs и повторите." $E_BLOCKED
-		warn "в $C/rootfs другая система: установка её не тронет и остановится"
-		BLOCK="${BLOCK}другая система в $C/rootfs; "
+		problem "В $C/rootfs уже стоит другая система (не этот Debian)." "Установщик её не трогает. Если она не нужна: rm -rf $C/rootfs" $E_BLOCKED
 	fi
+	[ -z "$PROBLEMS" ] && return 0
+	case $CMD in
+	install|update) report_problems; m fail $PCODE "problems found"; exit $PCODE ;;
+	esac
 }
 
-# --- choices: a menu on a terminal, flags and defaults otherwise -------------
-BLOCK="" KEY="" PASSWORD="" WIFI_NAME="" WIFI_PASS="" TZ_SET="" MODE="" YES="" FROM="" PASS="" DIRECT_OK=""
+# --- choices: a settings screen on a terminal, flags and defaults otherwise --
+FW="" IPADDR="" CF="" DF="" NOTE="" KEY="" PASSWORD="" WIFI_NAME="" WIFI_PASS="" TZ_SET="" MODE="" YES="" FROM="" PASS="" DIRECT_OK=""
 asking() { [ -t 0 ] && [ -z "$YES" ] && [ -z "$MACHINE" ]; }
 ask() { # $1 prompt, $2 default -> REPLY
 	if asking; then printf '%s [%s]: ' "$1" "$2"; read -r REPLY || REPLY=""; [ -n "$REPLY" ] || REPLY=$2
@@ -187,37 +212,136 @@ ask() { # $1 prompt, $2 default -> REPLY
 }
 have_login() { [ -s $C/persist/ssh/authorized_keys ] || [ -s $C/persist/ssh/root.hash ]; }
 mode_name() { case $1 in debian) echo "Debian через Android" ;; android) echo Android ;; direct) echo "Debian сразу (быстрая загрузка)" ;; esac; }
+TZ_LIST="Europe/Kaliningrad Europe/Moscow Europe/Samara Asia/Yekaterinburg Asia/Omsk Asia/Novosibirsk
+	Asia/Krasnoyarsk Asia/Irkutsk Asia/Yakutsk Asia/Vladivostok Asia/Magadan Asia/Kamchatka"
+tz_name() {
+	case $1 in
+	Europe/Kaliningrad) echo "Калининград (МСК−1)" ;; Europe/Moscow) echo "Москва (МСК)" ;;
+	Europe/Samara) echo "Самара (МСК+1)" ;; Asia/Yekaterinburg) echo "Екатеринбург (МСК+2)" ;;
+	Asia/Omsk) echo "Омск (МСК+3)" ;; Asia/Novosibirsk) echo "Новосибирск (МСК+4)" ;;
+	Asia/Krasnoyarsk) echo "Красноярск (МСК+4)" ;; Asia/Irkutsk) echo "Иркутск (МСК+5)" ;;
+	Asia/Yakutsk) echo "Якутск (МСК+6)" ;; Asia/Vladivostok) echo "Владивосток (МСК+7)" ;;
+	Asia/Magadan) echo "Магадан (МСК+8)" ;; Asia/Kamchatka) echo "Камчатка (МСК+9)" ;;
+	*) echo "$1" ;;
+	esac
+}
+# Area/City, letters and the few signs zone names have
+tz_ok() { case "$1" in [A-Z]*/[A-Za-z]*) [ "${1#*[!A-Za-z0-9_/+-]}" = "$1" ] ;; *) false ;; esac; }
+mode_desc() {
+	case $1 in
+	debian) echo "Debian через Android — надёжно, ~3 мин после включения" ;;
+	direct) echo "Debian сразу — быстро, ~15 с после включения" ;;
+	android) echo "Android, как сейчас; Debian — по команде «enter»" ;;
+	esac
+}
+login_desc() {
+	if [ -n "$KEY" ]; then echo "ключ ${KEY%% *} (${KEY##* })"
+	elif [ -n "$PASSWORD" ]; then echo "пароль — придумаю и покажу в конце"
+	else echo "как было (ключ или пароль уже сохранены)"; fi
+}
+line() { echo "  $(c 36)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(c 0)"; }
+screen() {
+	[ -n "$COLOR" ] && printf '\033[2J\033[H'
+	line
+	echo "   $(c 1)Debian для Яндекс Станции 1$(c 0)                  $(c 2)$VERSION$(c 0)"
+	line
+	echo "   $(c 32)✓$(c 0) Станция проверена: прошивка $FW, Wi-Fi $IPADDR"
+	echo "     место: /cache $CF МБ, /data $DF МБ$([ -n "$DIRECT_OK" ] && echo ", быстрая загрузка доступна")"
+	echo
+	echo "   $(c 1)Настройки$(c 0)"
+	echo "   $(c 36)1$(c 0)  Загрузка        $(mode_desc $MODE)"
+	echo "   $(c 36)2$(c 0)  Вход по SSH     $(login_desc)"
+	echo "   $(c 36)3$(c 0)  Ещё сеть Wi-Fi  ${WIFI_NAME:-нет (Debian возьмёт сети, сохранённые в Android)}"
+	echo "   $(c 36)4$(c 0)  Часовой пояс    $(tz_name $TZ_SET)"
+	echo
+	echo "   $(c 1)Enter$(c 0) — установить    $(c 1)1–4$(c 0) — изменить    $(c 1)q$(c 0) — выйти"
+	line
+	[ -n "$NOTE" ] && echo "   $(c 33)$NOTE$(c 0)"
+	NOTE=""
+	printf '  > '
+}
+pick_mode() {
+	echo; echo "   $(c 1)Что запускать при включении Станции$(c 0)"
+	echo "   $(c 36)1$(c 0)  Debian через Android — надёжно: Android включается первым и через"
+	echo "      пару минут сам передаёт Станцию Debian"
+	if [ -n "$DIRECT_OK" ]; then
+		echo "   $(c 36)2$(c 0)  Debian сразу — быстро, ~15 с. Android переезжает в recovery:"
+		echo "      кнопка Алисы 10 секунд — и Станция в Android"
+	else
+		echo "   $(c 2)2  Debian сразу — недоступно: загрузчик этой Станции ещё не проверяли$(c 0)"
+	fi
+	echo "   $(c 36)3$(c 0)  Android с Алисой, как сейчас; Debian — по команде «enter»"
+	printf '  > '; read -r r || r=""
+	case "$r" in
+	1) MODE=debian ;; 3) MODE=android ;;
+	2) if [ -n "$DIRECT_OK" ]; then MODE=direct; else NOTE="Быстрая загрузка на этой Станции недоступна."; fi ;;
+	"") ;; *) NOTE="Выберите 1, 2 или 3." ;;
+	esac
+}
+pick_login() {
+	echo; echo "   $(c 1)Вход в Debian по SSH (root)$(c 0)"
+	echo "   Вставьте свой открытый ключ одной строкой (ssh-ed25519 …)"
+	echo "   или нажмите Enter — тогда будет пароль, он покажется один раз в конце."
+	printf '  > '; read -r r || r=""
+	case "$r" in
+	ssh-*|ecdsa-*|sk-*) KEY=$r PASSWORD="" ;;
+	"") KEY="" PASSWORD=yes ;;
+	*) NOTE="Это не похоже на открытый ключ: он начинается с ssh-ed25519, ssh-rsa или ecdsa-." ;;
+	esac
+}
+pick_wifi() {
+	echo; echo "   $(c 1)Ещё одна сеть Wi-Fi$(c 0) (сети, сохранённые в Android, Debian возьмёт сам)"
+	echo "   Имя сети (Enter — не добавлять):"
+	printf '  > '; read -r n || n=""
+	[ -n "$n" ] || { WIFI_NAME="" WIFI_PASS=""; return; }
+	echo "   Пароль сети «$n» (Enter — открытая сеть):"
+	printf '  > '; read -r w || w=""
+	if [ -n "$w" ] && { [ ${#w} -lt 8 ] || [ ${#w} -gt 63 ]; }; then
+		NOTE="Пароль Wi-Fi — от 8 до 63 знаков; сеть не добавлена."
+	else
+		WIFI_NAME=$n WIFI_PASS=$w
+	fi
+}
+pick_tz() {
+	echo; echo "   $(c 1)Часовой пояс$(c 0)"
+	i=0
+	for z in $TZ_LIST; do i=$((i+1)); printf '   %s%2d%s  %s\n' "$(c 36)" $i "$(c 0)" "$(tz_name $z)"; done
+	echo "   или впишите свой, например Europe/Minsk"
+	printf '  > '; read -r r || r=""
+	case "$r" in
+	"") ;;
+	*[!0-9]*) if tz_ok "$r"; then TZ_SET=$r; else NOTE="Не знаю такой пояс: «$r»."; fi ;;
+	*) set -- $TZ_LIST
+		if [ "$r" -ge 1 ] && [ "$r" -le $# ]; then shift $((r - 1)); TZ_SET=$1; else NOTE="Выберите номер из списка."; fi ;;
+	esac
+}
 choices() {
-	step "Настройки (Enter — то, что в скобках)"
-	if [ -z "$MODE" ]; then
-		if asking; then
-			echo "  Что запускать при включении Станции:"
-			echo "    1) Debian: Android загружается первым и через пару минут сам передаёт Станцию Debian"
-			echo "    2) Android с Алисой, как сейчас; Debian — по команде «enter»"
-			[ -n "$DIRECT_OK" ] &&
-				echo "    3) Debian сразу, за ~15 с (Android переезжает в recovery: кнопка Алисы 10 с — и он там)"
-		fi
-		ask "  Выбор" 1
-		case "$REPLY" in 2) MODE=android ;; 3) [ -n "$DIRECT_OK" ] && MODE=direct || MODE=debian ;; *) MODE=debian ;; esac
+	step "Настройки"
+	# the time zone Android is set to, if it is a real one
+	[ -n "$TZ_SET" ] || { TZ_SET=$(getprop persist.sys.timezone); tz_ok "$TZ_SET" || TZ_SET=Europe/Moscow; }
+	[ -n "$MODE" ] || MODE=debian
+	[ -n "$KEY" ] || [ -n "$PASSWORD" ] || have_login || PASSWORD=yes
+	if asking; then
+		while :; do
+			screen
+			read -r REPLY || die "Отменено: на Станции ничего не менялось." "" $E_CANCELLED
+			case "$REPLY" in
+			"") break ;;
+			1) pick_mode ;; 2) pick_login ;; 3) pick_wifi ;; 4) pick_tz ;;
+			q|Q|й|Й) echo; echo "  Отменено: на Станции ничего не менялось."; m fail $E_CANCELLED cancelled; exit $E_CANCELLED ;;
+			*) NOTE="Не понял «$REPLY»: Enter — установить, 1–4 — изменить, q — выйти." ;;
+			esac
+		done
+		[ -n "$COLOR" ] && printf '\033[2J\033[H'
 	fi
 	case "$MODE" in debian|android|direct) ;; *) die "--mode: debian, android или direct, а не «$MODE»." "" $E_USAGE ;; esac
 	[ $MODE = direct ] && [ -z "$DIRECT_OK" ] &&
 		die "Быструю загрузку на этом загрузчике ещё не проверяли." "Поставьте обычную (--mode debian) или пришлите вывод «check»." $E_NO_DIRECT
-	if [ -z "$KEY" ] && [ -z "$PASSWORD" ] && ! have_login; then
-		asking && echo "  Вход в Debian по SSH (root): вставьте свой открытый ключ (ssh-ed25519 ...)" &&
-			echo "  или нажмите Enter — тогда будет пароль, он покажется один раз в конце."
-		ask "  Ключ" ""; case "$REPLY" in ssh-*|ecdsa-*|sk-*) KEY=$REPLY ;; *) PASSWORD=yes ;; esac
-	fi
-	if [ -z "$WIFI_NAME" ] && asking; then
-		echo "  Wi-Fi: Debian сам возьмёт сети, сохранённые в Android. Добавить ещё одну?"
-		ask "  Имя сети (Enter — не надо)" ""; WIFI_NAME=$REPLY
-		[ -n "$WIFI_NAME" ] && { ask "  Пароль сети (Enter — открытая)" ""; WIFI_PASS=$REPLY; }
-	fi
-	[ -n "$TZ_SET" ] || { ask "  Часовой пояс" "Europe/Moscow"; TZ_SET=$REPLY; }
+	tz_ok "$TZ_SET" || die "Не знаю такой часовой пояс: «$TZ_SET»." "Например: Europe/Moscow, Asia/Yekaterinburg." $E_USAGE
 	if [ -n "$WIFI_PASS" ] && { [ ${#WIFI_PASS} -lt 8 ] || [ ${#WIFI_PASS} -gt 63 ]; }; then
 		die "Пароль Wi-Fi должен быть от 8 до 63 знаков." "" $E_USAGE
 	fi
-	ok "при включении: $(mode_name $MODE), пояс $TZ_SET, вход: $([ -n "$KEY" ] && echo ключ || { [ -n "$PASSWORD" ] && echo пароль || echo как был; })"
+	ok "при включении: $(mode_desc $MODE); вход: $(login_desc); пояс: $(tz_name $TZ_SET)"
 }
 
 # --- steps ------------------------------------------------------------------
@@ -316,8 +440,13 @@ save_login() {
 show_password() {
 	[ -n "$PASS" ] || return 0
 	m password "$PASS"
-	echo; echo "  ПАРОЛЬ root в Debian: $PASS"
-	echo "  Запишите его. Забудете — новый даст «sh station-debian.run access» из Android."; echo
+	echo
+	echo "  $(c 33)┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓$(c 0)"
+	echo "     Пароль root в Debian:   $(c 1)$PASS$(c 0)"
+	echo "     Запишите его: больше он нигде не покажется."
+	echo "     Забудете — новый даст «sh station-debian.run access» из Android."
+	echo "  $(c 33)┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛$(c 0)"
+	echo
 }
 
 persist() {
@@ -440,7 +569,7 @@ reboot_now() {
 
 enter_debian() {
 	if boot_is_ours; then
-		say "Перезагружаюсь в Debian (быстрая загрузка). Через ~15 с он в сети: ssh root@<адрес Станции>."
+		say "Перезагружаюсь в Debian (быстрая загрузка). Через ~15 с он в сети: $(c 1)ssh root@${IPADDR:-<адрес Станции>}$(c 0)"
 		reboot_now direct; return
 	fi
 	set -- $(cat $S/recovery.sha256 2>/dev/null)
@@ -450,7 +579,7 @@ enter_debian() {
 	printf '%s-HANDOFF\n' $MAGIC | dd of=$MISC bs=4096 seek=$LOG_SEEK conv=notrunc,sync 2>/dev/null; sync
 	echo 0f10 > $PMIC; echo 0f > $PMIC
 	[ "$(cat $PMIC)" = "REG[f]=10" ] || die "Флаг загрузки в PMIC не встал." ""
-	say "Перезагружаюсь в Debian. Через минуту он в сети: ssh root@<адрес Станции>."
+	say "Перезагружаюсь в Debian. Через минуту он в сети: $(c 1)ssh root@${IPADDR:-<адрес Станции>}$(c 0)"
 	say "Если что-то не так, Станция сама вернётся в Android; там: «sh station-debian.run status»."
 	reboot_now recovery
 }
@@ -540,9 +669,9 @@ echo "Debian для Яндекс Станции 1 — установщик $VERS
 m start "$CMD" "$VERSION"
 case $CMD in
 version) m version "$VERSION"; echo "$VERSION" ;;
-check) checks; echo
-	[ -z "$BLOCK" ] || { m blocked "${BLOCK%; }"; echo "Перед установкой надо решить: ${BLOCK%; }."; exit $E_BLOCKED; }
-	echo "Станция готова к установке." ;;
+check) checks
+	if [ -n "$PROBLEMS" ]; then report_problems; m blocked "$(printf %s "$PROBLEMS" | cut -d'|' -f1 | tr '\n' ';')"; exit $E_BLOCKED; fi
+	echo; echo "  $(c 32)Станция готова к установке.$(c 0)" ;;
 download) checks; step "Загрузка ($URL)"; fetch $IMG $IMG_SHA; fetch $ROOTFS $ROOTFS_SHA
 	[ -n "$DIRECT_OK" ] && fetch $BOOT_IMG $BOOT_SHA
 	tar -tzf $DL/$ROOTFS ./etc/station/plain > /dev/null 2>&1 && ok "архив Debian читается"

@@ -8,8 +8,11 @@
 так что Станция всегда может вернуться на неё.
 
 **Хотите просто Debian на Станции?** → [docs/INSTALL-DEBIAN.md](docs/INSTALL-DEBIAN.md):
-один файл из [выпусков](https://github.com/MyszkinPL/yandex-station-linux/releases), запускается
-в Android Станции, всё проверяет и ставит сам.
+одна команда в Android Станции, дальше экран настроек, проверка и установка сами:
+
+```sh
+curl -kfsSL https://github.com/MyszkinPL/yandex-station-linux/releases/latest/download/install.sh | sh
+```
 
 ## Что работает
 

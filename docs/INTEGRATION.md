@@ -12,6 +12,10 @@ https://github.com/MyszkinPL/yandex-station-linux/releases/latest/download/stati
 https://github.com/MyszkinPL/yandex-station-linux/releases/latest/download/SHA256SUMS
 ```
 
+Или одной командой для человека — `install.sh` (скачивает установщик своего выпуска, проверяет,
+что тот скачался целиком, и запускает с терминалом): `curl -kfsSL .../latest/download/install.sh | sh`,
+флаги — после `sh -s --`. Приложению удобнее скачивать сам `.run`, как ниже.
+
 Конкретный выпуск — `releases/download/debian-vN/...`. Всё, что установщик скачивает сам, он
 сверяет с sha256, зашитыми в него; сам `station-debian.run` проверяйте по `SHA256SUMS` того же
 выпуска (на ПК или в своём приложении: curl Android 6 не проверяет сертификаты, `-k`).
@@ -80,6 +84,7 @@ sh station-debian.run <команда> --machine [флаги]
 | `@status key=value ...` | `status`: `installed=yes\|no mode=debian\|android\|direct\|none recovery=debian\|android\|stock\|other last_boot=ok\|early\|to-android\|stay\|handoff\|none version=... rootfs=... direct_ok=yes\|no` |
 | `@done <команда> [mode=...]` | команда закончилась успешно |
 | `@reboot direct\|recovery` | сейчас перезагрузится |
+| `@problem <код> <что \| что делать>` | проверка нашла проблему; все проблемы идут подряд, потом `@fail` (или `@blocked` у `check`) |
 | `@fail <код> <что \| что делать>` | ошибка; затем выход с этим кодом |
 
 ## Коды выхода
@@ -101,7 +106,7 @@ sh station-debian.run <команда> --machine [флаги]
 
 ## Обычный сценарий
 
-1. `check --machine` → код 0 или показать `@blocked` / `@fail`.
+1. `check --machine` → код 0, или показать человеку все `@problem` (каждая — что не так и что сделать).
 2. `install --machine --mode debian --key "<ключ пользователя>"` отвязанно; ждать `@reboot`.
 3. Ждать SSH Станции (порт 22): Debian ответит через ~3 мин (`debian`) или ~15 с (`direct`).
    Не ответил за 5 мин — Станция сама вернулась в Android: `status --machine` расскажет почему.
