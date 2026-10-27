@@ -21,7 +21,7 @@
 
 /* ---- switches (defaults = PLAN.md batch "full") ---- */
 #ifndef WF2_SMP
-#define WF2_SMP		0	/* 0: maxcpus=1 in bootargs (first SCP-channel tests) */
+#define WF2_SMP		1	/* 0: maxcpus=1 in bootargs (first SCP-channel tests) */
 #endif
 #ifndef WF2_RTC
 #define WF2_RTC		1	/* needs the wf2 Image (RTC_DRV_SUN6I=y) */
@@ -92,13 +92,16 @@
 	 * kexec'd kernel that hangs still falls back to Android.
 	 * hw_protection=reboot: a critical thermal trip resets through the WDT
 	 * instead of PSCI SYSTEM_OFF (unsafe on this board, E2).
+	 * loglevel=4: warnings and worse on the HDMI console. At 7 every info
+	 * line of every service was drawn there, inside the service's own
+	 * write(), all the time (the whole log is still in dmesg and ramoops).
 	 */
 	/* dtc does not concatenate adjacent strings: both variants spelled out */
 	chosen {
 #if WF2_SMP
-		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused hw_protection=reboot watchdog.stop_on_reboot=0 rdinit=/init";
+		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=4 clk_ignore_unused hw_protection=reboot watchdog.stop_on_reboot=0 rdinit=/init";
 #else
-		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=7 clk_ignore_unused maxcpus=1 hw_protection=reboot watchdog.stop_on_reboot=0 rdinit=/init";
+		bootargs = "console=tty0 consoleblank=0 fbcon=font:TER16x32 video=HDMI-A-1:1920x1080@60 panic=5 loglevel=4 clk_ignore_unused maxcpus=1 hw_protection=reboot watchdog.stop_on_reboot=0 rdinit=/init";
 #endif
 	};
 
@@ -143,7 +146,7 @@
 			no-map;
 			record-size = <0x20000>;
 			console-size = <0x80000>;
-			pmsg-size = <0x40000>;
+			ecc-size = <16>;
 		};
 	};
 
@@ -1214,3 +1217,15 @@
 	cpu-supply = <&reg_vdd_cpux>;
 };
 #endif
+
+/*
+ * Not used by a speaker: the GPU (lima) and the video decoder (cedrus) are
+ * off in the config, and their nodes too, so nothing waits on them.
+ */
+&mali {
+	status = "disabled";
+};
+
+&{/soc/video-codec@1c0e000} {
+	status = "disabled";
+};
