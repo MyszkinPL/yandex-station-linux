@@ -49,7 +49,8 @@ mv \$B \$S/bin/busybox; B=\$S/bin/busybox
 \$B dd if="\$0" bs=4096 skip=$((STUB_BLOCKS + BB_BLOCKS)) 2>/dev/null > \$S/bin/station-debian.sh
 [ "\$(\$B sha256sum \$S/bin/station-debian.sh | \$B cut -d' ' -f1)" = $(sha "$W/installer.sh") ] ||
 	{ echo "station-debian.run: the file is damaged (installer), download it again"; exit 1; }
-BB=\$B exec \$B sh \$S/bin/station-debian.sh "\$@"
+case "\$0" in /*) RUN=\$0 ;; *) RUN=\$PWD/\${0#./} ;; esac
+BB=\$B RUN=\$RUN exec \$B sh \$S/bin/station-debian.sh "\$@"
 EOF
 [ $(stat -c %s "$W/stub") -lt 4096 ]
 # padded with newlines to its block: the shell stops at exec, never reads on
@@ -72,7 +73,7 @@ F=/data/local/tmp/station-debian.run
 echo "Debian для Яндекс Станции 1: скачиваю установщик $TAG..."
 cd /data/local/tmp 2>/dev/null || { echo "Нет /data/local/tmp: это запускается в Android Станции."; exit 3; }
 rm -f \$F.part
-if ! curl -kfsSL --connect-timeout 20 --retry 2 -o \$F.part "https://github.com/$REPO/releases/download/$TAG/station-debian.run" ||
+if ! curl -kfsSL --connect-timeout 20 --retry 2 -o \$F.part 2>/dev/null "https://github.com/$REPO/releases/download/$TAG/station-debian.run" ||
 	[ "\$(wc -c < \$F.part | tr -d ' ')" != $RUN_SIZE ]; then
 	rm -f \$F.part
 	echo "Установщик не скачался целиком. Проверьте интернет на Станции и повторите."

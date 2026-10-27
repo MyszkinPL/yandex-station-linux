@@ -29,6 +29,8 @@ set -u
 umask 022
 export PATH=/data/local/station/bin:/system/bin:/system/xbin
 BB=${BB:-/data/local/station/bin/busybox}
+# how to run this installer again, for the hints (the stub passes its own path)
+RUNCMD="sh ${RUN:-/data/local/tmp/station-debian.run}"
 S=/data/local/station            # ours in Android's /data
 DL=$S/dl                         # downloads (/data has the room)
 B=$S/backup                      # what was there before us
@@ -444,7 +446,7 @@ show_password() {
 	echo "  $(c 33)┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓$(c 0)"
 	echo "     Пароль root в Debian:   $(c 1)$PASS$(c 0)"
 	echo "     Запишите его: больше он нигде не покажется."
-	echo "     Забудете — новый даст «sh station-debian.run access» из Android."
+	echo "     Забудете — новый даст «$RUNCMD access» из Android."
 	echo "  $(c 33)┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛$(c 0)"
 	echo
 }
@@ -580,7 +582,7 @@ enter_debian() {
 	echo 0f10 > $PMIC; echo 0f > $PMIC
 	[ "$(cat $PMIC)" = "REG[f]=10" ] || die "Флаг загрузки в PMIC не встал." ""
 	say "Перезагружаюсь в Debian. Через минуту он в сети: $(c 1)ssh root@${IPADDR:-<адрес Станции>}$(c 0)"
-	say "Если что-то не так, Станция сама вернётся в Android; там: «sh station-debian.run status»."
+	say "Если что-то не так, Станция сама вернётся в Android; там: «$RUNCMD status»."
 	reboot_now recovery
 }
 
@@ -704,7 +706,7 @@ install|update)
 	case $MODE in
 	direct) enter_debian ;;
 	debian) enter_debian ;;
-	*) say "Готово. Загрузить Debian: sh station-debian.run enter" ;;
+	*) say "Готово. Загрузить Debian: $RUNCMD enter" ;;
 	esac ;;
 status) status ;;
 log) dd if=$MISC bs=4096 skip=$LOG_SEEK count=$LOG_BLOCKS 2>/dev/null | tr -d '\000' ;;
@@ -719,7 +721,7 @@ access)
 	fi
 	step "Новый вход в Debian"; save_login; sync; show_password
 	m done access
-	say "Он заработает при следующей загрузке Debian: sh station-debian.run enter" ;;
+	say "Он заработает при следующей загрузке Debian: $RUNCMD enter" ;;
 stay|unstay)
 	boot_is_ours && die "При быстрой загрузке Станция всегда включается в Debian." \
 		"Android: кнопка Алисы 10 с или station-android в Debian. Насовсем в Android: uninstall." $E_USAGE
