@@ -55,6 +55,27 @@ make -s -k -C "$S" O="$O" CC="$CC" -j"$J" Image modules scripts_dtc
 rm -rf "$B/modroot"
 make -s -C "$S" O="$O" INSTALL_MOD_PATH="$B/modroot" INSTALL_MOD_STRIP=1 modules_install
 tar -C "$B/modroot" --owner=0 --group=0 --sort=name --mtime=@0 -czf "$OUT/modules.tar.gz" lib
+# For the initramfs: the drivers whose firmware init copies from the
+# Station's own Android (Wi-Fi, the amplifiers, Bluetooth), with what they
+# depend on and brcmfmac's vendor parts (it asks for those by name), and a
+# modules.dep of their own.
+KREL=$(cat "$O/include/config/kernel.release")
+M=$B/modroot/lib/modules/$KREL
+IM=$OUT/initramfs-modules
+rm -rf "$IM"; mkdir -p "$IM/lib/modules/$KREL"
+{
+	for n in brcmfmac snd-soc-tas571x hci_uart; do
+		modprobe --show-depends -d "$B/modroot" -S "$KREL" "$n" | awk '$1 == "insmod" { print $2 }'
+	done
+	find "$M/kernel/drivers/net/wireless/broadcom" -name '*.ko'
+} | sort -u | while read -r ko; do
+	rel=${ko#"$M"/}
+	mkdir -p "$IM/lib/modules/$KREL/$(dirname "$rel")"
+	cp "$ko" "$IM/lib/modules/$KREL/$rel"
+done
+cp "$M"/modules.builtin* "$M"/modules.order "$IM/lib/modules/$KREL/"
+depmod -b "$IM" "$KREL"
+echo "initramfs modules: $(find "$IM" -name '*.ko' | sed 's|.*/||' | tr '\n' ' ')"
 "$TOP/kernel/dts/build-dtbs.sh" "$S" "$OUT/dtb" "$O/scripts/dtc/dtc"
 
 # --- boot shim (boot/pack.py puts DTB, Image and initramfs behind it) ---

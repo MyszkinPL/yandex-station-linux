@@ -126,3 +126,35 @@ jobs:
           name: os
           path: out/os/
           retention-days: 30
+
+  image:
+    # the recovery image, the same for every Station: shim + DTB + kernel +
+    # the public initramfs (busybox, kexec, init, the firmware-needing drivers
+    # as modules; the firmware itself comes from each Station's own Android)
+    needs: [kernel, userspace]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel
+          path: out/
+      - uses: actions/download-artifact@v4
+        with:
+          name: userspace
+          path: out/userspace/
+      - name: Pack
+        run: |
+          mkdir -p out/image
+          for d in station station-fixed; do
+            python3 boot/pack.py --shim out/shim.bin --image out/Image --dtb out/dtb/$d.dtb \
+              --initramfs initramfs/initramfs.list -D BUILD=out/userspace -D MODULES=out/initramfs-modules \
+              -o out/image/recovery-$d.img
+          done
+          (cd out/image && sha256sum *.img > SHA256SUMS && cat SHA256SUMS && ls -l)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: out/image/
+          retention-days: 30

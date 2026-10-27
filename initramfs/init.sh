@@ -148,6 +148,45 @@ result=fail
 # --- loopback: services talk over localhost (SSH forwards, local ports) ---
 ip link set lo up
 
+# --- the vendor's firmware, from the Station's own Android ---
+# Wi-Fi, Bluetooth and the amplifiers' register scripts are Yandex's files:
+# not ours to publish, so not in this image. Every Station has them in its
+# Android system partition (found, like the others, by where it is): copied
+# from there at every boot, read-only, and checked against the known ones; a
+# file that differs is used all the same and said so. The drivers that need
+# them are modules, loaded after. Without them there is no Wi-Fi, and the
+# rule below (no Wi-Fi device for two minutes: back to Android) applies.
+SYSTEM_START=204800
+SYSTEM_SECTORS=4194304
+fw_from_android() {
+	SYS=$(part_at $SYSTEM_START $SYSTEM_SECTORS)
+	[ -n "$SYS" ] || { say "firmware: no Android system partition"; return; }
+	blockdev --setro /dev/$SYS
+	mkdir -p /mnt/system /lib/firmware/brcm
+	mount -t ext4 -o ro,noload /dev/$SYS /mnt/system || { say "firmware: cannot mount Android's system"; return; }
+	got=0; odd=""
+	while read -r dst src sha; do
+		if cp /mnt/system/$src /lib/firmware/$dst 2>/dev/null; then
+			got=$((got+1))
+			[ "$(sha256sum /lib/firmware/$dst | cut -d' ' -f1)" = "$sha" ] || odd="$odd ${dst##*/}"
+		else
+			say "firmware: no /system/$src in Android"
+		fi
+	done <<-FW
+	brcm/brcmfmac4356-sdio.bin vendor/modules/fw_bcm4356a2_ag.bin ff7351dae9bd36f47a494579ae22330dcbeee61bf755e902c67b7bb418928e55
+	brcm/brcmfmac4356-sdio.txt vendor/modules/nvram.txt fa23dcba44074022314e9ac2eafb5993cf47f0a5b75df27f770f3e542f991560
+	brcm/BCM4356A2.hcd vendor/modules/BCM4354A2.hcd a39b2736e9f698c95d24ddc5dca222c4586c1cac76bda977cf20643dede86dc7
+	tas5751m-2a.txt vendor/firmware/tas5751m-2a.txt 9df7ff949168a040f6f7db36a0c7ee4c1c932274622e9ac9d6f5d665864ddc1f
+	tas5751m-2b.txt vendor/firmware/tas5751m-2b.txt 6fddd462a57681870ebba0ca22e902b6044e0c697bcea5d1540f33ea2efd450e
+	FW
+	umount /mnt/system
+	say "firmware: $got of 5 from Android${odd:+, not the known one:$odd}"
+}
+fw_from_android
+for m in brcmfmac snd-soc-tas571x hci_uart; do
+	modprobe $m || say "cannot load $m"
+done
+
 # --- Wi-Fi ---
 # Without the Wi-Fi device ours cannot be reached by anyone: no network, no
 # access point to set one up. Up to two minutes for it, then Android.
@@ -255,7 +294,9 @@ if [ -e /sys/class/net/wlan0 ]; then
 		mount -t tmpfs tmpfs $R/run
 		mount -t tmpfs tmpfs $R/tmp
 	else
-		say "no root filesystem: neither ours nor Debian in /data"
+		# nothing to run SSH or the access point from: nobody could reach
+		# the Station, and a power cut would bring it back here again
+		to_android "no root filesystem: neither ours nor Debian in /data"
 	fi
 fi
 
@@ -336,8 +377,19 @@ if [ -x $R/usr/sbin/wpa_supplicant ]; then
 
 	# SSH from the start, whatever the network does: dropbear listens on
 	# every address the Station gets, now or later
+	# The owner's way in, kept in persist/ssh (the installer puts it there):
+	# their public keys, and/or a root password as its hash only.
+	# /etc/station/authorized_keys: a key built into a developer's own image.
 	mkdir -p $R/root/.ssh && chmod 700 $R/root/.ssh
-	cp /etc/station/authorized_keys $R/root/.ssh/authorized_keys && chmod 600 $R/root/.ssh/authorized_keys
+	SSHK=/mnt/cache/station/persist/ssh
+	for k in $SSHK/authorized_keys /etc/station/authorized_keys; do
+		[ -s $k ] && { cp $k $R/root/.ssh/authorized_keys && chmod 600 $R/root/.ssh/authorized_keys; break; }
+	done
+	if [ -s $SSHK/root.hash ]; then
+		h=$(head -1 $SSHK/root.hash)
+		sed -i "s|^root:[^:]*:|root:$h:|" $R/etc/shadow && say "root password from persist/ssh"
+	fi
+	[ -s $R/root/.ssh/authorized_keys ] || [ -s $SSHK/root.hash ] || say "no SSH key and no root password: nobody can log in over SSH"
 	mkdir -p $R/etc/dropbear
 	$CH dropbear -R -E -p 22 >> $L 2>&1
 

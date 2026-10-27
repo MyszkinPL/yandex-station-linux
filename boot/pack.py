@@ -44,7 +44,8 @@ def align(n, a):
 
 
 def cpio_from_list(path, defs):
-    """gen_init_cpio list format (dir/file/nod/slink), ${NAME} from -D, paths relative to the list"""
+    """gen_init_cpio list format (dir/file/nod/slink), ${NAME} from -D, paths relative to the list;
+    plus `tree <dest> <srcdir>`: <dest> made from a whole directory (dirs 0755, files 0644)"""
     base = os.path.dirname(os.path.abspath(path))
     out, ino = bytearray(), 300
     for ln, line in enumerate(open(path, encoding="utf-8"), 1):
@@ -65,6 +66,22 @@ def cpio_from_list(path, defs):
             out += cpio.entry(name, t | int(w[2], 8), ino=ino, rdev=(int(w[6]), int(w[7])))
         elif kind == "slink":
             out += cpio.entry(name, 0o120000 | int(w[3], 8), w[2].encode(), ino=ino)
+        elif kind == "tree":
+            src = w[2] if os.path.isabs(w[2]) else os.path.join(base, w[2])
+            if not os.path.isdir(src):
+                sys.exit(f"{path}:{ln}: no directory {src}")
+            for top, dirs, files in os.walk(src):
+                dirs.sort()
+                rel = os.path.relpath(top, src).replace(os.sep, "/")
+                d = name if rel == "." else f"{name}/{rel}"
+                ino += 1
+                out += cpio.entry(d, 0o040755, ino=ino, nlink=2)
+                for f in sorted(files):
+                    fp = os.path.join(top, f)
+                    if os.path.islink(fp):
+                        continue
+                    ino += 1
+                    out += cpio.entry(f"{d}/{f}", 0o100644, open(fp, "rb").read(), ino=ino)
         else:
             sys.exit(f"{path}:{ln}: unknown entry {kind}")
     return cpio.finish(out)
