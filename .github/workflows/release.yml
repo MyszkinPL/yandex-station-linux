@@ -54,7 +54,7 @@ jobs:
           echo "BSHA=$BSHA" >> "$GITHUB_ENV"
           echo "DEBIAN=$(cat w/rootfs/rootfs-plain-VERSION)" >> "$GITHUB_ENV"
       - name: The installer
-        run: scripts/pack-installer.sh "$TAG" rel w/userspace/busybox
+        run: bash scripts/pack-installer.sh "$TAG" rel w/userspace/busybox
       - name: Publish
         run: |
           (cd rel && sha256sum * > SHA256SUMS && cat SHA256SUMS)
