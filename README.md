@@ -7,6 +7,10 @@
 Образ ставится в слот recovery. boot0, U-Boot и стоковая прошивка остаются на месте,
 так что Станция всегда может вернуться на неё.
 
+**Хотите просто Debian на Станции?** → [docs/INSTALL-DEBIAN.md](docs/INSTALL-DEBIAN.md):
+один файл из [выпусков](https://github.com/MyszkinPL/yandex-station-linux/releases), запускается
+в Android Станции, всё проверяет и ставит сам.
+
 ## Что работает
 
 | | |
