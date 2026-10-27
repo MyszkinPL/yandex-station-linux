@@ -9,6 +9,9 @@ COMMON="-DWF2_SMP=1 -DWF2_RTC=1 -DWF2_THERMAL=1 -DWF2_CPUFREQ=1 -DWF2_WIFI=0 -DW
 variants=(
 	# Linux mode (stage B): serdev Bluetooth, LED ring and keys, audio
 	"station|$COMMON -DWF2_BT=2 -DWF2_LEDS_KEYS=1 -DWF2_AUDIO=1 -DWF2_PMIC=1"
+	# the same with CPU DVFS through the vendor SCP (module sun50i-a64-scp-cpufreq):
+	# up to 1152 MHz at the vendor's voltages instead of 1008 MHz at a fixed 1.20 V
+	"station-dvfs|$COMMON -DWF2_BT=2 -DWF2_LEDS_KEYS=1 -DWF2_AUDIO=1 -DWF2_PMIC=1 -DWF2_CPUFREQ=2"
 )
 # Bring-up of a new kernel version: the board with every optional block off
 # (eMMC, Wi-Fi, watchdog: enough for stage B and SSH), then one block at a
