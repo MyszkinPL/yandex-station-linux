@@ -1,5 +1,5 @@
 From: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
-Subject: [PATCH] watchdog: sunxi: restart through the SoC watchdog before PSCI
+Subject: [PATCH] watchdog: sunxi: restart, and power off, through the SoC watchdog before PSCI
 
 On the Yandex Station 1 (A64, vendor ATF + AR100 SCP firmware) PSCI
 SYSTEM_RESET is forwarded to the SCP, and with the SCP alive the board
@@ -11,12 +11,45 @@ so reboot and panic took the PSCI path. Use 192 so the watchdog goes
 first; PSCI stays as the fallback, which sunxi_wdt_restart() never
 returns to.
 
+PSCI SYSTEM_OFF on that board makes the SCP switch every PMIC rail off
+(AXP803 reg 0x32 := 0x80); with no battery and no power key the board
+stays dead until it is unplugged. On that board only (by its compatible),
+power-off restarts through the watchdog too, ahead of PSCI's handler.
+
 Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 ---
 --- a/drivers/watchdog/sunxi_wdt.c
 +++ b/drivers/watchdog/sunxi_wdt.c
-@@ -315,7 +315,12 @@
-
+@@ -19,6 +19,7 @@
+ #include <linux/moduleparam.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/reboot.h>
+ #include <linux/types.h>
+ #include <linux/watchdog.h>
+ 
+@@ -278,6 +279,19 @@
+ 	.wdt_key_val = 0x16aa0000,
+ };
+ 
++/*
++ * Power-off on the Yandex Station 1: PSCI SYSTEM_OFF makes the vendor SCP
++ * firmware switch every PMIC rail off, and there is no battery and no key
++ * to come back with — only unplugging. Restart through the watchdog
++ * instead, ahead of PSCI's handler.
++ */
++static int sunxi_wdt_power_off(struct sys_off_data *data)
++{
++	struct sunxi_wdt_dev *sunxi_wdt = data->cb_data;
++
++	return sunxi_wdt_restart(&sunxi_wdt->wdt_dev, 0, NULL);
++}
++
+ static const struct of_device_id sunxi_wdt_dt_ids[] = {
+ 	{ .compatible = "allwinner,sun4i-a10-wdt", .data = &sun4i_wdt_reg },
+ 	{ .compatible = "allwinner,sun6i-a31-wdt", .data = &sun6i_wdt_reg },
+@@ -315,7 +329,12 @@
+ 
  	watchdog_init_timeout(&sunxi_wdt->wdt_dev, timeout, dev);
  	watchdog_set_nowayout(&sunxi_wdt->wdt_dev, nowayout);
 -	watchdog_set_restart_priority(&sunxi_wdt->wdt_dev, 128);
@@ -26,6 +59,21 @@ Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 +	 * watchdog reset always reboots cleanly.
 +	 */
 +	watchdog_set_restart_priority(&sunxi_wdt->wdt_dev, 192);
-
+ 
  	watchdog_set_drvdata(&sunxi_wdt->wdt_dev, sunxi_wdt);
-
+ 
+@@ -335,6 +354,14 @@
+ 	err = devm_watchdog_register_device(dev, &sunxi_wdt->wdt_dev);
+ 	if (unlikely(err))
+ 		return err;
++
++	if (of_machine_is_compatible("yandex,station-tulip-d1")) {
++		err = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF,
++						    SYS_OFF_PRIO_FIRMWARE + 1,
++						    sunxi_wdt_power_off, sunxi_wdt);
++		if (err)
++			return err;
++	}
+ 
+ 	dev_info(dev, "Watchdog enabled (timeout=%d sec, nowayout=%d)",
+ 		 sunxi_wdt->wdt_dev.timeout, nowayout);

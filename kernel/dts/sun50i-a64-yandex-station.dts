@@ -476,6 +476,11 @@
 		regulator-max-microvolt = <20000000>;
 		gpio = <&pio 3 5 GPIO_ACTIVE_HIGH>; /* PD5 */
 		enable-active-high;
+		/*
+		 * the 20 V rail ramps slowly: the first amplifier's first access
+		 * right after it failed (patch 0016 retries, as a guard now)
+		 */
+		startup-delay-us = <500000>;
 	};
 
 	/* "TAS_AVDD_3V3", PD4 high = on; the vendor driver waits 100 ms */
