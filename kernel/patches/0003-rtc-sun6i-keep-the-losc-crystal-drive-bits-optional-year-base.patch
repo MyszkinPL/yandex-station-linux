@@ -153,4 +153,3 @@ Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
  	ret = devm_rtc_register_device(chip->rtc);
  	if (ret)
 
---- a/drivers/cpufreq/Kconfig.arm

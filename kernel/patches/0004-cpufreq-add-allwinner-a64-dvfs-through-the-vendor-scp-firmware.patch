@@ -10,6 +10,7 @@ TF-A and crust keep using cpufreq-dt.
 
 Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 ---
+--- a/drivers/cpufreq/Kconfig.arm
 +++ b/drivers/cpufreq/Kconfig.arm
 @@ -15,6 +15,20 @@
  	  To compile this driver as a module, choose M here: the
@@ -467,4 +468,3 @@ Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 +MODULE_DESCRIPTION("Allwinner A64 CPU DVFS through the vendor ATF/SCP firmware");
 +MODULE_LICENSE("GPL");
 
---- a/drivers/mmc/host/sunxi-mmc.c

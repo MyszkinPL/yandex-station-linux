@@ -1,5 +1,4 @@
 0001-drm-sun4i-dw-hdmi-survive-a-deferred-bind.patch
-0002-mmc-core-print-the-ocr-on-a-voltage-mismatch.patch
 0003-rtc-sun6i-keep-the-losc-crystal-drive-bits-optional-year-base.patch
 0004-cpufreq-add-allwinner-a64-dvfs-through-the-vendor-scp-firmware.patch
 0005-mmc-sunxi-optional-uhs-sample-phase-error-statistics.patch

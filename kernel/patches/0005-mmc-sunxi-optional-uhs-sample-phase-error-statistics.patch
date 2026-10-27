@@ -9,6 +9,7 @@ measured.
 
 Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 ---
+--- a/drivers/mmc/host/sunxi-mmc.c
 +++ b/drivers/mmc/host/sunxi-mmc.c
 @@ -221,6 +221,8 @@
  #define SDXC_CLK_50M_DDR_8BIT	4

@@ -15,6 +15,7 @@ On the Yandex Station the STM32 boot animation drives i2c0 at power-on;
 stopped mid-byte, it left a chip holding SDA low, and on a cold boot the
 LED ring and a mic ADC timed out at probe with the bus locked for good.
 
+Signed-off-by: MyszkinPL <211237936+MyszkinPL@users.noreply.github.com>
 ---
 diff --git a/drivers/i2c/busses/i2c-mv64xxx.c b/drivers/i2c/busses/i2c-mv64xxx.c
 --- a/drivers/i2c/busses/i2c-mv64xxx.c
