@@ -46,6 +46,9 @@ while IFS= read -r l; do
 done < <(grep '^CONFIG_.*=[ym]$' "$TOP/kernel/station.config")
 [ -z "$gone" ] || echo "note: no longer in this kernel:$gone"
 [ -z "$lost" ] || { echo "options lost by olddefconfig:"; printf '%s' "$lost"; exit 1; }
+# the same config, minimal: only what differs from the kernel's defaults
+make -s -C "$S" O="$O" savedefconfig
+cp "$O/defconfig" "$OUT/defconfig"
 
 # --- build ---
 make -s -k -C "$S" O="$O" CC="$CC" -j"$J" Image modules scripts_dtc
