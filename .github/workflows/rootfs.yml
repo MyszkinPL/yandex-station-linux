@@ -18,7 +18,7 @@ permissions:
 jobs:
   rootfs:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
       # arm64 maintainer scripts run under qemu (binfmt)
@@ -29,6 +29,9 @@ jobs:
           arch-test arm64
       - name: Build
         run: sudo -E scripts/build-rootfs.sh
+      # plain Debian for the community: the same base, none of our services
+      - name: Build plain
+        run: sudo -E scripts/build-rootfs.sh plain
       - name: Publish for the Station
         if: github.ref == 'refs/heads/main'
         env:

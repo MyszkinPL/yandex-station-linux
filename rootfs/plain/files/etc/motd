@@ -1,0 +1,11 @@
+
+  Plain Debian on the Yandex Station 1 (kernel: github.com/MyszkinPL/yandex-station-linux)
+
+  * The only way in is Wi-Fi. Never: poweroff (there is none here — it would
+    cut the power for good on this board; reboot instead), and never touch
+    boot0, U-Boot, env or the boot partition.
+  * Back to Yandex Android: hold the Alice key for 10 s (not while plugging in:
+    that is the factory reset).
+  * Wi-Fi: station-wifi add "<name>" "<password>". Volume: amixer -c snddaudio1.
+  * Your services: /etc/service (runit). What you install stays (/cache/station/upper).
+

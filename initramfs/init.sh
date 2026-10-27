@@ -249,8 +249,17 @@ if [ -e /sys/class/net/wlan0 ]; then
 		fi
 		if [ -x $C/rootfs/usr/sbin/wpa_supplicant ] && [ -x $C/rootfs/usr/sbin/dropbear ]; then
 			mount -t tmpfs tmpfs /run/ovl
-			mkdir -p /run/ovl/u /run/ovl/w
-			if mount -t overlay overlay -o lowerdir=$C/rootfs,upperdir=/run/ovl/u,workdir=/run/ovl/w $R; then
+			# Ours is the same at every boot: its layer is in RAM. Plain Debian
+			# (the community's: /etc/station/plain) is the owner's to change,
+			# apt and all: its layer is kept on flash, $C/upper;
+			# $C/upper.reset (from Android, say) starts it clean.
+			up=/run/ovl/u wk=/run/ovl/w
+			if [ -e $C/rootfs/etc/station/plain ]; then
+				[ -e $C/upper.reset ] && rm -rf $C/upper $C/work $C/upper.reset && say "plain Debian: its layer reset"
+				up=$C/upper wk=$C/work
+			fi
+			mkdir -p $up $wk
+			if mount -t overlay overlay -o lowerdir=$C/rootfs,upperdir=$up,workdir=$wk $R; then
 				ROOT=own
 				# (not $P: that is the misc partition the log goes to)
 				KEEP=$C/persist
@@ -311,6 +320,11 @@ if [ -x $R/opt/station/start ]; then
 	chroot $R /usr/bin/env -i PATH=/opt/station/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
 		/opt/station/start >> $L 2>&1 &
 	say "services started"
+elif [ -x $R/etc/station/start ]; then
+	# plain Debian has none of ours: its own start (runit's /etc/service)
+	chroot $R /usr/bin/env -i PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+		/etc/station/start >> $L 2>&1 &
+	say "services started (/etc/station/start)"
 fi
 
 # The way back to Android that needs nothing but a hand: the Alice key held
@@ -686,8 +700,10 @@ keep_base() {
 		;;
 	esac
 }
-# the pids of our core services (a restart changes one)
+# the pids of the core services (a restart changes one): ours, or what the
+# root filesystem names in /etc/station/core (plain Debian: dropbear)
 CORE="ringd audiod timerd stationd webd"
+[ -s $R/etc/station/core ] && CORE=$(cat $R/etc/station/core)
 core_pids() { for s in $CORE; do pidof $s || echo none; done | tr '\n' ' '; }
 left=$hold; bad=0; seen=""; since=0; saved=""
 [ -n "$CH" ] && set_mode client

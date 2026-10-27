@@ -1,0 +1,5 @@
+#!/bin/sh
+# Started by init once the root filesystem is up (before the network). Put
+# your own services in /etc/service (runit: a directory with a ./run each).
+mkdir -p /etc/service
+exec runsvdir -P /etc/service

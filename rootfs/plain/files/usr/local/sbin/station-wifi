@@ -1,0 +1,62 @@
+#!/bin/sh
+# The Station's own Wi-Fi networks, tried before the ones Android has saved
+# (init reads /opt/station/etc/wifi.conf, kept across reboots).
+#   station-wifi add "<name>" ["<password>"]   (no password: an open network)
+#   station-wifi list | forget "<name>"
+set -e
+W=/opt/station/etc/wifi.conf
+mkdir -p "$(dirname "$W")"; touch "$W"; chmod 600 "$W"
+
+# text to hex, and back (dash's printf knows octal escapes only)
+hex() { printf %s "$1" | od -An -tx1 | tr -d ' \n'; }
+unhex() {
+	h=$1
+	while [ -n "$h" ]; do
+		b=${h%"${h#??}"}; h=${h#??}
+		printf "\\$(printf %o "0x$b")"
+	done
+	echo
+}
+
+case "$1" in
+add)
+	[ -n "$2" ] || { echo "usage: station-wifi add <name> [<password>]" >&2; exit 2; }
+	"$0" forget "$2" >/dev/null 2>&1 || true
+	if [ -n "$3" ]; then
+		psk=$(wpa_passphrase "$2" "$3" | sed -n 's/^[[:space:]]*psk=\([0-9a-f]\{64\}\)$/\1/p')
+		[ -n "$psk" ] || { echo "the password must be 8 to 63 characters" >&2; exit 1; }
+		printf 'network={\n\tssid=%s\n\tpsk=%s\n\tpriority=10\n}\n' "$(hex "$2")" "$psk" >> "$W"
+	else
+		printf 'network={\n\tssid=%s\n\tkey_mgmt=NONE\n\tpriority=10\n}\n' "$(hex "$2")" >> "$W"
+	fi
+	mkdir -p /run/station && touch /run/station/wifi-changed
+	echo "saved: $2 (the Station tries it within ten seconds)"
+	;;
+list)
+	sed -n 's/^[[:space:]]*ssid=//p' "$W" | while read -r s; do
+		case "$s" in
+		\"*) echo "$s" ;;
+		*) unhex "$s" ;;
+		esac
+	done
+	;;
+forget)
+	[ -n "$2" ] || { echo "usage: station-wifi forget <name>" >&2; exit 2; }
+	h=$(hex "$2")
+	awk -v h="$h" -v q="\"$2\"" '
+		/^network=\{/ { blk = $0 "\n"; inb = 1; drop = 0; next }
+		inb {
+			blk = blk $0 "\n"
+			if ($0 ~ "ssid=(" h ")$" || index($0, "ssid=" q)) drop = 1
+			if ($0 ~ /^\}/) { if (!drop) printf "%s", blk; inb = 0 }
+			next
+		}
+		{ print }' "$W" > "$W.new" && mv "$W.new" "$W"
+	mkdir -p /run/station && touch /run/station/wifi-changed
+	echo "forgotten: $2"
+	;;
+*)
+	echo "usage: station-wifi add <name> [<password>] | list | forget <name>" >&2
+	exit 2
+	;;
+esac

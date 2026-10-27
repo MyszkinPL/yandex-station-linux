@@ -1,0 +1,3 @@
+Plain Debian for the Yandex Station 1 (github.com/MyszkinPL/yandex-station-linux).
+init (the recovery image) keeps this root's layer on flash (/cache/station/upper),
+starts /etc/station/start and watches the services named in /etc/station/core.

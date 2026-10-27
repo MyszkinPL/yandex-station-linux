@@ -1,0 +1,28 @@
+# Plain Debian for the Station (scripts/build-rootfs.sh plain): the base a
+# community owner starts from — Wi-Fi, SSH, apt, sound, the hardware's tools —
+# with none of our services. Recommends are not installed.
+
+# init brings Wi-Fi up with these; the setup access point needs dnsmasq
+wpasupplicant
+iw
+iproute2
+dnsmasq-base
+# SSH (init starts it; it is the one way in), certificates for apt over https
+dropbear-bin
+ca-certificates
+curl
+# services of your own: runit (/etc/service, started by /etc/station/start)
+runit
+# sound: the amplifiers and mics (init sets them up at a safe volume)
+alsa-utils
+# time and zones
+chrony
+tzdata
+# the usual tools
+procps
+psmisc
+less
+nano
+i2c-tools
+e2fsprogs
+evtest
