@@ -108,11 +108,24 @@ Android и отмечает почему; Android после этого оста
 | `sh station-debian.run enter` | загрузить Debian сейчас |
 | `sh station-debian.run stay` / `unstay` | при включении — Android / снова Debian |
 | `sh station-debian.run log` | полный журнал последней загрузки Debian |
+| `sh station-debian.run access` | новый пароль root или ещё один ключ для Debian (если старый потерян) |
 | `sh station-debian.run update` | новое ядро из выпуска этого установщика (Debian остаётся как есть) |
 | `sh station-debian.run uninstall` | удалить всё: Станция как была |
 
 Debian обновляется сам по себе, через `apt`. Новый выпуск ядра — новый `station-debian.run` и
 `update`.
+
+## Забыли пароль или потеряли ключ
+
+Ничего страшного: доступ выдаётся заново из Android, Debian для этого не нужен.
+
+1. Удерживайте кнопку Алисы 10 секунд — Станция уйдёт в Android и останется там.
+2. В оболочке root Android: `sh /data/local/tmp/station-debian.run access` — Enter даст новый
+   пароль (покажется на экране), или вставьте новый открытый ключ.
+3. `sh /data/local/tmp/station-debian.run enter` — Debian загрузится уже с новым доступом.
+
+Пароль и ключи, которые вы меняете в самом Debian (`passwd`, `~/.ssh/authorized_keys`),
+сохраняются: установщик их не перетирает, пока вы сами не попросите `access`.
 
 ## Что установщик меняет на Станции
 

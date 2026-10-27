@@ -404,12 +404,27 @@ if [ -x $R/usr/sbin/wpa_supplicant ]; then
 	# /etc/station/authorized_keys: a key built into a developer's own image.
 	mkdir -p $R/root/.ssh && chmod 700 $R/root/.ssh
 	SSHK=/mnt/cache/station/persist/ssh
-	for k in $SSHK/authorized_keys /etc/station/authorized_keys; do
-		[ -s $k ] && { cp $k $R/root/.ssh/authorized_keys && chmod 600 $R/root/.ssh/authorized_keys; break; }
-	done
-	if [ -s $SSHK/root.hash ]; then
-		h=$(head -1 $SSHK/root.hash)
-		sed -i "s|^root:[^:]*:|root:$h:|" $R/etc/shadow && say "root password from persist/ssh"
+	if [ -e $R/etc/station/plain ]; then
+		# Plain Debian keeps its own changes (passwd, keys added there): the
+		# installer's keys are added to them, and its password is set only
+		# when it is a new one (the installer's "access", for a lost one)
+		[ -s $SSHK/authorized_keys ] && while read -r k; do
+			[ -n "$k" ] && ! grep -qxF "$k" $R/root/.ssh/authorized_keys 2>/dev/null && echo "$k" >> $R/root/.ssh/authorized_keys
+		done < $SSHK/authorized_keys
+		chmod 600 $R/root/.ssh/authorized_keys 2>/dev/null
+		if [ -s $SSHK/root.hash ] && [ "$(sha256sum < $SSHK/root.hash)" != "$(cat $SSHK/root.hash.applied 2>/dev/null)" ]; then
+			h=$(head -1 $SSHK/root.hash)
+			sed -i "s|^root:[^:]*:|root:$h:|" $R/etc/shadow && sha256sum < $SSHK/root.hash > $SSHK/root.hash.applied &&
+				say "root password from persist/ssh (a new one)"
+		fi
+	else
+		for k in $SSHK/authorized_keys /etc/station/authorized_keys; do
+			[ -s $k ] && { cp $k $R/root/.ssh/authorized_keys && chmod 600 $R/root/.ssh/authorized_keys; break; }
+		done
+		if [ -s $SSHK/root.hash ]; then
+			h=$(head -1 $SSHK/root.hash)
+			sed -i "s|^root:[^:]*:|root:$h:|" $R/etc/shadow && say "root password from persist/ssh"
+		fi
 	fi
 	[ -s $R/root/.ssh/authorized_keys ] || [ -s $SSHK/root.hash ] || say "no SSH key and no root password: nobody can log in over SSH"
 	mkdir -p $R/etc/dropbear

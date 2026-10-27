@@ -4,7 +4,7 @@
 # failure stops it and says what to do, and running it again goes on from
 # where it stopped. Its text is Russian; its log is /data/local/station/install.log.
 #
-#   sh station-debian.run [install|check|download|status|log|enter|stay|unstay|update|uninstall]
+#   sh station-debian.run [install|check|download|status|log|enter|stay|unstay|access|update|uninstall]
 #     --key "ssh-ed25519 ..."   SSH key for root in Debian    --password   a root password instead
 #     --wifi "<name>" "<pass>"  one more Wi-Fi network        --tz Europe/Moscow
 #     --mode debian|android     what the Station boots         --from DIR   files already downloaded
@@ -237,20 +237,34 @@ unpack_rootfs() {
 	ok "Debian распакован: $(cat $C/rootfs/etc/station-rootfs), $(du -sm $C/rootfs | cut -f1) МБ"
 }
 
-persist() {
-	K=$C/persist/ssh W=$C/persist/opt-station/etc/wifi.conf
-	mkdir -p $K ${W%/*} && chmod 700 $K
+# The way into Debian, kept where init reads it at every boot: keys are
+# added, a password replaces the one before (init sets it once it changes)
+save_login() {
+	K=$C/persist/ssh
+	mkdir -p $K && chmod 700 $K
 	if [ -n "$KEY" ]; then
 		grep -qxF "$KEY" $K/authorized_keys 2>/dev/null || echo "$KEY" >> $K/authorized_keys
 		chmod 600 $K/authorized_keys; grep -qxF "$KEY" $K/authorized_keys && ok "ключ SSH сохранён"
 	fi
 	if [ -n "$PASSWORD" ]; then
 		PASS=$(tr -dc 'a-km-np-z2-9' < /dev/urandom | head -c 12)
-		echo "$PASS" | cryptpw -m sha512 > $K/root.hash.new 2>/dev/null
+		cryptpw -m sha512 "$PASS" > $K/root.hash.new 2>/dev/null
 		grep -q '^\$6\$' $K/root.hash.new || { rm -f $K/root.hash.new; die "Не получилось задать пароль." ""; }
 		mv $K/root.hash.new $K/root.hash && chmod 600 $K/root.hash && ok "пароль root задан (покажу в конце)"
 	fi
 	have_login || die "Нет ни ключа, ни пароля: в Debian будет не войти." "Запустите снова с --key \"ssh-ed25519 ...\" или с --password."
+}
+
+show_password() {
+	[ -n "$PASS" ] || return 0
+	echo; echo "  ПАРОЛЬ root в Debian: $PASS"
+	echo "  Запишите его. Забудете — новый даст «sh station-debian.run access» из Android."; echo
+}
+
+persist() {
+	W=$C/persist/opt-station/etc/wifi.conf
+	mkdir -p ${W%/*}
+	save_login
 	if [ -n "$WIFI_NAME" ]; then
 		hex=$(printf %s "$WIFI_NAME" | od -An -tx1 | tr -d ' \n')
 		touch $W && chmod 600 $W
@@ -384,7 +398,7 @@ uninstall() {
 CMD=install
 while [ $# -gt 0 ]; do
 	case "$1" in
-	install|check|download|status|log|enter|stay|unstay|update|uninstall) CMD=$1 ;;
+	install|check|download|status|log|enter|stay|unstay|access|update|uninstall) CMD=$1 ;;
 	--key) KEY=${2:-}; shift ;;
 	--password) PASSWORD=yes ;;
 	--wifi) WIFI_NAME=${2:-} WIFI_PASS=${3:-}; shift; [ $# -gt 1 ] && case "$2" in --*) ;; *) shift ;; esac ;;
@@ -421,11 +435,21 @@ install|update)
 	[ $CMD = install ] && { unpack_rootfs; persist; }
 	write_recovery; install_handoff
 	echo
-	[ -n "$PASS" ] && { echo "  ПАРОЛЬ root в Debian: $PASS"; echo "  Запишите его: больше он нигде не покажется."; echo; }
+	show_password
 	if [ "$MODE" = debian ]; then enter_debian; else say "Готово. Загрузить Debian: sh station-debian.run enter"; fi ;;
 status) status ;;
 log) dd if=$MISC bs=4096 skip=$LOG_SEEK count=$LOG_BLOCKS 2>/dev/null | tr -d '\000' ;;
 enter) in_android || die "Это запускается в Android." ""; enter_debian ;;
+access)
+	# a lost password or key: a new way in, from Android
+	in_android || die "Это запускается в Android." ""
+	plain_rootfs || die "Debian не установлен." "Сначала: install."
+	if [ -z "$KEY" ] && [ -z "$PASSWORD" ]; then
+		asking && echo "  Новый вход в Debian: вставьте открытый ключ (ssh-ed25519 ...) или нажмите Enter — будет новый пароль."
+		ask "  Ключ" ""; case "$REPLY" in ssh-*|ecdsa-*|sk-*) KEY=$REPLY ;; *) PASSWORD=yes ;; esac
+	fi
+	step "Новый вход в Debian"; save_login; sync; show_password
+	say "Он заработает при следующей загрузке Debian: sh station-debian.run enter" ;;
 stay) touch $S/stay && say "При включении: Android. Debian — «enter»." ;;
 unstay) rm -f $S/stay && say "При включении снова Debian." ;;
 uninstall) in_android || die "Удаление запускается из Android." ""; uninstall ;;
