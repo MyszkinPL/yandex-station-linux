@@ -710,10 +710,21 @@ DM
 	rm -f $R/run/wpa_supplicant/wlan0
 	$CH wpa_supplicant -B -i wlan0 -D nl80211 -c /etc/wpa-ap.conf -f /run/wpa-ap.log
 	$CH dnsmasq --conf-file=/etc/dnsmasq-ap.conf
+	setup_page
 	set_mode ap
 	say "access point '$AP_SSID' up ($AP_IP): join it with a phone to set Wi-Fi up"
 }
+# Plain Debian has no panel of ours: its Wi-Fi page on the access point is
+# this image's own (busybox httpd, /www), whatever the owner did to Debian
+setup_page() {
+	[ -e $R/etc/station/plain ] || return 0
+	kill -0 "$(cat /tmp/httpd-ap.pid 2>/dev/null)" 2>/dev/null && return 0
+	httpd -f -p $AP_IP:80 -h /www -c /etc/httpd-setup.conf &
+	echo $! > /tmp/httpd-ap.pid
+	say "Wi-Fi page on http://$AP_IP/"
+}
 stop_ap() {
+	kill "$(cat /tmp/httpd-ap.pid 2>/dev/null)" 2>/dev/null; rm -f /tmp/httpd-ap.pid
 	kill "$(cat $R/run/dnsmasq-ap.pid 2>/dev/null)" 2>/dev/null
 	killall wpa_supplicant 2>/dev/null
 	wait_gone wpa_supplicant
@@ -725,6 +736,7 @@ keep_base() {
 	ap)
 		pidof wpa_supplicant >/dev/null || { say "access point was gone: up again"; start_ap; }
 		kill -0 "$(cat $R/run/dnsmasq-ap.pid 2>/dev/null)" 2>/dev/null || $CH dnsmasq --conf-file=/etc/dnsmasq-ap.conf
+		setup_page
 		;;
 	*)
 		[ -s /tmp/net ] || return

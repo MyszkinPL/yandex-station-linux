@@ -28,3 +28,9 @@ file /init init.sh 0755 0 0
 file /udhcpc.sh udhcpc.sh 0755 0 0
 file /etc/station/station-audio-init.sh station-audio-init.sh 0755 0 0
 file /etc/station/station-mics-init.sh station-mics-init.sh 0755 0 0
+# plain Debian's Wi-Fi page on its access point (init.sh: start_ap)
+dir /www 0755 0 0
+dir /www/cgi-bin 0755 0 0
+file /www/index.html setup/index.html 0644 0 0
+file /www/cgi-bin/wifi setup/wifi.cgi 0755 0 0
+file /etc/httpd-setup.conf setup/httpd.conf 0644 0 0
