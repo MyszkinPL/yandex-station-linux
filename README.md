@@ -34,7 +34,6 @@ kernel/station.config          конфиг ядра
 kernel/dts/                    device tree платы (один исходник, несколько вариантов DTB)
 boot/                          загрузочный shim и упаковщик образа (чистый Python)
 initramfs/                     init Linux-режима
-os/                            своя система поверх ядра, на Rust (службы Станции)
 scripts/                       скрипты сборки (их же запускает CI)
 ```
 

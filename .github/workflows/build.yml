@@ -3,7 +3,7 @@ name: build
 on:
   push:
     branches: [main]
-    paths: ['kernel/**', 'boot/**', 'initramfs/**', 'scripts/**', 'os/**', '.github/workflows/build.yml']
+    paths: ['kernel/**', 'boot/**', 'initramfs/**', 'scripts/**', '.github/workflows/build.yml']
   pull_request:
   workflow_dispatch:
 
@@ -82,53 +82,6 @@ jobs:
         with:
           name: userspace
           path: out/userspace/
-          retention-days: 30
-
-  os:
-    # our userspace (os/): static aarch64 musl binaries, linked with rust-lld
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write     # the os-latest release
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      # zig as the aarch64 musl C compiler: tract (listend's wake word models)
-      # assembles its kernels with it (scripts/zig-cc)
-      - name: Toolchain
-        run: |
-          rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-musl
-          python3 -m pip install --quiet --user --break-system-packages ziglang
-      # crates and the build directory: a push rebuilds only what changed
-      - name: Cargo cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            os/target
-          key: cargo-${{ hashFiles('os/Cargo.lock') }}-${{ github.sha }}
-          restore-keys: cargo-${{ hashFiles('os/Cargo.lock') }}-
-      # the ring's rules (rules.rs) run on the runner itself: the same code,
-      # every scene played through the real output frame by frame
-      - name: Test
-        run: cd os && cargo test --release --target x86_64-unknown-linux-gnu
-      - name: Build
-        run: scripts/build-os.sh && scripts/pack-os.sh
-      # the Station updates itself from this release (os/station/bin/update)
-      - name: Publish for the Station
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          gh release view os-latest > /dev/null 2>&1 ||
-            gh release create os-latest --prerelease --title "Userspace for the Station"               --notes "Built from main by CI; the Station installs it with \`update install\`."
-          gh release upload os-latest out/os-aarch64.tar.gz out/os-aarch64.tar.gz.sha256 out/os-VERSION --clobber
-      - uses: actions/upload-artifact@v4
-        with:
-          name: os
-          path: out/os/
           retention-days: 30
 
   image:

@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write     # the os-latest release
+  contents: write     # the rootfs-latest release
 
 jobs:
   rootfs:
@@ -38,9 +38,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release view os-latest > /dev/null 2>&1 ||
-            gh release create os-latest --prerelease --title "Userspace for the Station" --notes "Built from main by CI."
-          gh release upload os-latest out/rootfs-arm64.tar.gz out/rootfs-arm64.tar.gz.sha256 out/rootfs-VERSION --clobber
+          gh release view rootfs-latest > /dev/null 2>&1 ||
+            gh release create rootfs-latest --prerelease --latest=false --title "Корневая ФС для Станции"               --notes "Собирается из main (rootfs/packages); Станция ставит её командой \`update rootfs-install\`."
+          gh release upload rootfs-latest out/rootfs-arm64.tar.gz out/rootfs-arm64.tar.gz.sha256 out/rootfs-VERSION --clobber
       - uses: actions/upload-artifact@v4
         with:
           name: rootfs
