@@ -92,5 +92,7 @@ jobs:
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" rel/* --clobber
           else
-            gh release create "$TAG" rel/* --target main --title "Debian for the Station ($TAG)" --notes-file notes.md
+            # a trial (debian-v9-rc1): tried on the Station first, the one command stays on the last real one
+            case "$TAG" in *-rc*) TRIAL=1 ;; *) TRIAL= ;; esac
+            gh release create "$TAG" rel/* --target main --title "Debian for the Station ($TAG)" --notes-file notes.md ${TRIAL:+--prerelease --latest=false}
           fi
