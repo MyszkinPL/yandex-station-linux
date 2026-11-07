@@ -334,6 +334,11 @@ if [ -e /sys/class/net/wlan0 ]; then
 	fi
 fi
 
+# The kernel loads a module by itself through this initramfs' modprobe, which
+# has only the drivers above. The root filesystem's whole set, when it has one
+# (plain Debian's), in their place: what WireGuard or Docker ask for is found.
+[ -e "$R$MD/modules.dep" ] && mount --bind "$R$MD" "$MD" && say "modules from the root filesystem"
+
 # --- our services (/opt/station/start): before the network, so the ring
 # shows the boot and the buttons work at once; each is kept running ---
 # Plain Debian starts what its owner put in (runit's /etc/service), never

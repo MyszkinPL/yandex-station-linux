@@ -48,6 +48,16 @@ jobs:
           mkdir rel
           cp w/image/recovery-station.img w/image/recovery-station-fixed.img w/image/boot-station.img w/rootfs/rootfs-plain-arm64.tar.gz rel/
           KREL=$(cat w/kernel/kernel.release)
+          # the kernel's modules inside plain Debian: without them no modprobe
+          # finds WireGuard, nftables, Docker's veth. usr/lib: /lib is a link
+          # there, and a real lib/ in the archive would replace the link
+          mkdir w/modules
+          tar -C w/modules -xzf w/kernel/modules.tar.gz
+          rm -f "w/modules/lib/modules/$KREL/build" "w/modules/lib/modules/$KREL/source"
+          gunzip rel/rootfs-plain-arm64.tar.gz
+          tar -C w/modules --owner=0 --group=0 --numeric-owner --transform 's,^lib/,usr/lib/,' \
+            -rf rel/rootfs-plain-arm64.tar lib/modules
+          gzip -9n rel/rootfs-plain-arm64.tar
           tar -C w/kernel --owner=0 --group=0 -czf "rel/kernel-$KREL.tar.gz" \
             Image dtb modules.tar.gz shim.bin config defconfig System.map kernel.release
           echo "KREL=$KREL" >> "$GITHUB_ENV"

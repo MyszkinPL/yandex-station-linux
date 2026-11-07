@@ -4,6 +4,8 @@
 
 # init brings Wi-Fi up with these; the setup access point needs dnsmasq
 wpasupplicant
+# modprobe: the kernel's modules come in this root filesystem (release.yml)
+kmod
 iw
 iproute2
 dnsmasq-base
