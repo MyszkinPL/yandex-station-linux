@@ -37,12 +37,13 @@ make -s -C "$S" O="$O" CC="$CC" olddefconfig
 # Options of station.config that olddefconfig dropped: an error when the
 # symbol still exists (a dependency is missing), only a note when this
 # kernel no longer has it (renamed or removed upstream: review on a bump).
+# (the check below by a here-string: `echo | grep -q` under pipefail fails when grep stops early, and an option lost looked gone)
 symbols=$(find "$S" -name 'Kconfig*' -exec grep -hoE '^\s*(menu)?config\s+\w+' {} + | awk '{print $2}' | sort -u)
 lost=""; gone=""
 while IFS= read -r l; do
 	grep -qxF "$l" "$O/.config" && continue
 	sym=${l%%=*}; sym=${sym#CONFIG_}
-	if echo "$symbols" | grep -qxF "$sym"; then lost="$lost  $l"$'\n'; else gone="$gone $sym"; fi
+	if grep -qxF "$sym" <<< "$symbols"; then lost="$lost  $l"$'\n'; else gone="$gone $sym"; fi
 done < <(grep '^CONFIG_.*=[ym]$' "$TOP/kernel/station.config")
 [ -z "$gone" ] || echo "note: no longer in this kernel:$gone"
 [ -z "$lost" ] || { echo "options lost by olddefconfig:"; printf '%s' "$lost"; exit 1; }
